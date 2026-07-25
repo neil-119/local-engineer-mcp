@@ -82,7 +82,9 @@ with `local-engineer doctor`.
 
 ### Option 1: Ask Codex to configure it (recommended)
 
-Point Codex at this repository and prompt it with:
+Ask Codex to set up Local Engineer for you, update your local Codex MCP servers, and help you configure it.
+
+Simply point Codex at this repository and prompt it with:
 
 ```text
 Set up Local Engineer MCP from this repository.
