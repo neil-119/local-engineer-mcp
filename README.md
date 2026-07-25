@@ -645,9 +645,6 @@ connection cannot list, inspect, reply to, cancel, promote, or delete them.
 Add this policy to a repository's `AGENTS.md` or to personal Codex
 instructions:
 
-<details>
-<summary>Copyable Local Engineer policy</summary>
-
 ```md
 ## Local Engineer delegation
 
@@ -686,8 +683,6 @@ When the `local_engineer_*` MCP tools are available, use configured Local Engine
   and read-only domains, and build only with explicit approval.
 - Do not delegate trivial one-step work, tasks requiring information only the user can provide, or work whose risks/side effects have not been approved.
 ```
-
-</details>
 
 ## Review and promotion
 
