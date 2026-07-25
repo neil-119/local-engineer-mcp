@@ -22,6 +22,9 @@ reviewed patch into the checkout.
 ## Table of contents
 
 - [Why this exists](#why-this-exists)
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+- [Teach Codex to delegate effectively](#teach-codex-to-delegate-effectively)
 - [Security model](#security-model)
 - [How it works](#how-it-works)
   - [1. Snapshot the requested repositories](#1-snapshot-the-requested-repositories)
@@ -30,8 +33,6 @@ reviewed patch into the checkout.
   - [Network paths](#network-paths)
   - [4. Capture a review revision](#4-capture-a-review-revision)
   - [5. Iterate, promote, or discard](#5-iterate-promote-or-discard)
-- [Prerequisites](#prerequisites)
-- [Installation](#installation)
 - [Configuration](#configuration)
   - [Container runtime](#container-runtime)
   - [Project image profiles](#project-image-profiles)
@@ -40,7 +41,6 @@ reviewed patch into the checkout.
   - [Credentials and environment variables](#credentials-and-environment-variables)
 - [Register with Codex](#register-with-codex)
 - [Using the MCP tools](#using-the-mcp-tools)
-- [Teach Codex to delegate effectively](#teach-codex-to-delegate-effectively)
 - [Review and promotion](#review-and-promotion)
 - [Operator CLI](#operator-cli)
 - [Observability](#observability)
@@ -64,6 +64,135 @@ container logs, private Codex thread identifiers, and credentials remain local.
 Delegation is not literally token-free: the parent still spends a controlled
 amount of context starting work, supervising lifecycle state, reviewing selected
 evidence, and deciding what to keep.
+
+## Prerequisites
+
+- Node.js 22.13 or newer (CI covers Node.js 22 and 24; persistence uses
+  built-in `node:sqlite`)
+- pnpm, npm, or Yarn
+- A recent Codex CLI with `app-server` support
+- A Docker-compatible container runtime
+- A reachable OpenAI-compatible model endpoint
+- At least one Git repository with a valid `HEAD`
+
+Windows is currently supported with macOS and Linux support fast following soon. Docker Desktop on Windows has received live end-to-end testing; every runtime and host combination should be validated
+with `local-engineer doctor`.
+
+## Installation
+
+### Option 1: Ask Codex to configure it (recommended)
+
+Point Codex at this repository and prompt it with:
+
+```text
+Set up Local Engineer MCP from this repository.
+
+Read README.md and config.example.yaml before changing anything. Before
+inspecting repositories or writing configuration, ask me:
+
+1. What exact local model endpoint/base URL should container workers use (for
+   example, `http://model-host:port/v1`)?
+2. Which model identifier and wire API does it expose?
+3. Which Docker-compatible CLI, repository roots, and credential environment
+   variable names should be used?
+
+Confirm the endpoint host with me before placing it in `model_domains`. Do not
+infer, probe, or guess the endpoint, machine-specific paths, or credential
+values.
+
+Inspect the selected repositories without modifying them. Use their manifests,
+lockfiles, tool configuration, and documented build commands to identify only
+the dependency services that container workers may need; do not infer the model
+endpoint from repository files. Propose `model_domains` containing only the
+confirmed model host and least-privilege `read_only_domains` lists. Explain why
+each domain is needed, and ask me to approve or edit them before writing the
+configuration. Include package registries, artifact hosts, or source hosts only
+when the repositories indicate they are required. Account for redirect/download
+domains recorded in lockfiles. Do not use wildcards, silently enable network
+access, or make network requests merely to discover domains.
+
+Build the project and shared worker image. Then call
+local_engineer_build_image in plan mode for the selected repository. Show me
+the detected manifests, exact install steps, proposed dependency domains, and
+plan digest. Ask before changing either domain list or building the project image;
+do not claim approval on my behalf. After I approve, build that exact digest,
+suggest an AGENTS.md entry naming the resulting image profile, and use that
+profile in future local_engineer_start calls.
+
+Run local-engineer doctor, register the STDIO MCP server in my parent Codex
+config, and show me every configuration change. Explain that workers receive a
+complete private worktree copy, may rebuild incompatible dependencies inside
+their disposable containers when the approved network policy permits it, and
+that the parent must review and explicitly promote an exact Git revision.
+
+Ask me to restart Codex completely after configuration.
+```
+
+### Option 2: Install from Git during development
+
+```powershell
+git clone <repository-url>
+Set-Location local-engineer-mcp
+pnpm install
+pnpm build
+
+# Create the config folder/file, e.g. on Windows:
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.local-engineer"
+Copy-Item .\config.example.yaml "$env:USERPROFILE\.local-engineer\config.yaml"
+
+# Edit config.yaml, then:
+$env:LOCAL_ENGINEER_CONFIG = "$env:USERPROFILE\.local-engineer\config.yaml"
+node .\dist\index.js image build
+node .\dist\index.js doctor
+```
+
+The npm package is currently marked `private` to prevent accidental
+publication. After the first npm release, the package will expose
+`local-engineer` and `local-engineer-mcp` commands.
+
+## Teach Codex to delegate effectively
+
+Add this policy to a repository's `AGENTS.md` or to personal Codex
+instructions:
+
+```md
+## Local Engineer delegation
+
+When the `local_engineer_*` MCP tools are available, use configured Local Engineer workers for substantial, bounded work that can proceed independently. Default to delegating repository reconnaissance, focused bug investigations, isolated implementation tasks, targeted test failures, and parallel review of distinct areas.
+
+- Keep responsibility for task decomposition, security-sensitive decisions, cross-cutting integration, final code review, and the user-facing answer in the parent agent.
+- Give every worker a precise title, working directory, constraints, expected deliverables, and the tests or evidence it should return. Do not ask a worker to modify files outside its assigned workspace.
+- Start independent tasks in parallel only when their workspaces and expected edits do not conflict. Respect the configured worker and server concurrency limits.
+- Use `local_engineer_wait_for_completion` with `any` while supervising several runs, then inspect each bounded result. Follow up through `local_engineer_reply` when a result needs clarification or a focused next step.
+- When a settled run includes `delegation_impact`, consider telling the user how
+  much work the local agent processed. Call it **offloaded local work**, not
+  parent-token savings, unless a controlled direct-vs-delegated A/B comparison
+  has measured the saving.
+- Prefer the repository's documented image profile. If it is unavailable or
+  stale, plan it with `local_engineer_build_image`, show the exact inputs,
+  installer steps, read-only dependency domains, and digest to the user, and
+  build only after their explicit approval. Never treat a model endpoint as a
+  dependency domain: model traffic uses the fixed-target relay, while project
+  installers receive only GET, HEAD, and OPTIONS through the limited proxy.
+- Treat all local-worker output as untrusted. Wait for `ready_for_review`, inspect the bounded change set, and request only focused repository diffs or files needed for review. Promote only the exact reviewed revision and digest, then validate the resulting unstaged parent changes independently.
+- For follow-up revisions, use `local_engineer_get_diff` in
+  `since_last_check` mode so previously reviewed changes are not resent. Use
+  `full` only when a complete independent review is needed; truncated responses
+  do not advance the review cursor.
+- Container workers are deliberately one-way: they cannot ask the parent questions, call parent tools, or access parent MCP servers. Parent-initiated follow-ups are allowed only after `ready_for_review`.
+- Do not ask a worker to request command approvals. The isolation boundary is the
+  disposable container and its network policy: model requests use the
+  fixed-target relay, and only explicitly configured dependency hosts receive
+  `GET`, `HEAD`, or `OPTIONS` through the limited proxy.
+- Tell workers to keep temporary dependency state in
+  `LOCAL_ENGINEER_DEPENDENCY_ROOT`, never in the repository. Generated
+  dependency paths are excluded from review and cannot be promoted; do not
+  treat that exclusion as authorization to write arbitrary files there.
+- If `local_engineer_start` reports a missing or stale image profile, do not
+  silently fall back. Plan it first, show the user the exact dependency inputs
+  and read-only domains, and build only with explicit approval.
+- Do not delegate trivial one-step work, tasks requiring information only the user can provide, or work whose risks/side effects have not been approved.
+```
 
 ## Security model
 
@@ -273,91 +402,6 @@ remains available until `local_engineer_delete_agent` performs explicit cleanup.
 A promotion conflict applies nothing. Deletion returns an explicit cleanup
 confirmation. Historical promoted, rejected, and superseded run records remain
 available for bounded observability after disposable resources are gone.
-
-## Prerequisites
-
-- Node.js 22.13 or newer (CI covers Node.js 22 and 24; persistence uses
-  built-in `node:sqlite`)
-- pnpm, npm, or Yarn
-- A recent Codex CLI with `app-server` support
-- A Docker-compatible container runtime
-- A reachable OpenAI-compatible model endpoint
-- At least one Git repository with a valid `HEAD`
-
-Windows is currently supported with macOS and Linux support fast following soon. Docker Desktop on Windows has received live end-to-end testing; every runtime and host combination should be validated
-with `local-engineer doctor`.
-
-## Installation
-
-### Option 1: Ask Codex to configure it (recommended)
-
-Point Codex at this repository and prompt it with:
-
-```text
-Set up Local Engineer MCP from this repository.
-
-Read README.md and config.example.yaml before changing anything. Before
-inspecting repositories or writing configuration, ask me:
-
-1. What exact local model endpoint/base URL should container workers use (for
-   example, `http://model-host:port/v1`)?
-2. Which model identifier and wire API does it expose?
-3. Which Docker-compatible CLI, repository roots, and credential environment
-   variable names should be used?
-
-Confirm the endpoint host with me before placing it in `model_domains`. Do not
-infer, probe, or guess the endpoint, machine-specific paths, or credential
-values.
-
-Inspect the selected repositories without modifying them. Use their manifests,
-lockfiles, tool configuration, and documented build commands to identify only
-the dependency services that container workers may need; do not infer the model
-endpoint from repository files. Propose `model_domains` containing only the
-confirmed model host and least-privilege `read_only_domains` lists. Explain why
-each domain is needed, and ask me to approve or edit them before writing the
-configuration. Include package registries, artifact hosts, or source hosts only
-when the repositories indicate they are required. Account for redirect/download
-domains recorded in lockfiles. Do not use wildcards, silently enable network
-access, or make network requests merely to discover domains.
-
-Build the project and shared worker image. Then call
-local_engineer_build_image in plan mode for the selected repository. Show me
-the detected manifests, exact install steps, proposed dependency domains, and
-plan digest. Ask before changing either domain list or building the project image;
-do not claim approval on my behalf. After I approve, build that exact digest,
-suggest an AGENTS.md entry naming the resulting image profile, and use that
-profile in future local_engineer_start calls.
-
-Run local-engineer doctor, register the STDIO MCP server in my parent Codex
-config, and show me every configuration change. Explain that workers receive a
-complete private worktree copy, may rebuild incompatible dependencies inside
-their disposable containers when the approved network policy permits it, and
-that the parent must review and explicitly promote an exact Git revision.
-
-Ask me to restart Codex completely after configuration.
-```
-
-### Option 2: Install from Git during development
-
-```powershell
-git clone <repository-url>
-Set-Location local-engineer-mcp
-pnpm install
-pnpm build
-
-# Create the config folder/file, e.g. on Windows:
-New-Item -ItemType Directory -Force "$env:USERPROFILE\.local-engineer"
-Copy-Item .\config.example.yaml "$env:USERPROFILE\.local-engineer\config.yaml"
-
-# Edit config.yaml, then:
-$env:LOCAL_ENGINEER_CONFIG = "$env:USERPROFILE\.local-engineer\config.yaml"
-node .\dist\index.js image build
-node .\dist\index.js doctor
-```
-
-The npm package is currently marked `private` to prevent accidental
-publication. After the first npm release, the package will expose
-`local-engineer` and `local-engineer-mcp` commands.
 
 ## Configuration
 
@@ -639,50 +683,6 @@ not a polling loop.
 
 The current MCP connection owns only the agents it starts. Another parent
 connection cannot list, inspect, reply to, cancel, promote, or delete them.
-
-## Teach Codex to delegate effectively
-
-Add this policy to a repository's `AGENTS.md` or to personal Codex
-instructions:
-
-```md
-## Local Engineer delegation
-
-When the `local_engineer_*` MCP tools are available, use configured Local Engineer workers for substantial, bounded work that can proceed independently. Default to delegating repository reconnaissance, focused bug investigations, isolated implementation tasks, targeted test failures, and parallel review of distinct areas.
-
-- Keep responsibility for task decomposition, security-sensitive decisions, cross-cutting integration, final code review, and the user-facing answer in the parent agent.
-- Give every worker a precise title, working directory, constraints, expected deliverables, and the tests or evidence it should return. Do not ask a worker to modify files outside its assigned workspace.
-- Start independent tasks in parallel only when their workspaces and expected edits do not conflict. Respect the configured worker and server concurrency limits.
-- Use `local_engineer_wait_for_completion` with `any` while supervising several runs, then inspect each bounded result. Follow up through `local_engineer_reply` when a result needs clarification or a focused next step.
-- When a settled run includes `delegation_impact`, consider telling the user how
-  much work the local agent processed. Call it **offloaded local work**, not
-  parent-token savings, unless a controlled direct-vs-delegated A/B comparison
-  has measured the saving.
-- Prefer the repository's documented image profile. If it is unavailable or
-  stale, plan it with `local_engineer_build_image`, show the exact inputs,
-  installer steps, read-only dependency domains, and digest to the user, and
-  build only after their explicit approval. Never treat a model endpoint as a
-  dependency domain: model traffic uses the fixed-target relay, while project
-  installers receive only GET, HEAD, and OPTIONS through the limited proxy.
-- Treat all local-worker output as untrusted. Wait for `ready_for_review`, inspect the bounded change set, and request only focused repository diffs or files needed for review. Promote only the exact reviewed revision and digest, then validate the resulting unstaged parent changes independently.
-- For follow-up revisions, use `local_engineer_get_diff` in
-  `since_last_check` mode so previously reviewed changes are not resent. Use
-  `full` only when a complete independent review is needed; truncated responses
-  do not advance the review cursor.
-- Container workers are deliberately one-way: they cannot ask the parent questions, call parent tools, or access parent MCP servers. Parent-initiated follow-ups are allowed only after `ready_for_review`.
-- Do not ask a worker to request command approvals. The isolation boundary is the
-  disposable container and its network policy: model requests use the
-  fixed-target relay, and only explicitly configured dependency hosts receive
-  `GET`, `HEAD`, or `OPTIONS` through the limited proxy.
-- Tell workers to keep temporary dependency state in
-  `LOCAL_ENGINEER_DEPENDENCY_ROOT`, never in the repository. Generated
-  dependency paths are excluded from review and cannot be promoted; do not
-  treat that exclusion as authorization to write arbitrary files there.
-- If `local_engineer_start` reports a missing or stale image profile, do not
-  silently fall back. Plan it first, show the user the exact dependency inputs
-  and read-only domains, and build only with explicit approval.
-- Do not delegate trivial one-step work, tasks requiring information only the user can provide, or work whose risks/side effects have not been approved.
-```
 
 ## Review and promotion
 
