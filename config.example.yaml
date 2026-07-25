@@ -1,0 +1,73 @@
+version: 1
+default_worker: local-container
+
+server:
+  state_dir: ~/.local-engineer
+  max_concurrency: 2
+  default_timeout_seconds: 3600
+  max_timeout_seconds: 14400
+  default_wait_timeout_seconds: 300
+  max_wait_timeout_seconds: 900
+  wait_response_reserve_seconds: 10
+  max_wait_ids: 32
+  cancellation_grace_seconds: 15
+  final_result_max_characters_per_run: 6000
+  max_server_log_bytes: 26214400
+  # Optional replacement for the built-in worker execution policy.
+  # default_worker_prompt: |-
+  #   Add repository-specific instructions here.
+
+security:
+  allowed_roots: [C:\work]
+  deny_unc_paths: true
+  deny_path_traversal: true
+  deny_symlink_escape: true
+  allowed_environment_variables: [PATH, USERPROFILE, TEMP, TMP, LOCAL_MODEL_API_KEY]
+
+container:
+  # Any Docker-compatible CLI that passes `local-engineer doctor`.
+  command: docker
+  image: local-engineer/codex-worker:latest
+  base_image: node:24-bookworm-slim
+  codex_version: 0.144.6
+  workspace_path: /workspace
+  worker_user: codex
+  codex_command: codex
+  network:
+    model_domains: [model-provider.example]
+    read_only_domains: []
+    allow_private_model_endpoint: false
+
+# Local Engineer snapshots only the repositories explicitly named here.
+workspaces:
+  - name: example-stack
+    repositories:
+      - name: application
+        path: C:\work\example-application
+        default_access: read-write
+      - name: deployment
+        path: C:\work\example-deployment
+        default_access: read-only
+
+workers:
+  - name: local-container
+    enabled: true
+    required: true
+    harness: codex
+    model: local-model
+    model_provider: local-provider
+    reasoning_effort: high
+    container_model_provider:
+      base_url: https://model-provider.example/v1
+      wire_api: responses
+      api_key_environment_variable: LOCAL_MODEL_API_KEY
+      requires_openai_auth: false
+    # Instead of container_model_provider, use one trusted host file:
+    # container_codex_config_file: C:\secure\local-engineer-config.toml
+    environment_from_host: [LOCAL_MODEL_API_KEY]
+    max_concurrency: 2
+    timeout_seconds: 3600
+    idle_timeout_seconds: 600
+    # Optional per-worker replacement for server.default_worker_prompt.
+    # worker_prompt: |-
+    #   Use narrow, reviewable patches and run targeted tests.
