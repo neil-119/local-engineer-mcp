@@ -118,6 +118,15 @@ describe('bounded projections', () => {
           reasoning_output: 1000,
           source: 'app_server',
         },
+        parent_to_worker: {
+          characters: 120,
+          estimated_tokens: 30,
+          title_characters: 10,
+          task_characters: 90,
+          grounding_characters: 20,
+          task_assignments: 1,
+          follow_up_messages: 0,
+        },
         parent_visible: {
           characters: 800,
           estimated_tokens: 200,
@@ -132,10 +141,16 @@ describe('bounded projections', () => {
 
     expect(projected.delegation_impact).toMatchObject({
       local_worker_tokens: { total: 30000, output: 5000 },
+      parent_to_worker_payload: {
+        characters: 120,
+        estimated_tokens: 30,
+        task_assignments: 1,
+      },
       parent_visible_review_tokens_estimate: 200,
       savings_status: 'unmeasured',
     });
     expect(projected.delegation_impact?.human_summary).toContain('30,000 tokens locally');
+    expect(projected.delegation_impact?.human_summary).toContain('about 30 tokens');
     expect(projected.delegation_impact?.human_summary).toContain('not a measured parent-token saving');
   });
 

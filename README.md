@@ -794,7 +794,7 @@ credentials, and host artifact paths.
 
 ### Token accounting
 
-`local-engineer stats` separates three measurements rather than presenting one
+`local-engineer stats` separates four measurements rather than presenting one
 misleading savings number:
 
 - Local worker input, cached-input, output, and reasoning tokens are exact when
@@ -803,18 +803,28 @@ misleading savings number:
   counted exactly in characters and estimated at four characters per token.
   This estimate does not include the parent's own reasoning, lifecycle tool
   calls, or ordinary conversation.
+- Parent-to-worker task text is also counted exactly in characters for every
+  initial assignment and parent follow-up. The accompanying token number is a
+  four-characters-per-token estimate, split into titles, task/reply text, and
+  grounding text. Retained historical runs are derived from their persisted
+  task/reply fields; new runs persist the accounting directly. This deliberately
+  excludes Local Engineer's generated worker policy and framing, so it is a
+  proxy for the parent's delegation effort—not a measure of the parent model's
+  complete conversation or billable usage.
 - Savings are measured only when the user supplies parent-session token totals
   from a comparable direct run and delegated run. Without that A/B baseline,
   the CLI explicitly reports that no exact counterfactual exists.
 
-When the app server reports worker usage, parent-facing `status` and
-`wait_for_completion` results include a compact `delegation_impact` summary for
-that run. It gives the parent a human-readable way to say, for example, that a
+Parent-facing `status` and `wait_for_completion` results include a compact
+`delegation_impact` summary whenever the run has delegation telemetry. It gives
+the parent a human-readable way to say, for example, that a
 local worker processed 30,000 tokens while only a bounded review payload came
-back to the parent. The field deliberately calls this **offloaded local work**,
-not a parent-token saving. A saving claim requires the controlled A/B comparison
-above; the parent may choose to share either clearly labeled result with the
-user.
+back to the parent. It also includes the direct parent-to-worker assignment and
+follow-up payload estimate, making the delegation overhead visible without
+claiming access to the parent's total session usage. The field deliberately
+calls this **offloaded local work**, not a parent-token saving. A saving claim
+requires the controlled A/B comparison above; the parent may choose to share
+either clearly labeled result with the user.
 
 Filters include `--since 2h|7d|<ISO timestamp>`, `--agent <id>`, and
 `--run <id>`. Statistics persist with run history in the configured state

@@ -89,6 +89,44 @@ export interface GroundingPacket {
   excluded_approaches?: string[];
   additional_context?: string;
 }
+export interface ParentToWorkerPayload {
+  characters: number;
+  estimated_tokens: number;
+  title_characters: number;
+  task_characters: number;
+  grounding_characters: number;
+  task_assignments: number;
+  follow_up_messages: number;
+}
+export function parentToWorkerPayload(
+  title: string,
+  task: string,
+  grounding: GroundingPacket | undefined,
+  kind: 'assignment' | 'follow_up',
+): ParentToWorkerPayload {
+  const titleCharacters = title.length;
+  const taskCharacters = task.length;
+  const groundingCharacters = [
+    grounding?.objective,
+    ...(grounding?.known_facts ?? []),
+    ...(grounding?.constraints ?? []),
+    ...(grounding?.acceptance_criteria ?? []),
+    ...(grounding?.references ?? []),
+    ...(grounding?.parent_hypotheses ?? []),
+    ...(grounding?.excluded_approaches ?? []),
+    grounding?.additional_context,
+  ].reduce((total, value) => total + (value?.length ?? 0), 0);
+  const characters = titleCharacters + taskCharacters + groundingCharacters;
+  return {
+    characters,
+    estimated_tokens: Math.ceil(characters / 4),
+    title_characters: titleCharacters,
+    task_characters: taskCharacters,
+    grounding_characters: groundingCharacters,
+    task_assignments: kind === 'assignment' ? 1 : 0,
+    follow_up_messages: kind === 'follow_up' ? 1 : 0,
+  };
+}
 export interface Worker {
   name: string;
   enabled: boolean;
@@ -177,6 +215,12 @@ export interface RunStats {
     reasoning_output: number;
     source: 'app_server';
   };
+  /**
+   * Text directly supplied by the parent through start/reply. This deliberately
+   * excludes Local Engineer's generated policy and prompt framing, so it is a
+   * useful proxy for parent delegation effort rather than worker context size.
+   */
+  parent_to_worker?: ParentToWorkerPayload;
   parent_visible: {
     characters: number;
     estimated_tokens: number;

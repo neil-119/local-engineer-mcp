@@ -151,7 +151,7 @@ export function createServer(engine: LocalEngineer): McpServer {
   server.tool(
     'local_engineer_wait_for_completion',
     toolDescription(
-      'Wait for one or many container runs owned by this parent connection without exposing logs. Prefer wait_for any with timeout_seconds 300 rather than repeated short polls. When a run includes delegation_impact, you may share its local-work token total with the user; call it offloaded work, not measured parent-token savings, unless a controlled A/B comparison establishes savings.',
+      'Wait for one or many container runs owned by this parent connection without exposing logs. Prefer wait_for any with timeout_seconds 300 rather than repeated short polls. delegation_impact can include exact local worker tokens, a bounded estimate of parent-to-worker task/reply text, and a bounded review-context estimate. These are not measured parent-token savings without a controlled A/B comparison.',
     ),
     {
       run_ids: z.array(z.string()).min(1),
@@ -176,7 +176,7 @@ export function createServer(engine: LocalEngineer): McpServer {
   server.tool(
     'local_engineer_status',
     toolDescription(
-      'Get bounded status for container run or agent IDs owned by this parent connection. delegation_impact reports exact local worker tokens when available and a bounded review-context estimate; it is not a measured parent-token saving without a controlled A/B comparison.',
+      'Get bounded status for container run or agent IDs owned by this parent connection. delegation_impact reports exact local worker tokens when available, plus a bounded estimate of direct parent-to-worker task/reply text and parent-visible review context. It is not a measured parent-token saving without a controlled A/B comparison.',
     ),
     { run_ids: z.array(z.string()).optional(), agent_ids: z.array(z.string()).optional() },
     async (input) => {

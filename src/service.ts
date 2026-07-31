@@ -1,5 +1,14 @@
 import { randomBytes } from 'node:crypto';
-import type { Config, GroundingPacket, Result, Run, RunStats, RunStatus, Worker } from './domain.js';
+import {
+  parentToWorkerPayload,
+  type Config,
+  type GroundingPacket,
+  type Result,
+  type Run,
+  type RunStats,
+  type RunStatus,
+  type Worker,
+} from './domain.js';
 import { emptyResult, RunStore } from './store.js';
 import { buildPrompt } from './prompt.js';
 import { canonicalWorkspace, defaultWorker } from './config.js';
@@ -71,6 +80,7 @@ export class LocalEngineer {
       continuationIndex: 0,
       createdAt: now(),
       diagnostics: activity('queued'),
+      stats: parentToWorkerStats(input.title, input.task, input.grounding, 'assignment'),
       requiresUserAction: false,
     };
     this.store.add(run);
@@ -112,6 +122,7 @@ export class LocalEngineer {
       createdAt: now(),
       workerThreadId: prior.workerThreadId,
       diagnostics: activity('queued'),
+      stats: parentToWorkerStats(input.title, input.message, input.grounding, 'follow_up'),
       requiresUserAction: false,
     };
     this.store.add(run);
@@ -701,6 +712,15 @@ export class LocalEngineer {
 }
 function emptyStats(): RunStats {
   return {
+    parent_to_worker: {
+      characters: 0,
+      estimated_tokens: 0,
+      title_characters: 0,
+      task_characters: 0,
+      grounding_characters: 0,
+      task_assignments: 0,
+      follow_up_messages: 0,
+    },
     parent_visible: {
       characters: 0,
       estimated_tokens: 0,
@@ -710,6 +730,18 @@ function emptyStats(): RunStats {
       lifecycle_characters: 0,
     },
     review_requests: { changes: 0, diffs: 0, files: 0 },
+  };
+}
+
+function parentToWorkerStats(
+  title: string,
+  task: string,
+  grounding: GroundingPacket | undefined,
+  kind: 'assignment' | 'follow_up',
+): RunStats {
+  return {
+    ...emptyStats(),
+    parent_to_worker: parentToWorkerPayload(title, task, grounding, kind),
   };
 }
 function tokenUsageFromEvent(event: {
@@ -924,14 +956,17 @@ export interface SafeRun {
   result?: Result;
   change_set?: Run['changeSet'];
   delegation_impact?: {
-    local_worker_tokens: NonNullable<RunStats['worker_tokens']>;
+    local_worker_tokens?: NonNullable<RunStats['worker_tokens']>;
+    parent_to_worker_payload: NonNullable<RunStats['parent_to_worker']> & {
+      token_estimate_method: 'characters_divided_by_4_per_assignment_or_follow_up';
+    };
     parent_visible_review_tokens_estimate: number;
     savings_status: 'unmeasured';
     human_summary: string;
   };
 }
 export function safe(run: Run): SafeRun {
-  const delegationImpact = delegationImpactFor(run.stats);
+  const delegationImpact = delegationImpactFor(run);
   return {
     schema_version: 1,
     run_id: run.runId,
@@ -950,18 +985,35 @@ export function safe(run: Run): SafeRun {
   };
 }
 
-function delegationImpactFor(stats?: RunStats): SafeRun['delegation_impact'] | undefined {
+function delegationImpactFor(run: Run): SafeRun['delegation_impact'] | undefined {
+  const stats = run.stats;
   const worker = stats?.worker_tokens;
-  if (!worker) return undefined;
+  const parentToWorker =
+    stats?.parent_to_worker ??
+    (stats
+      ? parentToWorkerPayload(run.title, run.task, run.grounding, run.continuationIndex ? 'follow_up' : 'assignment')
+      : undefined);
+  if (!worker && !parentToWorker) return undefined;
   const reviewEstimate = stats?.parent_visible.estimated_tokens ?? 0;
+  const parentPayload = parentToWorker ?? emptyStats().parent_to_worker!;
+  const workerSummary = worker
+    ? `Local Engineer processed ${worker.total.toLocaleString('en-US')} tokens locally ` +
+      `(${worker.output.toLocaleString('en-US')} output; ${worker.reasoning_output.toLocaleString('en-US')} reasoning) `
+    : 'Local Engineer has not yet reported local worker token usage ';
   return {
-    local_worker_tokens: worker,
+    ...(worker ? { local_worker_tokens: worker } : {}),
+    parent_to_worker_payload: {
+      ...parentPayload,
+      token_estimate_method: 'characters_divided_by_4_per_assignment_or_follow_up',
+    },
     parent_visible_review_tokens_estimate: reviewEstimate,
     savings_status: 'unmeasured',
     human_summary:
-      `Local Engineer processed ${worker.total.toLocaleString('en-US')} tokens locally ` +
-      `(${worker.output.toLocaleString('en-US')} output; ${worker.reasoning_output.toLocaleString('en-US')} reasoning) ` +
+      workerSummary +
+      `after the parent supplied ${parentPayload.characters.toLocaleString('en-US')} characters ` +
+      `(about ${parentPayload.estimated_tokens.toLocaleString('en-US')} tokens) across ` +
+      `${parentPayload.task_assignments} task assignment(s) and ${parentPayload.follow_up_messages} follow-up message(s), ` +
       `and exposed about ${reviewEstimate.toLocaleString('en-US')} review tokens to the parent. ` +
-      'This is offloaded local work, not a measured parent-token saving.',
+      'The parent-to-worker figure excludes generated policy/framing and is not total parent conversation usage. This is offloaded local work, not a measured parent-token saving.',
   };
 }

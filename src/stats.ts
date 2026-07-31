@@ -1,4 +1,4 @@
-import type { Run } from './domain.js';
+import { parentToWorkerPayload, type Run } from './domain.js';
 
 export interface StatsOptions {
   since?: string;
@@ -46,6 +46,31 @@ export function summarizeStats(runs: Run[], options: StatsOptions = {}) {
       lifecycle_characters: 0,
     },
   );
+  const parentToWorker = selected.reduce(
+    (total, run) => {
+      const payload =
+        run.stats?.parent_to_worker ??
+        parentToWorkerPayload(run.title, run.task, run.grounding, run.continuationIndex ? 'follow_up' : 'assignment');
+      return {
+        characters: total.characters + payload.characters,
+        estimated_tokens: total.estimated_tokens + payload.estimated_tokens,
+        title_characters: total.title_characters + payload.title_characters,
+        task_characters: total.task_characters + payload.task_characters,
+        grounding_characters: total.grounding_characters + payload.grounding_characters,
+        task_assignments: total.task_assignments + payload.task_assignments,
+        follow_up_messages: total.follow_up_messages + payload.follow_up_messages,
+      };
+    },
+    {
+      characters: 0,
+      estimated_tokens: 0,
+      title_characters: 0,
+      task_characters: 0,
+      grounding_characters: 0,
+      task_assignments: 0,
+      follow_up_messages: 0,
+    },
+  );
   const baseline =
     options.baselineParentTokens !== undefined && options.delegatedParentTokens !== undefined
       ? {
@@ -86,6 +111,12 @@ export function summarizeStats(runs: Run[], options: StatsOptions = {}) {
       ...parent,
       token_estimate_method: 'characters_divided_by_4_per_delivery',
       coverage: 'structured change, diff, and file review payloads recorded after this feature was installed',
+    },
+    parent_to_worker_payload: {
+      ...parentToWorker,
+      token_estimate_method: 'characters_divided_by_4_per_assignment_or_follow_up',
+      coverage:
+        'task/reply titles, messages, and grounding text recorded after this feature was installed; excludes generated Local Engineer policy and prompt framing',
     },
     measured_savings: baseline,
     savings_note: baseline

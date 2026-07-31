@@ -17,9 +17,10 @@ When the `local_engineer_*` MCP tools are available, use configured Local Engine
 - Start independent tasks in parallel only when their workspaces and expected edits do not conflict. Respect the configured worker and server concurrency limits.
 - Use `local_engineer_wait_for_completion` with `any` while supervising several runs, then inspect each bounded result. Follow up through `local_engineer_reply` when a result needs clarification or a focused next step.
 - When a settled run includes `delegation_impact`, consider telling the user how
-  much work the local agent processed. Call it **offloaded local work**, not
-  parent-token savings, unless a controlled direct-vs-delegated A/B comparison
-  has measured the saving.
+  much work the local agent processed and how much direct task/reply text the
+  parent sent to it. Call the former **offloaded local work** and the latter a
+  parent-to-worker payload estimate—not parent-token savings—unless a
+  controlled direct-vs-delegated A/B comparison has measured the saving.
 - Prefer the repository's documented image profile. If it is unavailable or
   stale, plan it with `local_engineer_build_image`, show the exact inputs,
   installer steps, read-only dependency domains, and digest to the user, and

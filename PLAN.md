@@ -45,6 +45,9 @@
   reviewed patches.
 - Added persisted exact worker-token counters, bounded review-payload
   estimates, filtered CLI statistics, and optional controlled A/B savings.
+- Added parent-to-worker assignment/follow-up payload accounting: exact
+  character counts and clearly labeled token estimates, separate from the
+  parent model's unknown full conversational usage.
 - Expanded CI compatibility coverage to Node.js 22 and 24, matching the
   built-in `node:sqlite` requirement.
 - Live-validated the restarted MCP schemas, deterministic image planning,

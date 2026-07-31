@@ -6,6 +6,34 @@ import { LocalEngineer } from '../src/service.js';
 import { RunStore } from '../src/store.js';
 
 describe('agent lifecycle history', () => {
+  it('records direct parent task and grounding text for an initial assignment', () => {
+    const stateDirectory = mkdtempSync(join(testTemporaryDirectory(), 'service-start-'));
+    const testConfig = config(stateDirectory);
+    testConfig.security.allowed_roots = [stateDirectory];
+    const store = new RunStore(stateDirectory);
+    const engine = new LocalEngineer(testConfig, store, 'owner_test');
+    Object.defineProperty(engine, 'queue', { value: () => undefined });
+
+    const title = 'Initial assignment';
+    const task = 'Inspect the narrow target.';
+    const objective = 'Verify parent payload telemetry.';
+    const started = engine.start({
+      title,
+      task,
+      workingDirectory: stateDirectory,
+      grounding: { objective, constraints: ['Do not edit files.'] },
+    });
+
+    expect(store.get(started.run_id)?.stats?.parent_to_worker).toMatchObject({
+      task_assignments: 1,
+      follow_up_messages: 0,
+      title_characters: title.length,
+      task_characters: task.length,
+      grounding_characters: objective.length + 'Do not edit files.'.length,
+      characters: title.length + task.length + objective.length + 'Do not edit files.'.length,
+    });
+  });
+
   it('delivers only unseen revision deltas and does not advance a truncated cursor', async () => {
     const stateDirectory = mkdtempSync(join(testTemporaryDirectory(), 'service-diff-'));
     const store = new RunStore(stateDirectory);
@@ -92,6 +120,14 @@ describe('agent lifecycle history', () => {
       status: 'queued',
       continuation_index: 1,
       continuation_of_run_id: reviewed.runId,
+    });
+    expect(store.get(continuation.run_id)?.stats?.parent_to_worker).toMatchObject({
+      task_assignments: 0,
+      follow_up_messages: 1,
+      title_characters: 'Focused correction'.length,
+      task_characters: 'Correct one reviewed issue.'.length,
+      grounding_characters: 0,
+      characters: 'Focused correction'.length + 'Correct one reviewed issue.'.length,
     });
   });
 
