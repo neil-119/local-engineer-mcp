@@ -10,17 +10,16 @@
 
 ## Local Engineer delegation
 
-When the `local_engineer_*` MCP tools are available, use configured Local Engineer workers for substantial, bounded work that can proceed independently. Default to delegating repository reconnaissance, focused bug investigations, isolated implementation tasks, targeted test failures, and parallel review of distinct areas.
+When the `local_engineer_*` MCP tools are available, ALWAYS use configured Local Engineer workers for the bulk of substantial, bounded implementation and investigation that can proceed independently. Default to delegating repository reconnaissance, focused bug investigations, isolated implementation tasks, targeted test failures, and parallel review of distinct areas. Do not silently implement that work in the parent when Local Engineer is unavailable, misconfigured, unhealthy, or missing a required image profile: tell the user exactly what is unavailable and what they need to do to restore delegation, then wait for direction.
 
-- Keep responsibility for task decomposition, security-sensitive decisions, cross-cutting integration, final code review, and the user-facing answer in the parent agent.
+- Keep responsibility for task decomposition, security-sensitive decisions, cross-cutting integration, final code review, and the user-facing answer in the parent agent. Review worker code rigorously: inspect focused diffs and files, compare the implementation against requirements and repository conventions, identify bugs or unsafe behavior, request corrections when needed, and independently validate promoted changes.
 - Give every worker a precise title, working directory, constraints, expected deliverables, and the tests or evidence it should return. Do not ask a worker to modify files outside its assigned workspace.
 - Start independent tasks in parallel only when their workspaces and expected edits do not conflict. Respect the configured worker and server concurrency limits.
 - Use `local_engineer_wait_for_completion` with `any` while supervising several runs, then inspect each bounded result. Follow up through `local_engineer_reply` when a result needs clarification or a focused next step.
 - When a settled run includes `delegation_impact`, consider telling the user how
-  much work the local agent processed and how much direct task/reply text the
-  parent sent to it. Call the former **offloaded local work** and the latter a
-  parent-to-worker payload estimate—not parent-token savings—unless a
-  controlled direct-vs-delegated A/B comparison has measured the saving.
+  much work the local agent processed. Call it **offloaded local work**, not
+  parent-token savings, unless a controlled direct-vs-delegated A/B comparison
+  has measured the saving.
 - Prefer the repository's documented image profile. If it is unavailable or
   stale, plan it with `local_engineer_build_image`, show the exact inputs,
   installer steps, read-only dependency domains, and digest to the user, and

@@ -18,6 +18,8 @@ export interface ContainerRuntimeProbe {
   executable: string;
   version?: string;
   errorCode?: string;
+  /** A bounded, non-sensitive explanation appropriate for MCP responses. */
+  errorSummary?: string;
 }
 
 const RESOURCE_NAME = /^[a-z0-9][a-z0-9_.-]{0,127}$/;
@@ -67,6 +69,7 @@ export class ContainerRuntime {
         supported: false,
         executable: this.executable,
         errorCode: runtimeErrorCode(cause),
+        errorSummary: runtimeErrorSummary(cause, this.executable),
       };
     } finally {
       await this.removeContainer(container, true).catch(() => undefined);
@@ -367,4 +370,22 @@ function runtimeVersion(value: string): string {
 
 function runtimeErrorCode(cause: unknown): string {
   return cause instanceof Error ? cause.message.split(':')[0]! : 'CONTAINER_RUNTIME_UNSUPPORTED';
+}
+
+function runtimeErrorSummary(cause: unknown, executable: string): string {
+  const message = cause instanceof Error ? cause.message : String(cause);
+  if (
+    /failed to connect to the (docker|container) API|cannot connect to the Docker daemon|docker_engine|podman\.sock|is the daemon running/i.test(
+      message,
+    )
+  ) {
+    return `The ${executable} daemon is unavailable. Start the container runtime and retry the agent.`;
+  }
+  if (/CONTAINER_RUNTIME_LAUNCH_FAILED/i.test(message)) {
+    return `Local Engineer could not launch the configured container command (${executable}). Verify it is installed and on PATH.`;
+  }
+  if (/CONTAINER_RUNTIME_COMMAND_TIMEOUT/i.test(message)) {
+    return 'The container runtime capability probe timed out. Verify the container runtime is healthy and retry the agent.';
+  }
+  return 'The configured container runtime failed its capability probe. Run `local-engineer doctor` for safe diagnostics.';
 }

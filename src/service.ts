@@ -402,7 +402,11 @@ export class LocalEngineer {
       if (this.requireOwned(runId).status !== 'starting') return;
       const imageReference = run.imageReference ?? this.config.container.image;
       const probe = await this.containerManager.probe(imageReference);
-      if (!probe.supported) throw new Error(`CONTAINER_RUNTIME_UNSUPPORTED:${probe.errorCode ?? 'unknown'}`);
+      if (!probe.supported) {
+        throw new Error(
+          `CONTAINER_RUNTIME_UNAVAILABLE:${probe.errorCode ?? 'unknown'}:${probe.errorSummary ?? 'Container runtime probe failed.'}`,
+        );
+      }
       const profileRepository = run.imageProfile
         ? (run.repositories ?? []).find((repository) => repository.containerPath === run.containerWorkingDirectory)
             ?.name
@@ -470,6 +474,7 @@ export class LocalEngineer {
       const timedOut = error instanceof Error && error.message === 'RUN_TIMEOUT';
       const idleTimedOut = error instanceof Error && error.message === 'RUN_IDLE_TIMEOUT';
       const appServerExit = error instanceof Error && /^CODEX_APP_SERVER_(EXIT|ERROR)/.test(error.message);
+      const runtimeUnavailable = error instanceof Error && error.message.startsWith('CONTAINER_RUNTIME_UNAVAILABLE:');
       this.store.setStatus(runId, timedOut ? 'timed_out' : 'failed', {
         completedAt: now(),
         errorCode: timedOut
@@ -478,12 +483,14 @@ export class LocalEngineer {
             ? 'RUN_IDLE_TIMEOUT'
             : appServerExit
               ? 'CODEX_APP_SERVER_EXIT'
-              : 'HARNESS_FAILURE',
+              : runtimeUnavailable
+                ? 'CONTAINER_RUNTIME_UNAVAILABLE'
+                : 'HARNESS_FAILURE',
         diagnostics: activity(
           appServerExit ? 'app_server_exited' : timedOut ? 'timed_out' : idleTimedOut ? 'idle_timed_out' : 'failed',
           current.diagnostics,
           {
-            ...(appServerExit || idleTimedOut
+            ...(appServerExit || idleTimedOut || runtimeUnavailable
               ? { exit_reason: error instanceof Error ? error.message : String(error) }
               : {}),
           },

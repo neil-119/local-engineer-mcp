@@ -63,17 +63,18 @@ describe('container runtime adapter', () => {
     );
   });
 
-  it('reports an unsupported runtime without leaking command output', async () => {
+  it('reports an unavailable daemon with a safe actionable summary, without leaking command output', async () => {
     const runtime = new ContainerRuntime('nerdctl', async () => ({
       exitCode: 1,
       stdout: '',
-      stderr: 'sensitive host diagnostic',
+      stderr: 'failed to connect to the docker API at npipe:////./pipe/docker_engine; secret-host-detail',
     }));
 
     await expect(runtime.probe('worker:latest')).resolves.toEqual({
       supported: false,
       executable: 'nerdctl',
       errorCode: 'CONTAINER_RUNTIME_COMMAND_FAILED',
+      errorSummary: 'The nerdctl daemon is unavailable. Start the container runtime and retry the agent.',
     });
   });
 
