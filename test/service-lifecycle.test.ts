@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { Config, Run } from '../src/domain.js';
-import { LocalEngineer, safe } from '../src/service.js';
+import { LocalEngineer, completedAgentMessage, safe } from '../src/service.js';
 import { RunStore } from '../src/store.js';
 
 describe('agent lifecycle history', () => {
@@ -271,3 +271,25 @@ function testTemporaryDirectory(): string {
   mkdirSync(path, { recursive: true });
   return path;
 }
+
+describe('completed assistant message extraction', () => {
+  it('captures only completed agentMessage items with stable ids', () => {
+    expect(
+      completedAgentMessage({
+        method: 'item/completed',
+        params: { item: { type: 'agentMessage', id: 'item_9', text: 'finished' } },
+      }),
+    ).toEqual({ itemId: 'item_9', text: 'finished' });
+    expect(
+      completedAgentMessage({
+        method: 'item/completed',
+        params: { item: { type: 'commandExecution', id: 'cmd_1', text: 'ls -la' } },
+      }),
+    ).toBeUndefined();
+    expect(completedAgentMessage({ method: 'item/agentMessage/delta', params: { delta: 'z' } })).toBeUndefined();
+    expect(
+      completedAgentMessage({ method: 'item/completed', params: { item: { type: 'agentMessage', id: 'x' } } }),
+    ).toBeUndefined();
+    expect(completedAgentMessage({})).toBeUndefined();
+  });
+});

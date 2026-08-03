@@ -751,10 +751,23 @@ local-engineer stats --since 7d
 local-engineer stats --since 7d `
   --baseline-parent-tokens 120000 `
   --delegated-parent-tokens 42000
+
+# Start the read-only localhost web monitor and open the default browser
+local-engineer monitor
+
+# Bind a specific port on 127.0.0.1 without launching the browser
+local-engineer monitor --port 9000 --no-open
 ```
 
 The CLI intentionally has no session-resume command. Container workers are
 managed through their MCP lifecycle and review operations.
+
+`local-engineer monitor` starts a read-only localhost web interface that
+auto-refreshes a bounded, safe view of recent agent runs. It binds strictly to
+127.0.0.1, prints the URL it is serving, and opens the default browser unless
+`--no-open` is supplied. `--port <1-65535>` is strictly validated and defaults
+to 8899. The process runs until interrupted. See "Monitor web UI" under
+Observability for the security boundary.
 
 ## Observability
 
@@ -791,6 +804,55 @@ MCP projections include bounded lifecycle phases, timestamps, command counts,
 failure excerpts, structured report status, and captured change-set metadata.
 They exclude private Codex IDs, raw events, successful command output,
 credentials, and host artifact paths.
+
+### Monitor web UI
+
+`local-engineer monitor` renders the same bounded, read-only view on a localhost
+web page. The page auto-refreshes every few seconds against a single bounded
+JSON endpoint (`/api/runs`) and clearly distinguishes active, review, and
+terminal runs. It shows run and agent handles, title, worker, timestamps and
+activity, safe diagnostics, a structured result summary with verification and
+change counts, and delegation/token impact when present.
+
+The monitor is deliberately read-only and local-only:
+
+- It binds strictly to 127.0.0.1 and offers no `--host` option.
+- Only `GET` and `HEAD` are accepted; all other methods receive `405` with an
+  `Allow` header. There are no cancel, reply, promotion, deletion, or raw-log
+  endpoints.
+- The projection never exposes owner IDs, the original task or grounding
+  payloads, host or container paths, Codex thread/turn IDs, environment or
+  configuration values, writer-state metadata, or raw event logs. Command
+  failure excerpts are excluded.
+- The page is self-contained local HTML/CSS/JS with no CDN or network assets;
+  it has an explicit empty state and a visible unreachable/error state.
+- The CLI keeps running until interrupted, so it is safe for short-lived
+  inspection and should be stopped when no longer needed.
+
+The monitor drives both views through server-side pagination. `GET /api/runs`
+returns runs newest-first in pages (default 25, hard maximum 100) with an opaque
+`next_cursor` and a `has_more` flag; the page keeps a small previous-cursor stack
+so Previous/Next navigation never re-fetches the whole history. Run ordering is
+`createdAt` descending with `run_id` as a deterministic tie-breaker. Invalid
+limits or cursors fail closed with a safe `400` rather than silently broadening
+the request.
+
+Assistant messages are available read-only at
+`GET /api/runs/:run_id/messages`. The store persists only completed
+`agentMessage` text into a dedicated table as the MCP server processes it; it
+does not source messages from prompts, reasoning, command execution, tool output,
+or raw event logs, and it never exposes thread/turn IDs or internal item IDs.
+Assistant-message text is still untrusted model output and may repeat task or
+repository content, so keep the localhost monitor and its host appropriately
+secured. Messages are bounded
+(per-message text and per-run count), returned newest-first with the same opaque
+cursor pagination, and include only a timestamp, the text, and a `truncated`
+flag.
+
+Message capture begins only after the updated MCP server restarts. The monitor
+never scans or parses historical raw-event files, so runs that finished before
+the restart have no assistant messages even though their structured result
+summaries, change sets, and diagnostics remain available.
 
 ### Token accounting
 

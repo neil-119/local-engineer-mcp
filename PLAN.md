@@ -65,6 +65,11 @@
 - Post-restart direct worker smoke completed `ready_for_review` with a valid
   structured report, a successful read-only command, no changed files, and
   explicit disposal of the worker resources.
+- Added a read-only localhost monitor with server-side cursor pagination for
+  persisted runs and bounded, on-demand pages of completed worker messages.
+- Added SQLite-backed message deduplication, truncation, newest-message
+  retention, private sequence cursors, and tests proving Codex item IDs do not
+  enter monitor responses.
 
 ## Pending
 

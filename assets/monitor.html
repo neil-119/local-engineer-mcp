@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Local Engineer Monitor</title>
+    <style>
+      :root {
+        --bg: #0f1218;
+        --panel: #171b24;
+        --panel-2: #1e2430;
+        --border: #2a3140;
+        --text: #e6e9ef;
+        --muted: #98a1b3;
+        --active: #f0b429;
+        --review: #3d8bff;
+        --terminal: #34c98e;
+        --error: #ff6b6b;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        line-height: 1.5;
+      }
+      header {
+        position: sticky;
+        top: 0;
+        z-index: 10;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 12px 20px;
+        background: var(--panel);
+        border-bottom: 1px solid var(--border);
+      }
+      header h1 { font-size: 18px; margin: 0; font-weight: 600; }
+      header .meta { color: var(--muted); font-size: 13px; display: flex; gap: 16px; align-items: center; }
+      .status-pill { padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+      .status-pill.ok { background: rgba(52, 201, 142, 0.16); color: var(--terminal); }
+      .status-pill.bad { background: rgba(255, 107, 107, 0.16); color: var(--error); }
+      main { padding: 20px; max-width: 1100px; margin: 0 auto; }
+      .empty, .error {
+        padding: 40px 20px;
+        text-align: center;
+        color: var(--muted);
+        border: 1px dashed var(--border);
+        border-radius: 12px;
+      }
+      .run {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 16px 18px;
+        margin: 0 0 14px;
+      }
+      .run-head { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 8px; }
+      .run-head .title { font-weight: 600; flex: 1 1 240px; }
+      .badge {
+        font-size: 12px; padding: 3px 9px; border-radius: 999px; font-weight: 600; white-space: nowrap;
+      }
+      .badge.active { background: rgba(240, 180, 41, 0.16); color: var(--active); }
+      .badge.review { background: rgba(61, 139, 255, 0.16); color: var(--review); }
+      .badge.terminal { background: rgba(52, 201, 142, 0.16); color: var(--terminal); }
+      .badge.failed { background: rgba(255, 107, 107, 0.16); color: var(--error); }
+      .handles { color: var(--muted); font-size: 13px; display: flex; flex-wrap: wrap; gap: 6px 18px; margin-bottom: 10px; }
+      .handles code { background: var(--panel-2); padding: 2px 6px; border-radius: 6px; }
+      .meta-grid {
+        display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px;
+        color: var(--muted); font-size: 13px; margin-bottom: 10px;
+      }
+      .meta-grid b { color: var(--text); font-weight: 600; }
+      .section-title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 12px 0 6px; }
+      .verification { display: flex; flex-wrap: wrap; gap: 6px; }
+      .verification span { font-size: 12px; padding: 2px 8px; border-radius: 6px; background: var(--panel-2); }
+      .verification .passed { color: var(--terminal); }
+      .verification .failed { color: var(--error); }
+      .verification .not_run { color: var(--muted); }
+      .risks { color: #e0b3b3; font-size: 13px; }
+      .risks ul { margin: 4px 0 0; padding-left: 18px; }
+      .foot { color: var(--muted); text-align: center; font-size: 12px; padding: 20px; }
+      .nav-controls { display: flex; gap: 8px; align-items: center; }
+      .nav-controls button { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 4px 10px; cursor: pointer; }
+      .nav-controls button:disabled { opacity: 0.45; cursor: default; }
+      .msg-toggle {
+        margin-top: 12px; background: var(--panel-2); color: var(--text);
+        border: 1px solid var(--border); border-radius: 8px; padding: 6px 12px; cursor: pointer;
+      }
+      .messages { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 10px; }
+      .messages[hidden] { display: none; }
+      .msg-controls { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+      .msg-controls button { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 4px 10px; cursor: pointer; }
+      .msg-controls button:disabled { opacity: 0.45; cursor: default; }
+      .msg-count { color: var(--muted); font-size: 12px; margin-left: auto; }
+      .msg-list { list-style: none; margin: 0; padding: 0; }
+      .msg { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin: 0 0 8px; background: var(--panel-2); }
+      .msg-meta { color: var(--muted); font-size: 12px; display: flex; gap: 10px; align-items: center; margin-bottom: 6px; }
+      .msg-text { white-space: pre-wrap; word-break: break-word; font-size: 13px; }
+      .msg-empty, .msg-loading { padding: 20px; text-align: center; color: var(--muted); }
+      .msg-error { padding: 20px; text-align: center; color: var(--error); }
+      @media (max-width: 600px) {
+        main { padding: 12px; }
+        header { flex-direction: column; align-items: flex-start; }
+        header .meta { flex-wrap: wrap; }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Local Engineer Monitor</h1>
+      <div class="meta">
+        <span id="last-updated">Not loaded</span>
+        <span id="run-count">— runs</span>
+        <span class="nav-controls">
+          <button id="run-prev" type="button" disabled>‹ Newer</button>
+          <span id="run-page-indicator">Page 1</span>
+          <button id="run-next" type="button" disabled>Older ›</button>
+        </span>
+        <button id="refresh" type="button">Refresh</button>
+        <span id="conn" class="status-pill ok">connected</span>
+      </div>
+    </header>
+    <main id="content">
+      <div class="empty">Loading monitor…</div>
+    </main>
+    <div class="foot">
+      Read-only local interface bound to 127.0.0.1. No write, replay, or promotion controls are exposed.
+    </div>
+    <script>
+      'use strict';
+      var REFRESH_MS = 3000;
+      var content = document.getElementById('content');
+      var conn = document.getElementById('conn');
+      var lastUpdated = document.getElementById('last-updated');
+      var runCount = document.getElementById('run-count');
+      var runPageLimit = 25;
+
+      var runCursor = null;
+      var runCursorStack = [];
+      var runNextCursor = null;
+      var runHasMore = false;
+
+      var msgState = {
+        runId: null,
+        cursor: null,
+        cursorStack: [],
+        nextCursor: null,
+        hasMore: false,
+        container: null
+      };
+
+      document.getElementById('refresh').addEventListener('click', load);
+      document.getElementById('run-prev').addEventListener('click', runPrevPage);
+      document.getElementById('run-next').addEventListener('click', runNextPage);
+
+      function fmtTime(iso) {
+        if (!iso) return '—';
+        try { return new Date(iso).toLocaleString(); } catch (_) { return iso; }
+      }
+
+      function esc(value) {
+        return String(value).replace(/[&<>"']/g, function (c) {
+          return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+        });
+      }
+
+      function badgeClass(status, lifecycle) {
+        if (status === 'failed' || status === 'timed_out') return 'failed';
+        return lifecycle;
+      }
+
+      function changeCounts(run) {
+        if (!run.change_set) return null;
+        var totalPaths = 0, additions = 0, deletions = 0;
+        (run.change_set.repositories || []).forEach(function (repo) {
+          totalPaths += repo.changed_paths || 0;
+          additions += repo.additions || 0;
+          deletions += repo.deletions || 0;
+        });
+        return { totalPaths: totalPaths, additions: additions, deletions: deletions };
+      }
+
+      function runPath() {
+        var q = '/api/runs?limit=' + runPageLimit;
+        if (runCursor != null) q += '&cursor=' + encodeURIComponent(runCursor);
+        return q;
+      }
+
+      function load() {
+        loadRuns(runPath());
+      }
+
+      function loadRuns(path) {
+        fetch(path, { cache: 'no-store' })
+          .then(function (response) {
+            if (!response.ok) throw new Error('HTTP ' + response.status);
+            return response.json();
+          })
+          .then(function (snapshot) {
+            conn.className = 'status-pill ok';
+            conn.textContent = 'connected';
+            lastUpdated.textContent = 'Updated ' + new Date().toLocaleTimeString();
+            runNextCursor = snapshot.next_cursor || null;
+            runHasMore = !!snapshot.has_more;
+            render(snapshot);
+            updateRunNav();
+          })
+          .catch(function (err) {
+            conn.className = 'status-pill bad';
+            conn.textContent = 'unreachable';
+            var node = document.createElement('div');
+            node.className = 'error';
+            node.textContent = 'Could not load monitor data: ' + err.message;
+            content.textContent = '';
+            content.appendChild(node);
+            updateRunNav();
+          });
+      }
+
+      function runNextPage() {
+        if (!runHasMore || runNextCursor == null) return;
+        runCursorStack.push(runCursor);
+        runCursor = runNextCursor;
+        load();
+      }
+
+      function runPrevPage() {
+        if (runCursorStack.length === 0) return;
+        runCursor = runCursorStack.pop();
+        load();
+      }
+
+      function updateRunNav() {
+        document.getElementById('run-prev').disabled = runCursorStack.length === 0;
+        document.getElementById('run-next').disabled = !runHasMore;
+        document.getElementById('run-page-indicator').textContent = 'Page ' + (runCursorStack.length + 1);
+      }
+
+      function toggleMessages(el, runId) {
+        var container = el.querySelector('.messages');
+        var wasHidden = container.hidden;
+        if (msgState.container && msgState.container !== container) {
+          msgState.container.hidden = true;
+        }
+        container.hidden = !wasHidden;
+        if (container.hidden) {
+          if (msgState.container === container) {
+            msgState.container = null;
+            msgState.runId = null;
+            msgState.cursor = null;
+            msgState.cursorStack = [];
+            msgState.nextCursor = null;
+            msgState.hasMore = false;
+          }
+          return;
+        }
+        msgState.container = container;
+        if (msgState.runId !== runId) {
+          msgState.runId = runId;
+          msgState.cursor = null;
+          msgState.cursorStack = [];
+          msgState.nextCursor = null;
+          msgState.hasMore = false;
+          loadMessagePage(container, runId, null);
+        } else {
+          loadMessagePage(container, runId, msgState.cursor);
+        }
+      }
+
+      function loadMessagePage(container, runId, cursor) {
+        container.innerHTML = '<div class="msg-loading">Loading messages…</div>';
+        var q = '/api/runs/' + encodeURIComponent(runId) + '/messages?limit=' + runPageLimit;
+        if (cursor != null) q += '&cursor=' + encodeURIComponent(cursor);
+        fetch(q, { cache: 'no-store' })
+          .then(function (response) {
+            if (!response.ok) throw new Error('HTTP ' + response.status);
+            return response.json();
+          })
+          .then(function (page) {
+            if (msgState.runId !== runId) return;
+            msgState.cursor = cursor;
+            msgState.nextCursor = page.next_cursor || null;
+            msgState.hasMore = !!page.has_more;
+            renderMessages(container, runId, page);
+          })
+          .catch(function (err) {
+            container.innerHTML = '<div class="msg-error">Could not load messages: ' + esc(err.message) + '</div>';
+          });
+      }
+
+      function renderMessages(container, runId, page) {
+        var html = '<div class="msg-controls">';
+        html += '<button type="button" data-msg-act="prev"' + (msgState.cursorStack.length === 0 ? ' disabled' : '') + '>‹ Newer</button>';
+        html += '<button type="button" data-msg-act="next"' + (msgState.hasMore ? '' : ' disabled') + '>Older ›</button>';
+        html += '<span class="msg-count">' + (page.messages ? page.messages.length : 0) + ' shown</span>';
+        html += '</div>';
+        if (!page.messages || page.messages.length === 0) {
+          html += '<div class="msg-empty">No assistant messages captured yet for this run. Message capture begins after the updated MCP server restarts; historical result summaries remain available.</div>';
+        } else {
+          html += '<ul class="msg-list">';
+          page.messages.forEach(function (m) {
+            html += '<li class="msg">';
+            html += '<div class="msg-meta"><span>' + fmtTime(m.ts) + '</span>' + (m.truncated ? '<span class="badge terminal">truncated</span>' : '') + '</div>';
+            html += '<div class="msg-text">' + esc(m.text) + '</div>';
+            html += '</li>';
+          });
+          html += '</ul>';
+        }
+        container.innerHTML = html;
+        Array.prototype.slice.call(container.querySelectorAll('[data-msg-act]')).forEach(function (btn) {
+          btn.addEventListener('click', function () {
+            if (btn.getAttribute('data-msg-act') === 'prev') messagesPrev();
+            else messagesNext();
+          });
+        });
+      }
+
+      function messagesPrev() {
+        if (!msgState.container || msgState.cursorStack.length === 0) return;
+        msgState.cursor = msgState.cursorStack.pop();
+        loadMessagePage(msgState.container, msgState.runId, msgState.cursor);
+      }
+
+      function messagesNext() {
+        if (!msgState.container || msgState.hasMore === false || msgState.nextCursor == null) return;
+        msgState.cursorStack.push(msgState.cursor);
+        msgState.cursor = msgState.nextCursor;
+        loadMessagePage(msgState.container, msgState.runId, msgState.cursor);
+      }
+
+      function renderRun(run) {
+        var el = document.createElement('div');
+        el.className = 'run';
+        el.setAttribute('data-run-id', run.run_id);
+        var html = '';
+        html += '<div class="run-head">';
+        html += '<span class="title">' + esc(run.title || '(untitled)') + '</span>';
+        html += '<span class="badge ' + badgeClass(run.status, run.lifecycle) + '">' + esc(run.status) + '</span>';
+        html += '<span class="badge terminal">' + esc(run.lifecycle) + '</span>';
+        html += '</div>';
+        html += '<div class="handles">';
+        html += 'Run <code>' + esc(run.run_id) + '</code>';
+        html += 'Agent <code>' + esc(run.agent_id) + '</code>';
+        html += 'Worker <code>' + esc(run.worker) + '</code>';
+        if (run.continuation_of_run_id) html += 'Continued from <code>' + esc(run.continuation_of_run_id) + '</code>';
+        html += '</div>';
+        html += '<div class="meta-grid">';
+        html += '<div>Status <b>' + esc(run.status) + '</b></div>';
+        html += '<div>Created <b>' + fmtTime(run.created_at) + '</b></div>';
+        if (run.started_at) html += '<div>Started <b>' + fmtTime(run.started_at) + '</b></div>';
+        if (run.completed_at) html += '<div>Completed <b>' + fmtTime(run.completed_at) + '</b></div>';
+        if (run.requires_user_action) html += '<div>Action <b>required</b></div>';
+        if (run.continuation_index) html += '<div>Continuation <b>' + run.continuation_index + '</b></div>';
+        html += '</div>';
+
+        if (run.diagnostics) {
+          var d = run.diagnostics;
+          html += '<div class="section-title">Activity</div>';
+          html += '<div class="meta-grid">';
+          html += '<div>Phase <b>' + esc(d.last_phase) + '</b></div>';
+          html += '<div>Last activity <b>' + fmtTime(d.last_activity_at) + '</b></div>';
+          if (d.commands_active_count != null) html += '<div>Active commands <b>' + d.commands_active_count + '</b></div>';
+          if (d.commands_started_count != null) html += '<div>Commands started <b>' + d.commands_started_count + '</b></div>';
+          if (d.commands_completed_count != null) html += '<div>Commands completed <b>' + d.commands_completed_count + '</b></div>';
+          if (d.last_command_status) html += '<div>Last command <b>' + esc(d.last_command_status) + '</b></div>';
+          if (d.exit_reason) html += '<div>Exit <b>' + esc(d.exit_reason) + '</b></div>';
+          html += '</div>';
+        }
+
+        if (run.change_set) {
+          var cc = changeCounts(run);
+          var repos = (run.change_set.repositories || []).map(function (r) {
+            return r.repository + ' (' + r.changed_paths + ' files, +' + r.additions + ' / -' + r.deletions + ')';
+          }).join(', ');
+          html += '<div class="section-title">Changes (revision ' + run.change_set.revision + ')</div>';
+          html += '<div class="meta-grid"><div>Files <b>' + cc.totalPaths + '</b></div>';
+          html += '<div>Lines <b>+' + cc.additions + ' / -' + cc.deletions + '</b></div>';
+          html += '</div><div class="handles">' + esc(repos) + '</div>';
+        }
+
+        if (run.result) {
+          var r = run.result;
+          var verification = (r.verification || []).map(function (v) {
+            return '<span class="' + esc(v.status) + '">' + esc(v.status) + ': ' + esc(v.name) + '</span>';
+          }).join('');
+          html += '<div class="section-title">Result (' + esc(r.report_status) + ')</div>';
+          html += '<p style="margin:4px 0">' + esc(r.summary || '') + '</p>';
+          if (verification) html += '<div class="verification">' + verification + '</div>';
+          if (r.unresolved_risks && r.unresolved_risks.length) {
+            html += '<div class="risks"><ul>' + r.unresolved_risks.map(function (x) { return '<li>' + esc(x) + '</li>'; }).join('') + '</ul></div>';
+          }
+        }
+
+        if (run.delegation_impact) {
+          var di = run.delegation_impact;
+          var pieces = [];
+          if (di.local_worker_tokens) {
+            pieces.push('local worker tokens: ' + di.local_worker_tokens.total +
+              ' (in ' + di.local_worker_tokens.input + ', out ' + di.local_worker_tokens.output + ')');
+          }
+          if (di.parent_to_worker) {
+            pieces.push('parent supplied ~' + di.parent_to_worker.estimated_tokens + ' tokens in ' +
+              di.parent_to_worker.task_assignments + ' assignment(s) / ' + di.parent_to_worker.follow_up_messages + ' follow-up(s)');
+          }
+          if (di.parent_visible_review_tokens_estimate) {
+            pieces.push('review payload ~' + di.parent_visible_review_tokens_estimate + ' tokens');
+          }
+          if (pieces.length) {
+            html += '<div class="section-title">Delegation impact</div>';
+            html += '<div class="handles">' + pieces.map(function (p) { return '<span>' + esc(p) + '</span>'; }).join('') + '</div>';
+          }
+        }
+
+        html += '<div class="msg-head">';
+        html += '<button type="button" class="msg-toggle">Messages</button>';
+        html += '</div>';
+        html += '<div class="messages" hidden></div>';
+
+        el.innerHTML = html;
+        el.querySelector('.msg-toggle').addEventListener('click', function () {
+          toggleMessages(el, run.run_id);
+        });
+        return el;
+      }
+
+      function render(snapshot) {
+        content.textContent = '';
+        if (!snapshot || !Array.isArray(snapshot.runs) || snapshot.runs.length === 0) {
+          var empty = document.createElement('div');
+          empty.className = 'empty';
+          empty.textContent = 'No Local Engineer runs found yet.';
+          content.appendChild(empty);
+          runCount.textContent = '0 runs';
+          return;
+        }
+        runCount.textContent = snapshot.count + ' run' + (snapshot.count === 1 ? '' : 's');
+        snapshot.runs.forEach(function (run) { content.appendChild(renderRun(run)); });
+        reopenMessages();
+      }
+
+      function reopenMessages() {
+        if (!msgState.runId) return;
+        var openEl = Array.prototype.slice.call(content.querySelectorAll('[data-run-id="' + msgState.runId + '"]'))[0];
+        if (!openEl) return;
+        var container = openEl.querySelector('.messages');
+        if (!container) return;
+        container.hidden = false;
+        msgState.container = container;
+        loadMessagePage(container, msgState.runId, msgState.cursor);
+      }
+
+      load();
+      setInterval(load, REFRESH_MS);
+    </script>
+  </body>
+</html>

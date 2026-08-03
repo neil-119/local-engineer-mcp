@@ -557,6 +557,7 @@ export class LocalEngineer {
     const raw = JSON.stringify(event);
     for (const run of this.store.list().filter((r) => this.owns(r) && eventMatchesRun(r, worker, event))) {
       this.store.appendRaw(run.runId, 'raw-events', raw + '\n');
+      this.captureAgentMessage(run, event);
       const tokenUsage = tokenUsageFromEvent(event);
       if (tokenUsage) this.recordWorkerTokens(run, tokenUsage);
       const commandTracking = this.trackCommandItem(run, event);
@@ -567,6 +568,10 @@ export class LocalEngineer {
         this.completedCommandItems.delete(run.runId);
       }
     }
+  }
+  private captureAgentMessage(run: Run, event: { method?: string; params?: Record<string, unknown> }): void {
+    const completed = completedAgentMessage(event);
+    if (completed) this.store.captureMessage(run.runId, completed.itemId, now(), completed.text);
   }
   private trackCommandItem(
     run: Run,
@@ -876,6 +881,22 @@ function shouldPersistActivity(run: Run, event: { method?: string; params?: Reco
   if (!/outputDelta|agentMessage\/delta/i.test(event.method ?? '')) return true;
   const lastActivity = Date.parse(run.diagnostics?.last_activity_at ?? '');
   return !Number.isFinite(lastActivity) || Date.now() - lastActivity >= 1000;
+}
+export interface CompletedAgentMessage {
+  itemId: string;
+  text: string;
+}
+export function completedAgentMessage(event: {
+  method?: string;
+  params?: Record<string, unknown>;
+}): CompletedAgentMessage | undefined {
+  if (!/item\/completed/i.test(event.method ?? '')) return undefined;
+  const item = asRecord(event.params?.item);
+  if (item?.type !== 'agentMessage') return undefined;
+  const itemId = typeof item.id === 'string' ? item.id : undefined;
+  const text = typeof item.text === 'string' ? item.text : undefined;
+  if (!itemId || !text) return undefined;
+  return { itemId, text };
 }
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;

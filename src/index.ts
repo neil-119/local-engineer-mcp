@@ -10,6 +10,7 @@ import { LocalEngineer } from './service.js';
 import { ContainerRuntime } from './container-runtime.js';
 import { ImageProfileError } from './image-profile.js';
 import { summarizeStats } from './stats.js';
+import { createMonitorServer, monitorStartupMessage, monitorUsage, openBrowser, parseMonitorArgs } from './monitor.js';
 
 const grounding = z
   .object({
@@ -420,6 +421,25 @@ async function main(): Promise<void> {
         2,
       ),
     );
+    return;
+  }
+  if (command === 'monitor') {
+    const options = parseMonitorArgs(arguments_);
+    if (options.help) {
+      console.log(monitorUsage());
+      return;
+    }
+    const { server, url } = createMonitorServer(store, options);
+    await new Promise<void>((done, fail) => {
+      server.once('error', fail);
+      server.listen({ port: options.port, host: '127.0.0.1' }, () => {
+        server.removeListener('error', fail);
+        done();
+      });
+    });
+    console.log(monitorStartupMessage(url));
+    if (options.open) openBrowser(url);
+    await new Promise<void>((done) => server.once('close', done));
     return;
   }
   const server = createServer(engine);
