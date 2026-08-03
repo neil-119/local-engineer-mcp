@@ -15,6 +15,16 @@ describe('repository snapshots', () => {
     for (const path of temporaryRoots.splice(0)) rmSync(path, { recursive: true, force: true });
   });
 
+  it('requires an initial commit before it can create a worker snapshot', async () => {
+    const root = mkdtempSync(join(testTemporaryDirectory(), 'empty-repository-'));
+    temporaryRoots.push(root);
+    const parent = join(root, 'parent');
+    mkdirSync(parent);
+    git(parent, ['init']);
+
+    await expect(createRepositorySnapshot(parent, join(root, 'snapshot'))).rejects.toThrow('REPOSITORY_HEAD_REQUIRED');
+  });
+
   it('makes dirty parent state part of the private baseline', async () => {
     const root = mkdtempSync(join(testTemporaryDirectory(), 'snapshot-'));
     temporaryRoots.push(root);

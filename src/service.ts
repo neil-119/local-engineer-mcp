@@ -475,6 +475,7 @@ export class LocalEngineer {
       const idleTimedOut = error instanceof Error && error.message === 'RUN_IDLE_TIMEOUT';
       const appServerExit = error instanceof Error && /^CODEX_APP_SERVER_(EXIT|ERROR)/.test(error.message);
       const runtimeUnavailable = error instanceof Error && error.message.startsWith('CONTAINER_RUNTIME_UNAVAILABLE:');
+      const repositoryHeadRequired = error instanceof Error && error.message === 'REPOSITORY_HEAD_REQUIRED';
       this.store.setStatus(runId, timedOut ? 'timed_out' : 'failed', {
         completedAt: now(),
         errorCode: timedOut
@@ -485,13 +486,21 @@ export class LocalEngineer {
               ? 'CODEX_APP_SERVER_EXIT'
               : runtimeUnavailable
                 ? 'CONTAINER_RUNTIME_UNAVAILABLE'
-                : 'HARNESS_FAILURE',
+                : repositoryHeadRequired
+                  ? 'REPOSITORY_HEAD_REQUIRED'
+                  : 'HARNESS_FAILURE',
         diagnostics: activity(
           appServerExit ? 'app_server_exited' : timedOut ? 'timed_out' : idleTimedOut ? 'idle_timed_out' : 'failed',
           current.diagnostics,
           {
-            ...(appServerExit || idleTimedOut || runtimeUnavailable
-              ? { exit_reason: error instanceof Error ? error.message : String(error) }
+            ...(appServerExit || idleTimedOut || runtimeUnavailable || repositoryHeadRequired
+              ? {
+                  exit_reason: repositoryHeadRequired
+                    ? 'A Local Engineer repository needs at least one Git commit (a valid HEAD) before a worker can start.'
+                    : error instanceof Error
+                      ? error.message
+                      : String(error),
+                }
               : {}),
           },
         ),
@@ -958,6 +967,7 @@ export interface SafeRun {
   continuation_index: number;
   continuation_of_run_id?: string;
   image_profile?: string;
+  error_code?: string;
   requires_user_action: boolean;
   diagnostics?: Run['diagnostics'];
   result?: Result;
@@ -984,6 +994,7 @@ export function safe(run: Run): SafeRun {
     continuation_index: run.continuationIndex,
     ...(run.continuationOfRunId ? { continuation_of_run_id: run.continuationOfRunId } : {}),
     ...(run.imageProfile ? { image_profile: run.imageProfile } : {}),
+    ...(run.errorCode ? { error_code: run.errorCode } : {}),
     requires_user_action: run.requiresUserAction,
     ...(run.diagnostics ? { diagnostics: run.diagnostics } : {}),
     ...(run.result ? { result: run.result } : {}),

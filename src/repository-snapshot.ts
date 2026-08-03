@@ -36,7 +36,15 @@ export async function createRepositorySnapshot(parentPath: string, snapshotPath:
   const parent = realpathSync.native(parentPath);
   const topLevel = realpathSync.native((await git(parent, ['rev-parse', '--show-toplevel'])).trim());
   if (topLevel !== parent) throw new Error('REPOSITORY_PATH_NOT_TOP_LEVEL');
-  const parentHead = (await git(parent, ['rev-parse', '--verify', 'HEAD'])).trim();
+  let parentHead: string;
+  try {
+    parentHead = (await git(parent, ['rev-parse', '--verify', 'HEAD'])).trim();
+  } catch (cause) {
+    if (cause instanceof Error && cause.message.startsWith('GIT_COMMAND_FAILED:rev-parse --verify HEAD:')) {
+      throw new Error('REPOSITORY_HEAD_REQUIRED');
+    }
+    throw cause;
+  }
   if (!/^[0-9a-f]{40,64}$/i.test(parentHead)) throw new Error('REPOSITORY_HEAD_INVALID');
   if ((await git(parent, ['diff', '--name-only', '--diff-filter=U'])).trim())
     throw new Error('REPOSITORY_HAS_UNMERGED_PATHS');

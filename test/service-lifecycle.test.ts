@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { Config, Run } from '../src/domain.js';
-import { LocalEngineer } from '../src/service.js';
+import { LocalEngineer, safe } from '../src/service.js';
 import { RunStore } from '../src/store.js';
 
 describe('agent lifecycle history', () => {
@@ -31,6 +31,27 @@ describe('agent lifecycle history', () => {
       task_characters: task.length,
       grounding_characters: objective.length + 'Do not edit files.'.length,
       characters: title.length + task.length + objective.length + 'Do not edit files.'.length,
+    });
+  });
+
+  it('projects safe failure codes and actionable diagnostics to the parent', () => {
+    const failed = {
+      ...run('run_head_required', 'failed', 0),
+      errorCode: 'REPOSITORY_HEAD_REQUIRED',
+      diagnostics: {
+        last_phase: 'failed',
+        last_activity_at: '2026-07-24T00:00:00.000Z',
+        exit_reason:
+          'A Local Engineer repository needs at least one Git commit (a valid HEAD) before a worker can start.',
+      },
+    };
+
+    expect(safe(failed)).toMatchObject({
+      error_code: 'REPOSITORY_HEAD_REQUIRED',
+      diagnostics: {
+        exit_reason:
+          'A Local Engineer repository needs at least one Git commit (a valid HEAD) before a worker can start.',
+      },
     });
   });
 
