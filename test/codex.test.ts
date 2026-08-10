@@ -68,4 +68,34 @@ describe('container Codex app-server bridge', () => {
     });
     await expect(waiting).resolves.toMatchObject({ turn: { id: 'turn-1' } });
   });
+
+  it('rejects a completed notification whose turn status is failed', async () => {
+    const adapter = new CodexAppServer(worker, () => undefined);
+    const internals = adapter as unknown as {
+      turnDone: Map<string, Promise<Record<string, unknown>>>;
+      turnResolvers: Map<string, { resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void }>;
+      receive: (message: Record<string, unknown>) => void;
+    };
+    let reject!: (error: Error) => void;
+    internals.turnDone.set(
+      'turn-failed',
+      new Promise((_resolve, rejectTurn) => {
+        reject = rejectTurn;
+      }),
+    );
+    internals.turnResolvers.set('turn-failed', { resolve: vi.fn(), reject });
+    const waiting = adapter.wait('turn-failed');
+    internals.receive({
+      jsonrpc: '2.0',
+      method: 'turn/completed',
+      params: {
+        turn: {
+          id: 'turn-failed',
+          status: 'failed',
+          error: { message: 'model relay error: model upstream timeout' },
+        },
+      },
+    });
+    await expect(waiting).rejects.toThrow('CODEX_TURN_FAILED:model relay error: model upstream timeout');
+  });
 });

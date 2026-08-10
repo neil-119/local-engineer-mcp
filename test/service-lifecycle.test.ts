@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { Config, Run } from '../src/domain.js';
-import { LocalEngineer, completedAgentMessage, safe } from '../src/service.js';
+import { LocalEngineer, codexTurnFailure, completedAgentMessage, safe } from '../src/service.js';
 import { RunStore } from '../src/store.js';
 
 describe('agent lifecycle history', () => {
@@ -291,5 +291,19 @@ describe('completed assistant message extraction', () => {
       completedAgentMessage({ method: 'item/completed', params: { item: { type: 'agentMessage', id: 'x' } } }),
     ).toBeUndefined();
     expect(completedAgentMessage({})).toBeUndefined();
+  });
+});
+
+describe('failed Codex turn classification', () => {
+  it('uses bounded public classifications without exposing raw upstream details', () => {
+    expect(codexTurnFailure(new Error('CODEX_TURN_FAILED:model relay error: model upstream timeout'))).toEqual({
+      errorCode: 'MODEL_UPSTREAM_TIMEOUT',
+      exitReason: 'The local model endpoint did not respond before the worker relay timed out.',
+    });
+    expect(codexTurnFailure(new Error('CODEX_TURN_FAILED:connect EHOSTUNREACH 192.168.90.174:8888'))).toEqual({
+      errorCode: 'MODEL_UPSTREAM_UNREACHABLE',
+      exitReason: 'The local model endpoint was unreachable from the worker relay.',
+    });
+    expect(codexTurnFailure(new Error('other failure'))).toBeUndefined();
   });
 });

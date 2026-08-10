@@ -69,6 +69,14 @@ export class ContainerAgentManager {
     return result;
   }
 
+  async proxyDiagnostic(agentId: string): Promise<string | undefined> {
+    const resources = this.agents.get(agentId);
+    if (!resources) return undefined;
+    const logs = await this.runtime.containerLogs(resources.proxyContainer, 80).catch(() => undefined);
+    const text = `${logs?.stdout ?? ''}\n${logs?.stderr ?? ''}`.trim();
+    return text ? sanitizeProxyDiagnostic(text) : undefined;
+  }
+
   async prepare(
     agentId: string,
     worker: Worker,
@@ -798,6 +806,16 @@ export class ContainerAgentManager {
       throw new Error('PROMOTION_LOCKED');
     }
   }
+}
+
+export function sanitizeProxyDiagnostic(value: string): string {
+  return value
+    .replace(/\b(authorization|api[_-]?key|token|password)\s*[:=]\s*\S+/gi, '$1=<redacted>')
+    .replace(/https?:\/\/[^\s"']+/gi, '<url-redacted>')
+    .replace(/[\r\n]+/g, ' ')
+    .replaceAll('\0', ' ')
+    .trim()
+    .slice(-2000);
 }
 
 function gitSafeDirectoryEnvironment(repositories: RunRepository[]): Record<string, string> {

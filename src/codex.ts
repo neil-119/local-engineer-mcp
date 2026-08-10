@@ -119,11 +119,19 @@ export class CodexAppServer {
       stringAt(message.params, ['turn', 'id']) ??
       stringAt(message.params, ['turn_id']) ??
       stringAt(message.params, ['turnId']);
-    if (turnId && /turn\/(completed|failed)|turn\/complete/i.test(message.method ?? ''))
-      this.turnResolvers.get(turnId)?.resolve({
+    if (turnId && /turn\/(completed|failed)|turn\/complete/i.test(message.method ?? '')) {
+      const turn = recordAt(message.params, ['turn']);
+      const status = stringAt(turn, ['status']);
+      const resolver = this.turnResolvers.get(turnId);
+      if (status === 'failed') {
+        resolver?.reject(new Error(`CODEX_TURN_FAILED:${turnFailureDetail(turn)}`));
+        return;
+      }
+      resolver?.resolve({
         ...(message.params ?? {}),
         final_message: this.turnMessages.get(turnId) ?? '',
       });
+    }
   }
 
   private approveContainerRequest(message: Rpc): void {
@@ -250,4 +258,12 @@ function recordAt(value: unknown, path: string[]): Record<string, unknown> | und
   return cursor && typeof cursor === 'object' && !Array.isArray(cursor)
     ? (cursor as Record<string, unknown>)
     : undefined;
+}
+
+function turnFailureDetail(turn: Record<string, unknown> | undefined): string {
+  const detail = stringAt(turn, ['error', 'message']) ?? 'Codex turn failed without an error message.';
+  return detail
+    .replace(/[\r\n]/g, ' ')
+    .replaceAll('\0', ' ')
+    .slice(0, 1000);
 }

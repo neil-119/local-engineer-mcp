@@ -464,6 +464,12 @@ export class LocalEngineer {
         diagnostics: activity('ready_for_review', this.requireOwned(runId).diagnostics),
       });
     } catch (error) {
+      const turnFailure = codexTurnFailure(error);
+      if (turnFailure) {
+        const proxyDiagnostic = await this.containerManager.proxyDiagnostic(run.agentId);
+        if (proxyDiagnostic)
+          this.store.appendRaw(runId, 'stderr', `${new Date().toISOString()} proxy-diagnostic ${proxyDiagnostic}\n`);
+      }
       this.store.appendRaw(
         runId,
         'stderr',
@@ -482,24 +488,28 @@ export class LocalEngineer {
           ? 'RUN_TIMEOUT'
           : idleTimedOut
             ? 'RUN_IDLE_TIMEOUT'
-            : appServerExit
-              ? 'CODEX_APP_SERVER_EXIT'
-              : runtimeUnavailable
-                ? 'CONTAINER_RUNTIME_UNAVAILABLE'
-                : repositoryHeadRequired
-                  ? 'REPOSITORY_HEAD_REQUIRED'
-                  : 'HARNESS_FAILURE',
+            : turnFailure
+              ? turnFailure.errorCode
+              : appServerExit
+                ? 'CODEX_APP_SERVER_EXIT'
+                : runtimeUnavailable
+                  ? 'CONTAINER_RUNTIME_UNAVAILABLE'
+                  : repositoryHeadRequired
+                    ? 'REPOSITORY_HEAD_REQUIRED'
+                    : 'HARNESS_FAILURE',
         diagnostics: activity(
           appServerExit ? 'app_server_exited' : timedOut ? 'timed_out' : idleTimedOut ? 'idle_timed_out' : 'failed',
           current.diagnostics,
           {
-            ...(appServerExit || idleTimedOut || runtimeUnavailable || repositoryHeadRequired
+            ...(turnFailure || appServerExit || idleTimedOut || runtimeUnavailable || repositoryHeadRequired
               ? {
                   exit_reason: repositoryHeadRequired
                     ? 'A Local Engineer repository needs at least one Git commit (a valid HEAD) before a worker can start.'
-                    : error instanceof Error
-                      ? error.message
-                      : String(error),
+                    : turnFailure
+                      ? turnFailure.exitReason
+                      : error instanceof Error
+                        ? error.message
+                        : String(error),
                 }
               : {}),
           },
@@ -730,6 +740,31 @@ export class LocalEngineer {
   private validateTitle(title: string): void {
     if (!title.trim() || [...title].length > 120 || /[\r\n]/.test(title)) throw new Error('TITLE_INVALID');
   }
+}
+
+export function codexTurnFailure(
+  error: unknown,
+):
+  | { errorCode: 'MODEL_UPSTREAM_TIMEOUT' | 'MODEL_UPSTREAM_UNREACHABLE' | 'CODEX_TURN_FAILED'; exitReason: string }
+  | undefined {
+  if (!(error instanceof Error) || !error.message.startsWith('CODEX_TURN_FAILED:')) return undefined;
+  const detail = error.message.slice('CODEX_TURN_FAILED:'.length);
+  if (/model upstream timeout/i.test(detail)) {
+    return {
+      errorCode: 'MODEL_UPSTREAM_TIMEOUT',
+      exitReason: 'The local model endpoint did not respond before the worker relay timed out.',
+    };
+  }
+  if (/EHOSTUNREACH|ECONNREFUSED|UND_ERR_CONNECT_TIMEOUT|connect timeout/i.test(detail)) {
+    return {
+      errorCode: 'MODEL_UPSTREAM_UNREACHABLE',
+      exitReason: 'The local model endpoint was unreachable from the worker relay.',
+    };
+  }
+  return {
+    errorCode: 'CODEX_TURN_FAILED',
+    exitReason: 'The local Codex worker turn failed before producing a final report.',
+  };
 }
 function emptyStats(): RunStats {
   return {

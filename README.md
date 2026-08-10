@@ -35,6 +35,7 @@ reviewed patch into the checkout.
   - [5. Iterate, promote, or discard](#5-iterate-promote-or-discard)
 - [Configuration](#configuration)
   - [Container runtime](#container-runtime)
+  - [Rancher Desktop on Windows](#rancher-desktop-on-windows)
   - [Project image profiles](#project-image-profiles)
   - [Model provider](#model-provider)
   - [Repository workspaces](#repository-workspaces)
@@ -432,6 +433,27 @@ capability probe validates runtime version and daemon access, the configured
 image, and uniquely named create/connect/remove resources. Unsupported
 runtimes fail closed rather than falling back to host execution.
 
+### Rancher Desktop on Windows
+
+Local Engineer works with Rancher Desktop's `dockerd (moby)` container engine.
+This is useful when Rancher Desktop already owns the local Kubernetes and
+container workflow: Docker Desktop does not need to be running, and its image
+store is separate from Rancher's.
+
+Set `DOCKER_HOST` only on the Local Engineer MCP process so its `docker`
+invocations target Rancher's standard Windows named pipe:
+
+```toml
+[mcp_servers.local_engineer.env]
+LOCAL_ENGINEER_CONFIG = 'C:\\work\\local-engineer-config.yaml'
+DOCKER_HOST = 'npipe:////./pipe/docker_engine'
+```
+
+Start Rancher Desktop before starting Codex. The MCP registration persists for
+new Codex sessions and across PC restarts; the first use after configuring a
+different runtime needs its own worker-image build because images are not shared
+between Docker Desktop and Rancher Desktop.
+
 Build the bundled image:
 
 ```powershell
@@ -643,6 +665,8 @@ enabled_tools = [
 
 [mcp_servers.local_engineer.env]
 LOCAL_ENGINEER_CONFIG = 'C:\work\local-engineer-config.yaml'
+# Optional on Windows when Rancher Desktop runs the dockerd (moby) engine:
+# DOCKER_HOST = 'npipe:////./pipe/docker_engine'
 ```
 
 During repository development:
@@ -657,6 +681,8 @@ required = true
 
 [mcp_servers.local_engineer.env]
 LOCAL_ENGINEER_CONFIG = 'C:\work\local-engineer-config.yaml'
+# Optional on Windows when Rancher Desktop runs the dockerd (moby) engine:
+# DOCKER_HOST = 'npipe:////./pipe/docker_engine'
 ```
 
 Restart Codex completely after changing MCP registration.
