@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { CodexAppServer } from '../src/codex.js';
+import { appServerInheritedEnvironmentNames, CodexAppServer } from '../src/codex.js';
 
 const worker = {
   command: 'docker',
@@ -18,6 +18,12 @@ function writableAdapter() {
 }
 
 describe('container Codex app-server bridge', () => {
+  it('inherits the selected Docker endpoint for container-exec app-server processes', () => {
+    expect(appServerInheritedEnvironmentNames).toEqual(
+      expect.arrayContaining(['DOCKER_CONFIG', 'DOCKER_HOST', 'DOCKER_CONTEXT']),
+    );
+  });
+
   it('accepts command requests because the container is the execution boundary', () => {
     const { adapter, writes } = writableAdapter();
     (adapter as unknown as { receive: (message: Record<string, unknown>) => void }).receive({

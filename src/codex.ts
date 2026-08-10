@@ -23,6 +23,21 @@ export interface StartedSession {
   turnId: string;
 }
 
+export const appServerInheritedEnvironmentNames = [
+  'PATH',
+  'SystemRoot',
+  'ComSpec',
+  'APPDATA',
+  'LOCALAPPDATA',
+  'HOME',
+  'USERPROFILE',
+  'TEMP',
+  'TMP',
+  'DOCKER_CONFIG',
+  'DOCKER_HOST',
+  'DOCKER_CONTEXT',
+] as const;
+
 export class CodexAppServer {
   private process?: ChildProcessWithoutNullStreams;
   private nextId = 1;
@@ -46,19 +61,7 @@ export class CodexAppServer {
     if (this.process && !this.process.killed && this.process.exitCode === null && this.process.signalCode === null)
       return;
     const environment: NodeJS.ProcessEnv = {};
-    for (const name of [
-      'PATH',
-      'SystemRoot',
-      'ComSpec',
-      'APPDATA',
-      'LOCALAPPDATA',
-      'HOME',
-      'USERPROFILE',
-      'TEMP',
-      'TMP',
-      'DOCKER_CONFIG',
-    ])
-      if (process.env[name]) environment[name] = process.env[name];
+    for (const name of appServerInheritedEnvironmentNames) if (process.env[name]) environment[name] = process.env[name];
     Object.assign(environment, this.worker.environment);
     this.process = spawn(this.worker.command, this.worker.args, {
       env: environment,
