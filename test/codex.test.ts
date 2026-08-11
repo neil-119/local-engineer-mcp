@@ -104,4 +104,36 @@ describe('container Codex app-server bridge', () => {
     });
     await expect(waiting).rejects.toThrow('CODEX_TURN_FAILED:model relay error: model upstream timeout');
   });
+
+  it('rejects an interrupted turn when a preceding relay error identifies the cause', async () => {
+    const adapter = new CodexAppServer(worker, () => undefined);
+    const internals = adapter as unknown as {
+      turnDone: Map<string, Promise<Record<string, unknown>>>;
+      turnResolvers: Map<string, { resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void }>;
+      receive: (message: Record<string, unknown>) => void;
+    };
+    let reject!: (error: Error) => void;
+    internals.turnDone.set(
+      'turn-interrupted',
+      new Promise((_resolve, rejectTurn) => {
+        reject = rejectTurn;
+      }),
+    );
+    internals.turnResolvers.set('turn-interrupted', { resolve: vi.fn(), reject });
+    const waiting = adapter.wait('turn-interrupted');
+    internals.receive({
+      jsonrpc: '2.0',
+      method: 'error',
+      params: {
+        turnId: 'turn-interrupted',
+        error: { additionalDetails: 'model relay error: connect EHOSTUNREACH model-host:8888' },
+      },
+    });
+    internals.receive({
+      jsonrpc: '2.0',
+      method: 'turn/completed',
+      params: { turn: { id: 'turn-interrupted', status: 'interrupted' } },
+    });
+    await expect(waiting).rejects.toThrow('CODEX_TURN_FAILED:model relay error: connect EHOSTUNREACH model-host:8888');
+  });
 });

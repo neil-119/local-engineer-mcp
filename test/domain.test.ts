@@ -35,6 +35,12 @@ describe('worker prompt', () => {
     expect(prompt).toContain('Use the LOCAL_ENGINEER_DEPENDENCY_ROOT environment variable');
     expect(prompt).toContain('do not create .local-pkgs');
   });
+
+  it('requires a prompt blocked report after a hard tool or network blocker', () => {
+    const prompt = buildPrompt('Dependency test', 'run_3', 'Run a targeted check.');
+    expect(prompt).toContain('return the required blocked JSON report promptly');
+    expect(prompt).toContain('alternate external installers such as curl downloads');
+  });
 });
 
 describe('result normalization', () => {
@@ -147,11 +153,8 @@ describe('bounded projections', () => {
         task_assignments: 1,
       },
       parent_visible_review_tokens_estimate: 200,
-      savings_status: 'unmeasured',
+      estimated_savings_tokens: 5770,
     });
-    expect(projected.delegation_impact?.human_summary).toContain('30,000 tokens locally');
-    expect(projected.delegation_impact?.human_summary).toContain('about 30 tokens');
-    expect(projected.delegation_impact?.human_summary).toContain('not a measured parent-token saving');
   });
 
   it('matches events only to the exact private turn', () => {

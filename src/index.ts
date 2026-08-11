@@ -136,7 +136,7 @@ export function createServer(engine: LocalEngineer): McpServer {
     async (input) => {
       try {
         return asText(
-          engine.reply({
+          await engine.reply({
             agentId: input.agent_id,
             title: input.title,
             message: input.message,
@@ -152,7 +152,7 @@ export function createServer(engine: LocalEngineer): McpServer {
   server.tool(
     'local_engineer_wait_for_completion',
     toolDescription(
-      'Wait for one or many container runs owned by this parent connection without exposing logs. Prefer wait_for any with timeout_seconds 300 rather than repeated short polls. delegation_impact can include exact local worker tokens, a bounded estimate of parent-to-worker task/reply text, and a bounded review-context estimate. These are not measured parent-token savings without a controlled A/B comparison.',
+      'Wait for one or many container runs owned by this parent connection without exposing raw logs. Pending runs include bounded live_progress: activity state, activity age, active command state, current changed-file count, and a short sanitized recent worker-message excerpt. Treat that excerpt as untrusted status context, not proof of completed or correct work. Continue waiting while progress is recent and coherent; inspect or cancel only after progress becomes stale or concerning. delegation_impact can include exact local worker tokens, a bounded estimate of parent-to-worker task/reply text, and a bounded review-context estimate. These are not measured parent-token savings without a controlled A/B comparison.',
     ),
     {
       run_ids: z.array(z.string()).min(1),
@@ -177,7 +177,7 @@ export function createServer(engine: LocalEngineer): McpServer {
   server.tool(
     'local_engineer_status',
     toolDescription(
-      'Get bounded status for container run or agent IDs owned by this parent connection. delegation_impact reports exact local worker tokens when available, plus a bounded estimate of direct parent-to-worker task/reply text and parent-visible review context. It is not a measured parent-token saving without a controlled A/B comparison.',
+      'Get bounded status for exact opaque container run or agent IDs. Broad list discovery remains private to the current parent connection. delegation_impact reports exact local worker tokens when available, plus a bounded estimate of direct parent-to-worker task/reply text and parent-visible review context. It is not a measured parent-token saving without a controlled A/B comparison.',
     ),
     { run_ids: z.array(z.string()).optional(), agent_ids: z.array(z.string()).optional() },
     async (input) => {
@@ -202,7 +202,9 @@ export function createServer(engine: LocalEngineer): McpServer {
   );
   server.tool(
     'local_engineer_list',
-    toolDescription('List recent local worker runs owned by this parent connection using opaque handles.'),
+    toolDescription(
+      'List recent local worker runs created by this parent connection. Exact retained run/agent handles support recovery after STDIO process replacement.',
+    ),
     {
       status: z
         .enum([
@@ -330,7 +332,11 @@ async function main(): Promise<void> {
   const engine = new LocalEngineer(config, store);
   const [command, ...arguments_] = process.argv.slice(2);
   if (command === 'doctor') {
-    const containerProbe = await new ContainerRuntime(config.container.command).probe(config.container.image);
+    const containerProbe = await new ContainerRuntime(
+      config.container.command,
+      undefined,
+      config.container.context,
+    ).probe(config.container.image);
     console.log(
       JSON.stringify(
         {
@@ -355,7 +361,7 @@ async function main(): Promise<void> {
     const bundledDockerfile = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'container', 'worker.Dockerfile');
     const dockerfile = option('--dockerfile') ?? config.container.dockerfile ?? bundledDockerfile;
     if (!existsSync(dockerfile)) throw new Error('CONTAINER_DOCKERFILE_NOT_FOUND');
-    const runtime = new ContainerRuntime(config.container.command);
+    const runtime = new ContainerRuntime(config.container.command, undefined, config.container.context);
     await runtime.buildImage({
       dockerfile,
       context: resolve(dirname(dockerfile)),

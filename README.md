@@ -326,11 +326,28 @@ gate. The container boundary—not parent review of every shell command—is the
 execution control.
 
 The worker can edit, delete, run tests, and make mistakes inside its private
-copy. It cannot ask the parent questions or invoke parent tools. The parent frontier model gives it a
-bounded task with sufficient constraints and acceptance criteria up front.
+copy. It uses the worker image's `apply_patch` helper for source edits. The
+helper accepts one structured, line-ending-preserving patch format:
+`*** Begin Patch`, `*** Add File` / `*** Update File` / `*** Delete File`, and
+`*** End Patch`. This avoids weak local models mixing Codex patch markers with
+Git diff syntax or miscounting unified-diff hunks. Workers validate non-trivial
+patches first with `apply_patch --check`, then submit that exact literal patch;
+the helper rejects mixed formats and unmatched context. It cannot ask the parent questions or
+invoke parent tools. The parent frontier model gives it a bounded task with
+sufficient constraints and acceptance criteria up front.
 
 Local Engineer records raw events and logs locally while returning only bounded
 lifecycle state through MCP.
+
+When a wait times out, its pending entries include `live_progress` rather than
+just a bare `running` state: whether the worker is executing a command,
+producing a message, or awaiting its next action; time since activity; a
+container-derived changed-file count; and a short sanitized recent-message
+excerpt. Parent agents should continue waiting while that evidence remains
+recent and coherent. Raw logs, command output, private thread identifiers, and
+source content remain local unless separately requested through bounded review
+tools. The excerpt is untrusted progress context, not evidence that an
+implementation is correct or ready to promote.
 
 ### Network paths
 
@@ -416,6 +433,10 @@ in [config.example.yaml](config.example.yaml).
 ```yaml
 container:
   command: docker
+  # Optional explicit Docker context; prevents accidental use of a stale Desktop context.
+  # context: default
+  # Reserved for Local Engineer's per-agent networks; must not overlap your LAN.
+  agent_network_pool: 10.240.0.0/16
   image: local-engineer/codex-worker:latest
   base_image: node:24-bookworm-slim
   codex_version: 0.144.6
@@ -428,10 +449,21 @@ container:
     allow_private_model_endpoint: false
 ```
 
-`container.command` is the exact executable Local Engineer invokes. The
+`container.command` is the exact executable Local Engineer invokes. Set
+`container.context` when the CLI has more than one daemon—for example, use
+`default` for a Rancher Desktop Moby daemon if `docker context ls` shows that
+the active Docker Desktop context is unavailable. Local Engineer passes this as
+`--context <name>` on every runtime command, so the choice survives new agents
+and host restarts. The
 capability probe validates runtime version and daemon access, the configured
 image, and uniquely named create/connect/remove resources. Unsupported
 runtimes fail closed rather than falling back to host execution.
+
+`agent_network_pool` prevents Docker's automatic address allocator from
+choosing a private bridge subnet that overlaps a LAN-hosted model endpoint.
+Local Engineer derives one internal and one egress `/24` per agent from this
+reserved `/16`; choose a `10.x.0.0/16` range that is unused by your LAN, VPN,
+and model network.
 
 ### Rancher Desktop on Windows
 
@@ -467,8 +499,18 @@ local-engineer image build `
 
 Use a custom base image when workers need extra compilers, language runtimes,
 system libraries, or dependency caches. The bundled image includes Node.js 24,
-Python 3.12, pip, and venv so common JavaScript/TypeScript and Python checks can
-run without installing operating-system packages during a worker session.
+Python 3.12 with pip and venv, the stable Rust toolchain (`cargo` and `rustc`),
+and the Debian Linux development libraries required by Tauri/WebKitGTK builds.
+That supports typical JavaScript/TypeScript, Python, Rust, and Tauri project
+checks without installing operating-system packages during a worker session.
+The Tauri CLI and project-specific Node/Rust dependencies remain project
+dependencies: provide them through the copied worktree, an approved project
+image profile, or explicitly allowlisted registries. Rebuild the shared worker
+image after upgrading Local Engineer before starting a Rust or Tauri worker.
+For a Rust project that must fetch crates, add only the exact required hosts to
+`read_only_domains`—normally `index.crates.io` and `static.crates.io`; add
+`github.com` only for an explicitly used Git dependency. Tauri's JavaScript
+packages use the same npm registry policy as other Node projects.
 Project dependencies are not baked into the shared image. They come from the
 private worktree copy or can be rebuilt in a read-write repository when the
 configured `read_only_domains` permit the required registries and artifact
@@ -489,10 +531,15 @@ Instead, it asks Local Engineer to plan from the repository:
 }
 ```
 
-The generated planner currently recognizes root `requirements*.txt` files and
-Node lockfiles for npm, pnpm, or Yarn. It returns the exact inputs and their
-digests, install steps, inferred package domains, missing read-only-domain entries,
-the proposed image tag, and a `plan_digest`. Planning is read-only.
+The generated planner recognizes `requirements*.txt`, locked npm/pnpm/Yarn
+projects, and locked Cargo projects. If the requested workspace root has no
+manifest, it can deterministically select one direct child project directory;
+it never recursively scans dependency or build directories. It returns the
+exact inputs and their digests, install steps, inferred package domains, missing
+read-only-domain entries, the proposed image tag, and a `plan_digest`. Planning
+is read-only. Cargo profiles use only `index.crates.io` and `static.crates.io`
+by default; Git dependencies remain opt-in and require a separately approved
+domain.
 
 Building is a separately reviewed operation:
 
@@ -694,7 +741,7 @@ Restart Codex completely after changing MCP registration.
 | `local_engineer_start`               | Start an autonomous disposable worker and return opaque handles immediately.                   |
 | `local_engineer_build_image`         | Plan, then explicitly build, a reusable project dependency image profile.                      |
 | `local_engineer_wait_for_completion` | Wait for one or many runs with `all` or `any` semantics.                                       |
-| `local_engineer_status`              | Read bounded state for owned run or agent IDs.                                                 |
+| `local_engineer_status`              | Read bounded state for retained opaque run or agent IDs.                                       |
 | `local_engineer_list`                | List recent owned runs; use `active_only: true` to hide terminal history.                      |
 | `local_engineer_cancel`              | Cancel a queued or active run.                                                                 |
 | `local_engineer_reply`               | Continue the same private session from `ready_for_review`.                                     |
@@ -709,8 +756,11 @@ and `timeout_seconds: 300`, inspect the settled result, then continue useful
 parent work between waits. `local_engineer_status` is a non-blocking snapshot,
 not a polling loop.
 
-The current MCP connection owns only the agents it starts. Another parent
-connection cannot list, inspect, reply to, cancel, promote, or delete them.
+Run listing is private to the current MCP connection. Retain the opaque
+`run_id` and `agent_id` returned by `local_engineer_start`: an exact handle is
+a recovery capability for that one retained agent. This lets the creating
+parent continue review, follow-ups, promotion, or deletion when Codex replaces
+the STDIO MCP process, without exposing other agents through broad listing.
 
 ## Review and promotion
 
@@ -903,16 +953,12 @@ misleading savings number:
   from a comparable direct run and delegated run. Without that A/B baseline,
   the CLI explicitly reports that no exact counterfactual exists.
 
-Parent-facing `status` and `wait_for_completion` results include a compact
-`delegation_impact` summary whenever the run has delegation telemetry. It gives
-the parent a human-readable way to say, for example, that a
-local worker processed 30,000 tokens while only a bounded review payload came
-back to the parent. It also includes the direct parent-to-worker assignment and
-follow-up payload estimate, making the delegation overhead visible without
-claiming access to the parent's total session usage. The field deliberately
-calls this **offloaded local work**, not a parent-token saving. A saving claim
-requires the controlled A/B comparison above; the parent may choose to share
-either clearly labeled result with the user.
+Parent-facing `status` and `wait_for_completion` results include compact
+`delegation_impact` telemetry whenever available. `estimated_savings_tokens` is
+an integer: local worker output plus reported reasoning output, minus the
+bounded parent-to-worker payload and parent-visible review estimates. It is a
+useful compact proxy, not a measured parent-session or billing saving; use the
+controlled A/B comparison above for an exact claim.
 
 Filters include `--since 2h|7d|<ISO timestamp>`, `--agent <id>`, and
 `--run <id>`. Statistics persist with run history in the configured state
@@ -932,10 +978,17 @@ Concurrency is layered:
 Workers may run concurrently because they edit separate snapshots. Promotion
 still conflicts when another actor changes an affected parent path.
 
-Parent ownership is connection-scoped. After a parent Codex restart, the new
-connection cannot manage agents created by the old connection. Automatic
-reconciliation of resources orphaned by a server or container-runtime crash is
-not yet implemented.
+Run listing is connection-scoped, but completed container agents are retained
+with their private snapshots, review commits, and resource manifest. A parent
+that retained its opaque `run_id`/`agent_id` can recover an exact agent after a
+Codex or MCP-process restart, then inspect diffs/files, continue the same
+worker, promote an exact reviewed revision, or discard it. This is capability
+access—not discovery: unrelated parents cannot enumerate retained agents.
+
+The first post-restart review operation reattaches to the worker container and
+verifies its deterministic resource names and saved snapshot metadata. If
+retained state or the container runtime is missing, Local Engineer fails closed
+without promoting anything.
 
 ## Development
 
@@ -979,12 +1032,16 @@ separate future decision.
   Python 3.12, but incompatible project dependencies may still need to be
   reinstalled inside the private read-write worktree. This requires the relevant
   registry and artifact domains to be explicitly allowlisted.
-- Generated project-image planning currently recognizes root
-  `requirements*.txt` files and npm, pnpm, or Yarn lockfiles. Arbitrary project
-  Dockerfiles are not executed by the hardened builder; use a reviewed,
+- The shared image provides Rust and Linux Tauri build prerequisites, not every
+  project dependency or platform target. Cross-compilation, mobile targets,
+  platform-specific signing, and dependency registries such as crates.io still
+  require an approved project image/profile and exact allowlisted domains.
+- Generated project-image planning recognizes `requirements*.txt`, locked
+  npm/pnpm/Yarn projects, and locked Cargo projects. It can select one direct
+  child project when the workspace root itself has no manifest. Arbitrary
+  project Dockerfiles are not executed by the hardened builder; use a reviewed,
   externally built base image for other toolchains.
 - Submodules, Git LFS, unusual file modes, very large binaries, and non-Git
   state may have limitations.
-- A restarted parent connection cannot adopt an earlier agent.
 - Crash-orphan reconciliation is pending.
 - Podman, nerdctl, and non-Windows hosts follow the configurable CLI contract but have not received the same live test coverage as Docker Desktop on Windows.

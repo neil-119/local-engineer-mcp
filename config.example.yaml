@@ -27,6 +27,10 @@ security:
 container:
   # Any Docker-compatible CLI that passes `local-engineer doctor`.
   command: docker
+  # Optional CLI context, useful when Docker Desktop and Rancher Desktop coexist.
+  # context: default
+  # Dedicated Local Engineer /16. Avoid a range used by your LAN or model endpoint.
+  agent_network_pool: 10.240.0.0/16
   image: local-engineer/codex-worker:latest
   base_image: node:24-bookworm-slim
   codex_version: 0.144.6

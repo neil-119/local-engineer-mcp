@@ -1,0 +1,9 @@
+#!/bin/sh
+# Apply a Local Engineer structured patch supplied on standard input.
+#
+# The parser lives beside this wrapper so local coding models have one precise,
+# line-ending-preserving editing protocol rather than a fragile mix of Git and
+# Codex patch syntaxes.
+set -eu
+
+exec node /usr/local/lib/local-engineer/apply_patch.mjs "$@"

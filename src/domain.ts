@@ -29,6 +29,10 @@ export interface ContainerNetworkConfig {
 }
 export interface ContainerConfig {
   command: string;
+  /** Optional Docker-compatible CLI context (for example Rancher Desktop's default Moby context). */
+  context?: string;
+  /** Reserved /16 from which Local Engineer allocates isolated per-agent /24 networks. */
+  agent_network_pool?: string;
   image: string;
   base_image: string;
   dockerfile?: string;
@@ -246,6 +250,9 @@ export interface RunDiagnostics {
   last_command_status?: 'running' | 'succeeded' | 'failed' | 'declined';
   last_command_exit_code?: number;
   last_command_error_excerpt?: string;
+  last_agent_message_excerpt?: string;
+  last_agent_message_at?: string;
+  agent_messages_completed_count?: number;
   turn_completed_at?: string;
   exit_reason?: string;
   resources_deleted_at?: string;

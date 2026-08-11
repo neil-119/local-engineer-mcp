@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ContainerRuntime, type RuntimeCommandExecutor } from '../src/container-runtime.js';
+import { agentNetworkSubnets, ContainerRuntime, type RuntimeCommandExecutor } from '../src/container-runtime.js';
 
 describe('container runtime adapter', () => {
   it('uses the configured executable but constructs every argument internally', async () => {
@@ -40,6 +40,38 @@ describe('container runtime adapter', () => {
     }));
 
     expect(() => runtime.removeContainer('--all')).toThrow('CONTAINER_RESOURCE_NAME_INVALID');
+  });
+
+  it('prefixes every command with an explicitly configured CLI context', async () => {
+    const calls: string[][] = [];
+    const runtime = new ContainerRuntime(
+      'docker',
+      async (_executable, arguments_) => {
+        calls.push([...arguments_]);
+        return { exitCode: 0, stdout: '', stderr: '' };
+      },
+      'default',
+    );
+
+    await runtime.createVolume('le-context-volume', { 'local-engineer.managed': 'true' });
+    expect(calls[0]).toEqual([
+      '--context',
+      'default',
+      'volume',
+      'create',
+      '--label',
+      'local-engineer.managed=true',
+      'le-context-volume',
+    ]);
+  });
+
+  it('allocates stable non-overlapping internal and egress subnets from the reserved pool', () => {
+    const first = agentNetworkSubnets('agt_example', '10.240.0.0/16');
+    expect(first).toEqual(agentNetworkSubnets('agt_example', '10.240.0.0/16'));
+    expect(first.internal).toMatch(/^10\.240\.\d+\.0\/24$/);
+    expect(first.egress).toMatch(/^10\.240\.\d+\.0\/24$/);
+    expect(first.internal).not.toBe(first.egress);
+    expect(() => agentNetworkSubnets('agt_example', '192.168.0.0/16')).toThrow('CONTAINER_AGENT_NETWORK_POOL_INVALID');
   });
 
   it('permits only the narrowly scoped setup capability', async () => {

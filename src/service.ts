@@ -87,21 +87,27 @@ export class LocalEngineer {
     this.queue(run.runId, timeout);
     return safe(run);
   }
-  reply(input: {
+  async reply(input: {
     agentId: string;
     title: string;
     message: string;
     grounding?: GroundingPacket;
     timeoutSeconds?: number;
-  }): SafeRun {
+  }): Promise<SafeRun> {
     this.validateTitle(input.title);
-    const prior = this.store
-      .getByAgent(input.agentId)
-      .filter((run) => this.owns(run))
-      .at(-1);
+    const history = this.store.getByAgent(input.agentId);
+    const latest = history.at(-1);
+    if (!latest) throw new Error('AGENT_UNAVAILABLE');
+    if (['queued', 'starting', 'running', 'cancel_requested'].includes(latest.status)) throw new Error('AGENT_BUSY');
+    const prior = [...history]
+      .reverse()
+      .find(
+        (candidate) =>
+          candidate.status === 'ready_for_review' || (candidate.status === 'superseded' && candidate.changeSet),
+      );
     if (!prior?.workerThreadId) throw new Error('AGENT_UNAVAILABLE');
     const worker = this.worker(prior.worker);
-    if (prior.status !== 'ready_for_review') throw new Error('AGENT_BUSY');
+    await this.restoreContainerAgent(prior);
     const run: Run = {
       runId: handle('run'),
       agentId: prior.agentId,
@@ -117,8 +123,8 @@ export class LocalEngineer {
       imageReference: prior.imageReference,
       worker: worker.name,
       status: 'queued',
-      continuationIndex: prior.continuationIndex + 1,
-      continuationOfRunId: prior.runId,
+      continuationIndex: latest.continuationIndex + 1,
+      continuationOfRunId: latest.runId,
       createdAt: now(),
       workerThreadId: prior.workerThreadId,
       diagnostics: activity('queued'),
@@ -136,14 +142,9 @@ export class LocalEngineer {
   status(runIds?: string[], agentIds?: string[]): SafeRun[] {
     if (!!runIds === !!agentIds) throw new Error('STATUS_REQUIRES_EXACTLY_ONE_HANDLE_TYPE');
     return runIds
-      ? runIds.map((id) => this.requireOwned(id)).map((run) => this.project(run))
+      ? runIds.map((id) => this.requireRunCapability(id)).map((run) => this.project(run))
       : agentIds!
-          .map((id) =>
-            this.store
-              .getByAgent(id)
-              .filter((run) => this.owns(run))
-              .at(-1),
-          )
+          .map((id) => this.store.getByAgent(id).at(-1))
           .filter((r): r is Run => !!r)
           .map((run) => this.project(run));
   }
@@ -171,7 +172,7 @@ export class LocalEngineer {
       .map(safe);
   }
   async cancel(runId: string): Promise<SafeRun> {
-    const run = this.requireOwned(runId);
+    const run = this.requireRunCapability(runId);
     if (['failed', 'cancelled', 'timed_out', 'promoted', 'rejected', 'superseded'].includes(run.status))
       return safe(run);
     this.store.setStatus(runId, 'cancel_requested');
@@ -180,7 +181,7 @@ export class LocalEngineer {
         .get(run.agentId)
         ?.interrupt(run.workerThreadId, run.workerTurnId)
         .catch(() => undefined);
-    const current = this.requireOwned(runId);
+    const current = this.requireRunCapability(runId);
     this.commandItemStartedAt.delete(runId);
     this.completedCommandItems.delete(runId);
     return safe(
@@ -215,7 +216,7 @@ export class LocalEngineer {
     runIds: string[],
     waitFor: 'all' | 'any',
     seconds?: number,
-  ): Promise<{ timedOut: boolean; settled: SafeRun[]; pending: SafeRun[] }> {
+  ): Promise<{ timedOut: boolean; settled: SafeRun[]; pending: WaitRun[] }> {
     if (!runIds.length || runIds.length > this.config.server.max_wait_ids || new Set(runIds).size !== runIds.length)
       throw new Error('WAIT_RUN_IDS_INVALID');
     const timeout = waitDurationSeconds(
@@ -223,7 +224,7 @@ export class LocalEngineer {
       this.config.server.max_wait_timeout_seconds,
       this.config.server.wait_response_reserve_seconds,
     );
-    const settled = () => runIds.map((id) => this.requireOwned(id)).filter((r) => isSettled(r.status));
+    const settled = () => runIds.map((id) => this.requireRunCapability(id)).filter((r) => isSettled(r.status));
     const done = () => (waitFor === 'all' ? settled().length === runIds.length : settled().length > 0);
     if (!done())
       await new Promise<void>((resolve) => {
@@ -237,11 +238,11 @@ export class LocalEngineer {
         };
         this.store.on('change', handler);
       });
-    const all = runIds.map((id) => this.requireOwned(id));
+    const all = runIds.map((id) => this.requireRunCapability(id));
     return {
       timedOut: !done(),
       settled: all.filter((r) => isSettled(r.status)).map((run) => this.project(run)),
-      pending: all.filter((r) => !isSettled(r.status)).map((run) => this.project(run)),
+      pending: await Promise.all(all.filter((r) => !isSettled(r.status)).map((run) => this.waitProjection(run))),
     };
   }
   getChanges(agentId: string): {
@@ -251,7 +252,7 @@ export class LocalEngineer {
     status: RunStatus;
     change_set: NonNullable<Run['changeSet']>;
   } {
-    const run = this.requireOwnedAgent(agentId);
+    const run = this.requireAgentCapability(agentId);
     if (run.status !== 'ready_for_review' || !run.changeSet) throw new Error('AGENT_NOT_READY_FOR_REVIEW');
     const response = {
       schema_version: 1 as const,
@@ -279,8 +280,9 @@ export class LocalEngineer {
     truncated: boolean;
     check_cursor_advanced: boolean;
   }> {
-    const run = this.requireOwnedAgent(agentId);
+    const run = this.requireAgentCapability(agentId);
     if (run.status !== 'ready_for_review' || !run.changeSet) throw new Error('AGENT_NOT_READY_FOR_REVIEW');
+    await this.restoreContainerAgent(run);
     const checkpointKey = `${agentId}\0${repository}`;
     const toRevision = run.changeSet.revision;
     const fromRevision = mode === 'full' ? 0 : (this.diffCheckpoints.get(checkpointKey) ?? 0);
@@ -305,8 +307,9 @@ export class LocalEngineer {
     return response;
   }
   async getFile(agentId: string, repository: string, path: string, maximumBytes = 20000) {
-    const run = this.requireOwnedAgent(agentId);
+    const run = this.requireAgentCapability(agentId);
     if (run.status !== 'ready_for_review') throw new Error('AGENT_NOT_READY_FOR_REVIEW');
+    await this.restoreContainerAgent(run);
     const response = {
       schema_version: 1,
       agent_id: agentId,
@@ -318,8 +321,9 @@ export class LocalEngineer {
     return response;
   }
   async keepChanges(agentId: string, revision: number, digest: string): Promise<SafeRun> {
-    const run = this.requireOwnedAgent(agentId);
+    const run = this.requireAgentCapability(agentId);
     if (run.status !== 'ready_for_review' || !run.changeSet) throw new Error('AGENT_NOT_READY_FOR_REVIEW');
+    await this.restoreContainerAgent(run);
     await this.containerManager.promote(agentId, revision, digest);
     return safe(
       this.store.setStatus(run.runId, 'promoted', {
@@ -336,7 +340,7 @@ export class LocalEngineer {
     retained_history_run_ids: string[];
     history_retained: true;
   }> {
-    const run = this.requireOwnedAgent(agentId);
+    const run = this.requireAgentCapability(agentId);
     if (['queued', 'starting', 'running', 'cancel_requested'].includes(run.status)) await this.cancel(run.runId);
     await this.containerManager.delete(agentId);
     this.adapters.delete(agentId);
@@ -344,7 +348,7 @@ export class LocalEngineer {
     const deletedAt = now();
     const discardedRunIds: string[] = [];
     const retainedHistoryRunIds: string[] = [];
-    for (const candidate of this.store.getByAgent(agentId).filter((item) => this.owns(item))) {
+    for (const candidate of this.store.getByAgent(agentId)) {
       if (candidate.status === 'ready_for_review') {
         this.store.setStatus(candidate.runId, 'rejected', {
           completedAt: candidate.completedAt ?? deletedAt,
@@ -379,7 +383,7 @@ export class LocalEngineer {
     };
   }
   private queue(runId: string, timeoutSeconds: number): void {
-    const run = this.requireOwned(runId);
+    const run = this.requireRunCapability(runId);
     const previous = this.queues.get(run.agentId) ?? Promise.resolve();
     const task = previous.catch(() => undefined).then(() => this.execute(runId, timeoutSeconds));
     this.queues.set(run.agentId, task);
@@ -441,12 +445,29 @@ export class LocalEngineer {
           '\n',
         )}\nThis worker is one-way: do not ask the parent questions or attempt to access parent tools. Complete the bounded task with available context, report unresolved ambiguity in the final JSON, and stop.`;
       const workingDirectory = run.containerWorkingDirectory!;
-      const started = run.workerThreadId
-        ? {
+      let started: { threadId: string; turnId: string };
+      if (!run.workerThreadId) {
+        started = await adapter.createAndStart(workingDirectory, prompt);
+      } else {
+        try {
+          started = {
             threadId: run.workerThreadId,
             turnId: await adapter.continue(run.workerThreadId, workingDirectory, prompt),
-          }
-        : await adapter.createAndStart(workingDirectory, prompt);
+          };
+        } catch (cause) {
+          if (!isMissingRecoveredThread(cause)) throw cause;
+          this.store.appendRaw(
+            runId,
+            'stderr',
+            `${new Date().toISOString()} recovered worker thread unavailable; starting a new Codex thread in the retained container\n`,
+          );
+          started = await adapter.createAndStart(
+            workingDirectory,
+            `${prompt}\n\nRecovery context: a previous Local Engineer app-server process no longer has its in-memory thread. ` +
+              'The private container workspace already contains the prior reviewed revision. Inspect that existing work first; do not discard or recreate it. Continue only the requested correction, run the required validation, and return the structured final JSON.',
+          );
+        }
+      }
       if (this.requireOwned(runId).status !== 'starting') return;
       run = this.store.setStatus(runId, 'running', {
         workerThreadId: started.threadId,
@@ -482,6 +503,7 @@ export class LocalEngineer {
       const appServerExit = error instanceof Error && /^CODEX_APP_SERVER_(EXIT|ERROR)/.test(error.message);
       const runtimeUnavailable = error instanceof Error && error.message.startsWith('CONTAINER_RUNTIME_UNAVAILABLE:');
       const repositoryHeadRequired = error instanceof Error && error.message === 'REPOSITORY_HEAD_REQUIRED';
+      const harnessFailure = !timedOut && !idleTimedOut && !turnFailure && !appServerExit && !runtimeUnavailable;
       this.store.setStatus(runId, timedOut ? 'timed_out' : 'failed', {
         completedAt: now(),
         errorCode: timedOut
@@ -501,14 +523,19 @@ export class LocalEngineer {
           appServerExit ? 'app_server_exited' : timedOut ? 'timed_out' : idleTimedOut ? 'idle_timed_out' : 'failed',
           current.diagnostics,
           {
-            ...(turnFailure || appServerExit || idleTimedOut || runtimeUnavailable || repositoryHeadRequired
+            ...(turnFailure ||
+            appServerExit ||
+            idleTimedOut ||
+            runtimeUnavailable ||
+            repositoryHeadRequired ||
+            harnessFailure
               ? {
                   exit_reason: repositoryHeadRequired
                     ? 'A Local Engineer repository needs at least one Git commit (a valid HEAD) before a worker can start.'
                     : turnFailure
                       ? turnFailure.exitReason
                       : error instanceof Error
-                        ? error.message
+                        ? safeHarnessFailureDetail(error)
                         : String(error),
                 }
               : {}),
@@ -644,7 +671,7 @@ export class LocalEngineer {
     category: 'changes' | 'diff' | 'file' | 'lifecycle',
     payload: unknown,
   ): void {
-    const run = this.requireOwned(runId);
+    const run = this.requireRunCapability(runId);
     const current = run.stats ?? emptyStats();
     const characters = JSON.stringify(payload).length;
     const parent = current.parent_visible;
@@ -708,13 +735,26 @@ export class LocalEngineer {
       access: accessOverrides[repository.name] ?? repository.default_access,
     }));
   }
-  private requireOwnedAgent(agentId: string): Run {
-    const run = this.store
-      .getByAgent(agentId)
-      .filter((candidate) => this.owns(candidate))
-      .at(-1);
+  private requireAgentCapability(agentId: string): Run {
+    const run = this.store.getByAgent(agentId).at(-1);
     if (!run) throw new Error('AGENT_UNAVAILABLE');
     return run;
+  }
+  private requireRunCapability(id: string): Run {
+    const run = this.store.get(id);
+    if (!run) throw new Error('RUN_NOT_FOUND');
+    return run;
+  }
+  private async restoreContainerAgent(run: Run): Promise<void> {
+    // Legacy/in-memory test runs have no retained container state. Real
+    // container-backed runs always persist repositories before review.
+    if (!run.repositories?.length) return;
+    await this.containerManager.recover({
+      agentId: run.agentId,
+      image: run.imageReference ?? this.config.container.image,
+      repositories: run.repositories,
+      changeSet: run.changeSet,
+    });
   }
   private worker(name?: string): Worker {
     const worker = name ? this.config.workers.find((w) => w.name === name && w.enabled) : defaultWorker(this.config);
@@ -723,6 +763,33 @@ export class LocalEngineer {
   }
   private project(run: Run): SafeRun {
     return safe(run);
+  }
+  private async waitProjection(run: Run): Promise<WaitRun> {
+    const diagnostics = run.diagnostics;
+    const activityAt = Date.parse(diagnostics?.last_activity_at ?? '');
+    const secondsSinceActivity = Number.isFinite(activityAt)
+      ? Math.max(0, Math.floor((Date.now() - activityAt) / 1000))
+      : undefined;
+    const activeCommand = (diagnostics?.commands_active_count ?? 0) > 0;
+    const streamingMessage = diagnostics?.last_phase === 'agent_message_streaming';
+    const state = activeCommand ? 'executing_command' : streamingMessage ? 'producing_message' : 'awaiting_next_action';
+    const changedFileCount = await this.containerManager.liveChangeCount(run.agentId).catch(() => undefined);
+    return {
+      ...this.project(run),
+      live_progress: {
+        state,
+        ...(secondsSinceActivity !== undefined ? { seconds_since_last_activity: secondsSinceActivity } : {}),
+        ...(changedFileCount !== undefined ? { changed_file_count: changedFileCount } : {}),
+        ...(diagnostics?.last_agent_message_at ? { last_message_at: diagnostics.last_agent_message_at } : {}),
+        ...(diagnostics?.last_agent_message_excerpt
+          ? { recent_message_excerpt: diagnostics.last_agent_message_excerpt }
+          : {}),
+        recommended_parent_action:
+          activeCommand || (secondsSinceActivity !== undefined && secondsSinceActivity < 120)
+            ? 'continue_waiting'
+            : 'inspect_or_cancel',
+      },
+    };
   }
   private owns(run: Run): boolean {
     return run.ownerId === this.ownerId;
@@ -740,6 +807,27 @@ export class LocalEngineer {
   private validateTitle(title: string): void {
     if (!title.trim() || [...title].length > 120 || /[\r\n]/.test(title)) throw new Error('TITLE_INVALID');
   }
+}
+
+/**
+ * Startup failures are stored verbatim in the private run log. Expose a
+ * bounded, path-redacted diagnostic to the supervising parent so it can make
+ * a recovery decision without receiving arbitrary command output.
+ */
+export function safeHarnessFailureDetail(error: Error): string {
+  const detail = error.message
+    .replace(/[A-Za-z]:\\[^\r\n]*/g, '<local-path>')
+    .replace(/\/[^\s:]+(?:\/[^\s:]*)*/g, '<path>')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 500);
+  return /^(REPOSITORY|CONTAINER|SNAPSHOT|GIT|WORKER)_[A-Z0-9_:-]+/.test(detail)
+    ? detail
+    : 'Worker setup or harness failed before the first command. Inspect the retained Local Engineer run logs.';
+}
+
+export function isMissingRecoveredThread(cause: unknown): boolean {
+  return cause instanceof Error && /^CODEX_RPC_ERROR:thread not found:/i.test(cause.message);
 }
 
 export function codexTurnFailure(
@@ -863,6 +951,15 @@ function eventActivity(
 ): NonNullable<Run['diagnostics']> {
   const method = event.method ?? 'event';
   if (/turn\/completed/i.test(method)) return activity('turn_completed', run.diagnostics, { turn_completed_at: now() });
+  if (/item\/agentMessage\/delta/i.test(method)) {
+    const delta = typeof event.params?.delta === 'string' ? event.params.delta : '';
+    return activity('agent_message_streaming', run.diagnostics, {
+      last_agent_message_at: now(),
+      ...(delta
+        ? { last_agent_message_excerpt: progressExcerpt(run.diagnostics?.last_agent_message_excerpt, delta) }
+        : {}),
+    });
+  }
   const item = asRecord(event.params?.item);
   const itemType = typeof item?.type === 'string' ? item.type : undefined;
   if (/item\/started/i.test(method) && item && itemType === 'commandExecution')
@@ -884,14 +981,16 @@ function eventActivity(
     });
   if (/item\/completed/i.test(method) && item && itemType === 'commandExecution') {
     const rawStatus = typeof item.status === 'string' ? item.status.toLowerCase() : '';
-    const exitCode = typeof item.exitCode === 'number' ? item.exitCode : undefined;
+    const reportedExitCode = typeof item.exitCode === 'number' ? item.exitCode : undefined;
+    const output = typeof item.aggregatedOutput === 'string' ? item.aggregatedOutput.trim() : '';
+    const patchExitCode = maskedPatchExitCode(item, output);
+    const exitCode = patchExitCode ?? reportedExitCode;
     const commandStatus =
       rawStatus === 'declined' || rawStatus === 'cancelled'
         ? 'declined'
         : rawStatus === 'completed' && (exitCode === undefined || exitCode === 0)
           ? 'succeeded'
           : 'failed';
-    const output = typeof item.aggregatedOutput === 'string' ? item.aggregatedOutput.trim() : '';
     const completedIncrement = commandTracking?.countCompleted === false ? 0 : 1;
     return activity(`command_${commandStatus}`, run.diagnostics, {
       command_started_at: commandTracking?.startedAt ?? run.diagnostics?.command_started_at,
@@ -904,8 +1003,36 @@ function eventActivity(
         commandStatus === 'failed' || commandStatus === 'declined' ? output.slice(0, 1000) || undefined : undefined,
     });
   }
+  if (/item\/completed/i.test(method) && itemType === 'agentMessage')
+    return activity('agent_message_completed', run.diagnostics, {
+      last_agent_message_at: now(),
+      last_agent_message_excerpt: progressExcerpt(undefined, typeof item?.text === 'string' ? item.text : ''),
+      agent_messages_completed_count: (run.diagnostics?.agent_messages_completed_count ?? 0) + 1,
+    });
   if (/item\/completed/i.test(method)) return activity(`item_completed_${itemType ?? 'unknown'}`, run.diagnostics);
   return activity(method.replace(/[^a-z0-9]+/gi, '_').toLowerCase(), run.diagnostics);
+}
+
+/**
+ * Smaller local models sometimes append `echo "e:$?"` after apply_patch,
+ * changing the shell process status to zero. Preserve the helper's nonzero
+ * result for lifecycle supervision rather than reporting a false pass.
+ */
+export function maskedPatchExitCode(item: Record<string, unknown>, output: string): number | undefined {
+  const command = typeof item.command === 'string' ? item.command : typeof item.text === 'string' ? item.text : '';
+  if (!/(^|\s)apply_patch(?:\s|$)/.test(command)) return undefined;
+  const matches = [...output.matchAll(/(?:^|\s)e:(\d+)\b/g)];
+  const last = matches.at(-1)?.[1];
+  if (!last) return undefined;
+  const value = Number(last);
+  return Number.isSafeInteger(value) && value !== 0 ? value : undefined;
+}
+function progressExcerpt(prior: string | undefined, delta: string): string {
+  return `${prior ?? ''}${delta}`
+    .replace(/```[\s\S]*?```/g, '[code omitted]')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(-480);
 }
 interface CommandItemTracking {
   startedAt?: string;
@@ -1034,8 +1161,18 @@ export interface SafeRun {
       token_estimate_method: 'characters_divided_by_4_per_assignment_or_follow_up';
     };
     parent_visible_review_tokens_estimate: number;
-    savings_status: 'unmeasured';
-    human_summary: string;
+    /** Conservative net local output after bounded delegation/review overhead. */
+    estimated_savings_tokens: number;
+  };
+}
+export interface WaitRun extends SafeRun {
+  live_progress: {
+    state: 'executing_command' | 'producing_message' | 'awaiting_next_action';
+    seconds_since_last_activity?: number;
+    changed_file_count?: number;
+    last_message_at?: string;
+    recent_message_excerpt?: string;
+    recommended_parent_action: 'continue_waiting' | 'inspect_or_cancel';
   };
 }
 export function safe(run: Run): SafeRun {
@@ -1070,10 +1207,10 @@ function delegationImpactFor(run: Run): SafeRun['delegation_impact'] | undefined
   if (!worker && !parentToWorker) return undefined;
   const reviewEstimate = stats?.parent_visible.estimated_tokens ?? 0;
   const parentPayload = parentToWorker ?? emptyStats().parent_to_worker!;
-  const workerSummary = worker
-    ? `Local Engineer processed ${worker.total.toLocaleString('en-US')} tokens locally ` +
-      `(${worker.output.toLocaleString('en-US')} output; ${worker.reasoning_output.toLocaleString('en-US')} reasoning) `
-    : 'Local Engineer has not yet reported local worker token usage ';
+  const estimatedSavings = Math.max(
+    0,
+    (worker?.output ?? 0) + (worker?.reasoning_output ?? 0) - parentPayload.estimated_tokens - reviewEstimate,
+  );
   return {
     ...(worker ? { local_worker_tokens: worker } : {}),
     parent_to_worker_payload: {
@@ -1081,13 +1218,6 @@ function delegationImpactFor(run: Run): SafeRun['delegation_impact'] | undefined
       token_estimate_method: 'characters_divided_by_4_per_assignment_or_follow_up',
     },
     parent_visible_review_tokens_estimate: reviewEstimate,
-    savings_status: 'unmeasured',
-    human_summary:
-      workerSummary +
-      `after the parent supplied ${parentPayload.characters.toLocaleString('en-US')} characters ` +
-      `(about ${parentPayload.estimated_tokens.toLocaleString('en-US')} tokens) across ` +
-      `${parentPayload.task_assignments} task assignment(s) and ${parentPayload.follow_up_messages} follow-up message(s), ` +
-      `and exposed about ${reviewEstimate.toLocaleString('en-US')} review tokens to the parent. ` +
-      'The parent-to-worker figure excludes generated policy/framing and is not total parent conversation usage. This is offloaded local work, not a measured parent-token saving.',
+    estimated_savings_tokens: estimatedSavings,
   };
 }

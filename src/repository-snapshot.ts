@@ -35,10 +35,14 @@ export interface RepositoryChanges {
 export async function createRepositorySnapshot(parentPath: string, snapshotPath: string): Promise<RepositorySnapshot> {
   const parent = realpathSync.native(parentPath);
   const topLevel = realpathSync.native((await git(parent, ['rev-parse', '--show-toplevel'])).trim());
-  if (topLevel !== parent) throw new Error('REPOSITORY_PATH_NOT_TOP_LEVEL');
+  // A caller may intentionally scope a worker to a project directory inside a
+  // larger checkout. Snapshot the actual checkout so Git state and promotion
+  // checks remain correct; the container working directory is handled by the
+  // caller separately.
+  const repositoryRoot = topLevel;
   let parentHead: string;
   try {
-    parentHead = (await git(parent, ['rev-parse', '--verify', 'HEAD'])).trim();
+    parentHead = (await git(repositoryRoot, ['rev-parse', '--verify', 'HEAD'])).trim();
   } catch (cause) {
     if (cause instanceof Error && cause.message.startsWith('GIT_COMMAND_FAILED:rev-parse --verify HEAD:')) {
       throw new Error('REPOSITORY_HEAD_REQUIRED');
@@ -46,33 +50,35 @@ export async function createRepositorySnapshot(parentPath: string, snapshotPath:
     throw cause;
   }
   if (!/^[0-9a-f]{40,64}$/i.test(parentHead)) throw new Error('REPOSITORY_HEAD_INVALID');
-  if ((await git(parent, ['diff', '--name-only', '--diff-filter=U'])).trim())
+  if ((await git(repositoryRoot, ['diff', '--name-only', '--diff-filter=U'])).trim())
     throw new Error('REPOSITORY_HAS_UNMERGED_PATHS');
-  const dirty = (await git(parent, ['status', '--porcelain=v1', '--untracked-files=all'])).length > 0;
-  const trackedPaths = nulPaths(await git(parent, ['ls-files', '-z']));
-  const untrackedPaths = nulPaths(await git(parent, ['ls-files', '-z', '--others', '--exclude-standard']));
+  const dirty = (await git(repositoryRoot, ['status', '--porcelain=v1', '--untracked-files=all'])).length > 0;
+  const trackedPaths = nulPaths(await git(repositoryRoot, ['ls-files', '-z']));
+  const untrackedPaths = nulPaths(await git(repositoryRoot, ['ls-files', '-z', '--others', '--exclude-standard']));
   const ignoredPaths = copyRoots(
-    nulPaths(await git(parent, ['ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory'])),
+    nulPaths(
+      await git(repositoryRoot, ['ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory']),
+    ),
   );
-  for (const path of [...trackedPaths, ...untrackedPaths]) assertNoNestedRepository(parent, path);
-  for (const path of ignoredPaths) safeRepositoryPath(parent, path);
+  for (const path of [...trackedPaths, ...untrackedPaths]) assertNoNestedRepository(repositoryRoot, path);
+  for (const path of ignoredPaths) safeRepositoryPath(repositoryRoot, path);
   const parentWorktree = Object.fromEntries(
     [...new Set([...trackedPaths, ...untrackedPaths])]
-      .filter((path) => existsSync(safeRepositoryPath(parent, path)))
-      .map((path) => [path, worktreeFingerprint(safeRepositoryPath(parent, path))]),
+      .filter((path) => existsSync(safeRepositoryPath(repositoryRoot, path)))
+      .map((path) => [path, worktreeFingerprint(safeRepositoryPath(repositoryRoot, path))]),
   );
-  const parentIndex = parseIndex(await git(parent, ['ls-files', '--stage', '-z']));
+  const parentIndex = parseIndex(await git(repositoryRoot, ['ls-files', '--stage', '-z']));
   if (existsSync(snapshotPath)) throw new Error('SNAPSHOT_PATH_EXISTS');
   mkdirSync(dirname(snapshotPath), { recursive: true });
-  await git(dirname(snapshotPath), ['clone', '--no-hardlinks', '--no-checkout', parent, snapshotPath]);
-  const autoCrlf = await gitOptional(parent, ['config', '--get', 'core.autocrlf']);
-  const coreEol = await gitOptional(parent, ['config', '--get', 'core.eol']);
+  await git(dirname(snapshotPath), ['clone', '--no-hardlinks', '--no-checkout', repositoryRoot, snapshotPath]);
+  const autoCrlf = await gitOptional(repositoryRoot, ['config', '--get', 'core.autocrlf']);
+  const coreEol = await gitOptional(repositoryRoot, ['config', '--get', 'core.eol']);
   if (autoCrlf.trim()) await git(snapshotPath, ['config', 'core.autocrlf', autoCrlf.trim()]);
   if (coreEol.trim()) await git(snapshotPath, ['config', 'core.eol', coreEol.trim()]);
   await git(snapshotPath, ['checkout', '--detach', parentHead]);
 
   for (const path of trackedPaths) {
-    const source = safeRepositoryPath(parent, path);
+    const source = safeRepositoryPath(repositoryRoot, path);
     const destination = safeRepositoryPath(snapshotPath, path);
     if (!existsSync(source)) {
       rmSync(destination, { force: true });
@@ -83,7 +89,7 @@ export async function createRepositorySnapshot(parentPath: string, snapshotPath:
     copyFileSync(source, destination);
   }
   for (const path of untrackedPaths) {
-    const source = safeRepositoryPath(parent, path);
+    const source = safeRepositoryPath(repositoryRoot, path);
     const destination = safeRepositoryPath(snapshotPath, path);
     if (!lstatSync(source).isFile()) throw new Error('SNAPSHOT_UNTRACKED_NON_FILE_UNSUPPORTED');
     mkdirSync(dirname(destination), { recursive: true });
@@ -106,7 +112,7 @@ export async function createRepositorySnapshot(parentPath: string, snapshotPath:
   }
   const baselineCommit = (await git(snapshotPath, ['rev-parse', 'HEAD'])).trim();
   return {
-    parentPath: parent,
+    parentPath: repositoryRoot,
     snapshotPath: realpathSync.native(snapshotPath),
     parentHead,
     baselineCommit,
@@ -114,6 +120,40 @@ export async function createRepositorySnapshot(parentPath: string, snapshotPath:
     ignoredPaths,
     parentWorktree,
     parentIndex,
+  };
+}
+
+/**
+ * Rebuild snapshot metadata from a retained private Git snapshot. This is used
+ * only after an STDIO MCP process is replaced; the snapshot itself remains the
+ * authoritative baseline for later promotion checks.
+ */
+export async function recoverRepositorySnapshot(
+  parentPath: string,
+  snapshotPath: string,
+  parentHead: string,
+  baselineCommit: string,
+  baselineKind: RepositorySnapshot['baselineKind'],
+): Promise<RepositorySnapshot> {
+  if (!existsSync(snapshotPath)) throw new Error('SNAPSHOT_PATH_NOT_FOUND');
+  const parent = realpathSync.native(parentPath);
+  const repositoryRoot = realpathSync.native((await git(parent, ['rev-parse', '--show-toplevel'])).trim());
+  const snapshot = realpathSync.native(snapshotPath);
+  const trackedPaths = nulPaths(await git(snapshot, ['ls-files', '-z']));
+  const parentWorktree = Object.fromEntries(
+    trackedPaths
+      .filter((path) => existsSync(safeRepositoryPath(snapshot, path)))
+      .map((path) => [path, worktreeFingerprint(safeRepositoryPath(snapshot, path))]),
+  );
+  return {
+    parentPath: repositoryRoot,
+    snapshotPath: snapshot,
+    parentHead,
+    baselineCommit,
+    baselineKind,
+    ignoredPaths: [],
+    parentWorktree,
+    parentIndex: parseIndex(await git(snapshot, ['ls-files', '--stage', '-z'])),
   };
 }
 

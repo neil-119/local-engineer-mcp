@@ -12,7 +12,7 @@ import {
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import type { Config } from './domain.js';
 import { generatedProxyConfig } from './container-codex-config.js';
-import { ContainerRuntime } from './container-runtime.js';
+import { agentNetworkSubnets, ContainerRuntime } from './container-runtime.js';
 
 export interface ImagePlanInput {
   path: string;
@@ -31,6 +31,7 @@ export interface ImagePlan {
   detected: {
     python?: { manager: 'requirements'; files: string[] };
     node?: { manager: 'npm' | 'pnpm' | 'yarn'; files: string[]; version?: string };
+    cargo?: { manager: 'cargo'; files: string[] };
   };
   inputs: ImagePlanInput[];
   install_steps: string[];
@@ -71,7 +72,7 @@ export class ImageProfileManager {
     private readonly stateDirectory: string,
     runtime?: ContainerRuntime,
   ) {
-    this.runtime = runtime ?? new ContainerRuntime(config.container.command);
+    this.runtime = runtime ?? new ContainerRuntime(config.container.command, undefined, config.container.context);
   }
 
   plan(workingDirectory: string, profile: string, additionalDomains: string[] = []): ImagePlan {
@@ -84,16 +85,20 @@ export class ImageProfileManager {
     const requiredDomains = new Set<string>();
     for (const domain of additionalDomains) requiredDomains.add(domain);
 
-    const requirementFiles = readdirSync(workingDirectory)
+    const projectDirectory = discoveredProjectDirectory(workingDirectory);
+    const relativeProjectDirectory = relative(workingDirectory, projectDirectory);
+    const projectPath = (name: string) => relativeProjectPath(relativeProjectDirectory, name);
+    const requirementFiles = readdirSync(projectDirectory)
       .filter((name) => /^requirements(?:[-_.][a-z0-9_.-]+)?\.txt$/i.test(name))
       .sort();
     if (requirementFiles.length) {
-      detected.python = { manager: 'requirements', files: requirementFiles };
-      paths.push(...requirementFiles);
+      const files = requirementFiles.map(projectPath);
+      detected.python = { manager: 'requirements', files };
+      paths.push(...files);
       installSteps.push(
         'python3.12 -m venv /opt/local-engineer-profile/python',
-        `/opt/local-engineer-profile/python/bin/pip install --no-cache-dir ${requirementFiles
-          .map((name) => `-r /opt/local-engineer-profile/inputs/${name}`)
+        `/opt/local-engineer-profile/python/bin/pip install --no-cache-dir ${files
+          .map((name) => `-r /opt/local-engineer-profile/inputs/${basename(name)}`)
           .join(' ')}`,
       );
       smokeCommands.push('/opt/local-engineer-profile/python/bin/python --version');
@@ -101,33 +106,37 @@ export class ImageProfileManager {
       requiredDomains.add('files.pythonhosted.org');
     }
 
-    const packageJson = join(workingDirectory, 'package.json');
+    const packageJson = join(projectDirectory, 'package.json');
     if (existsSync(packageJson)) {
       const packageData = parsedJson(packageJson);
       const packageManager = typeof packageData.packageManager === 'string' ? packageData.packageManager : undefined;
-      const pnpmLock = join(workingDirectory, 'pnpm-lock.yaml');
-      const npmLock = join(workingDirectory, 'package-lock.json');
-      const yarnLock = join(workingDirectory, 'yarn.lock');
+      const pnpmLock = join(projectDirectory, 'pnpm-lock.yaml');
+      const npmLock = join(projectDirectory, 'package-lock.json');
+      const yarnLock = join(projectDirectory, 'yarn.lock');
       if (existsSync(pnpmLock)) {
         const version = packageManager?.match(/^pnpm@([^+\s]+)(?:\+.*)?$/)?.[1];
         detected.node = {
           manager: 'pnpm',
-          files: ['package.json', 'pnpm-lock.yaml'],
+          files: [projectPath('package.json'), projectPath('pnpm-lock.yaml')],
           ...(version ? { version } : {}),
         };
-        paths.push('package.json', 'pnpm-lock.yaml');
+        paths.push(projectPath('package.json'), projectPath('pnpm-lock.yaml'));
         installSteps.push(
           `npm install --global pnpm${version ? `@${version}` : ''}`,
           'pnpm install --dir /opt/local-engineer-profile/node --frozen-lockfile',
         );
       } else if (existsSync(npmLock)) {
-        detected.node = { manager: 'npm', files: ['package.json', 'package-lock.json'] };
-        paths.push('package.json', 'package-lock.json');
+        detected.node = { manager: 'npm', files: [projectPath('package.json'), projectPath('package-lock.json')] };
+        paths.push(projectPath('package.json'), projectPath('package-lock.json'));
         installSteps.push('npm ci --prefix /opt/local-engineer-profile/node');
       } else if (existsSync(yarnLock)) {
         const version = packageManager?.match(/^yarn@([^+\s]+)(?:\+.*)?$/)?.[1];
-        detected.node = { manager: 'yarn', files: ['package.json', 'yarn.lock'], ...(version ? { version } : {}) };
-        paths.push('package.json', 'yarn.lock');
+        detected.node = {
+          manager: 'yarn',
+          files: [projectPath('package.json'), projectPath('yarn.lock')],
+          ...(version ? { version } : {}),
+        };
+        paths.push(projectPath('package.json'), projectPath('yarn.lock'));
         installSteps.push(
           `npm install --global yarn${version ? `@${version}` : ''}`,
           'yarn --cwd /opt/local-engineer-profile/node install --frozen-lockfile',
@@ -137,6 +146,18 @@ export class ImageProfileManager {
         smokeCommands.push('node --version');
         requiredDomains.add('registry.npmjs.org');
       }
+    }
+
+    const cargoToml = join(projectDirectory, 'Cargo.toml');
+    const cargoLock = join(projectDirectory, 'Cargo.lock');
+    if (existsSync(cargoToml) && existsSync(cargoLock)) {
+      const files = [projectPath('Cargo.toml'), projectPath('Cargo.lock')];
+      detected.cargo = { manager: 'cargo', files };
+      paths.push(...files);
+      installSteps.push('cargo fetch --locked --manifest-path /opt/local-engineer-profile/cargo/Cargo.toml');
+      smokeCommands.push('cargo --version', 'rustc --version');
+      requiredDomains.add('index.crates.io');
+      requiredDomains.add('static.crates.io');
     }
 
     const inputs = [...new Set(paths)].sort().map((path) => ({
@@ -236,6 +257,16 @@ export class ImageProfileManager {
       };
       this.writeRecord(record);
       return record;
+    } catch (cause) {
+      if (cause instanceof ImageProfileError) throw cause;
+      throw new ImageProfileError('IMAGE_PROFILE_BUILD_FAILED', {
+        error_code: 'IMAGE_PROFILE_BUILD_FAILED',
+        profile: plan.profile,
+        plan_digest: plan.plan_digest,
+        error_summary: imageBuildFailureSummary(cause),
+        recommended_action:
+          'Keep the same approved plan; inspect the Local Engineer image/profile builder before retrying.',
+      });
     } finally {
       rmSync(buildDirectory, { recursive: true, force: true });
     }
@@ -301,14 +332,15 @@ export class ImageProfileManager {
       'local-engineer.agent-id': `image-${suffix}`,
       'local-engineer.managed': 'true',
     };
+    const subnets = agentNetworkSubnets(`image-${suffix}`, this.config.container.agent_network_pool);
     const proxyConfigPath = join(buildDirectory, 'proxy-config.toml');
     writeFileSync(proxyConfigPath, generatedProxyConfig(this.config.container), {
       encoding: 'utf8',
       mode: 0o600,
     });
     try {
-      await this.runtime.createNetwork(internalNetwork, true, labels);
-      await this.runtime.createNetwork(egressNetwork, false, labels);
+      await this.runtime.createNetwork(internalNetwork, true, labels, subnets.internal);
+      await this.runtime.createNetwork(egressNetwork, false, labels, subnets.egress);
       await this.runtime.createVolume(configVolume, labels);
       await this.runtime.createVolume(sharedVolume, labels);
       await this.runtime.createContainer({
@@ -384,6 +416,9 @@ export class ImageProfileManager {
         image: this.config.container.image,
         network,
         user: '0',
+        // The generated Cargo cache must be handed to the final non-root worker.
+        // CHOWN is the only extra setup capability permitted by the runtime.
+        capabilities: ['CHOWN'],
         labels,
         readOnlyRoot: false,
         mounts: [`type=volume,src=${sharedVolume},dst=/proxy-shared,readonly`],
@@ -399,6 +434,7 @@ export class ImageProfileManager {
           GIT_SSL_CAINFO: caPath,
           PIP_CERT: caPath,
           npm_config_cafile: caPath,
+          CARGO_HTTP_CAINFO: caPath,
         },
         command: ['sleep', 'infinity'],
       });
@@ -467,14 +503,22 @@ export class ImageProfileManager {
         await this.runtime.execContainer(container, ['mkdir', '-p', nodeRoot], { user: '0' });
         await this.runtime.execContainer(
           container,
-          ['cp', '/opt/local-engineer-profile/inputs/package.json', `${nodeRoot}/package.json`],
+          [
+            'cp',
+            `/opt/local-engineer-profile/inputs/${basename(plan.detected.node.files[0]!)}`,
+            `${nodeRoot}/package.json`,
+          ],
           { user: '0' },
         );
         const manager = plan.detected.node;
         if (manager.manager === 'npm') {
           await this.runtime.execContainer(
             container,
-            ['cp', '/opt/local-engineer-profile/inputs/package-lock.json', `${nodeRoot}/package-lock.json`],
+            [
+              'cp',
+              `/opt/local-engineer-profile/inputs/${basename(manager.files[1]!)}`,
+              `${nodeRoot}/package-lock.json`,
+            ],
             { user: '0' },
           );
           await this.runtime.execContainer(container, ['npm', 'ci', '--prefix', nodeRoot], { user: '0' });
@@ -488,7 +532,7 @@ export class ImageProfileManager {
           const lockfile = manager.manager === 'pnpm' ? 'pnpm-lock.yaml' : 'yarn.lock';
           await this.runtime.execContainer(
             container,
-            ['cp', `/opt/local-engineer-profile/inputs/${lockfile}`, `${nodeRoot}/${lockfile}`],
+            ['cp', `/opt/local-engineer-profile/inputs/${basename(manager.files[1]!)}`, `${nodeRoot}/${lockfile}`],
             { user: '0' },
           );
           await this.runtime.execContainer(
@@ -500,9 +544,47 @@ export class ImageProfileManager {
           );
         }
       }
+      if (plan.detected.cargo) {
+        const cargoRoot = '/opt/local-engineer-profile/cargo';
+        const cargoHome = '/opt/local-engineer-profile/cargo-home';
+        await this.runtime.execContainer(container, ['mkdir', '-p', `${cargoRoot}/src`, cargoHome], { user: '0' });
+        await this.runtime.execContainer(
+          container,
+          [
+            'cp',
+            `/opt/local-engineer-profile/inputs/${basename(plan.detected.cargo.files[0]!)}`,
+            `${cargoRoot}/Cargo.toml`,
+          ],
+          { user: '0' },
+        );
+        // Cargo requires a target even for `fetch`. The source is a trusted,
+        // generated empty library used only to make the copied lockfile
+        // installable; no project source is executed during profile creation.
+        await this.runtime.execContainer(
+          container,
+          ['node', '--eval', `require('node:fs').writeFileSync('${cargoRoot}/src/lib.rs', '')`],
+          { user: '0' },
+        );
+        await this.runtime.execContainer(
+          container,
+          [
+            'cp',
+            `/opt/local-engineer-profile/inputs/${basename(plan.detected.cargo.files[1]!)}`,
+            `${cargoRoot}/Cargo.lock`,
+          ],
+          { user: '0' },
+        );
+        await this.runtime.execContainer(
+          container,
+          ['cargo', 'fetch', '--locked', '--manifest-path', `${cargoRoot}/Cargo.toml`],
+          { user: '0', environment: { CARGO_HOME: cargoHome } },
+        );
+        await this.runtime.execContainer(container, ['chown', '-R', '10001:10001', cargoHome], { user: '0' });
+      }
       const path = [
         ...(plan.detected.python ? ['/opt/local-engineer-profile/python/bin'] : []),
         ...(plan.detected.node ? ['/opt/local-engineer-profile/node/node_modules/.bin'] : []),
+        '/usr/local/cargo/bin',
         '/usr/local/sbin',
         '/usr/local/bin',
         '/usr/sbin',
@@ -514,9 +596,10 @@ export class ImageProfileManager {
         'USER codex',
         `ENV PATH=${path}`,
         ...(plan.detected.node ? ['ENV NODE_PATH=/opt/local-engineer-profile/node/node_modules'] : []),
+        ...(plan.detected.cargo ? ['ENV CARGO_HOME=/opt/local-engineer-profile/cargo-home'] : []),
         'ENV HTTP_PROXY= HTTPS_PROXY= ALL_PROXY= NO_PROXY=',
         'ENV SSL_CERT_FILE= REQUESTS_CA_BUNDLE= CURL_CA_BUNDLE= NODE_EXTRA_CA_CERTS=',
-        'ENV GIT_SSL_CAINFO= PIP_CERT= npm_config_cafile=',
+        'ENV GIT_SSL_CAINFO= PIP_CERT= npm_config_cafile= CARGO_HTTP_CAINFO=',
       ]);
     } finally {
       await this.runtime.removeContainer(container, true).catch(() => undefined);
@@ -529,6 +612,15 @@ export class ImageProfileManager {
   }
 }
 
+function imageBuildFailureSummary(cause: unknown): string {
+  const message = cause instanceof Error ? cause.message : String(cause);
+  if (/no targets specified in the manifest/i.test(message))
+    return "Cargo could not initialize Local Engineer's generated dependency profile target.";
+  if (/EHOSTUNREACH|ECONNREFUSED|connect timeout/i.test(message))
+    return 'The dependency builder could not reach a configured upstream through its isolated proxy.';
+  return 'A container runtime command failed while building the isolated dependency profile.';
+}
+
 function parsedJson(path: string): Record<string, unknown> {
   try {
     const value = JSON.parse(readFileSync(path, 'utf8')) as unknown;
@@ -536,6 +628,36 @@ function parsedJson(path: string): Record<string, unknown> {
   } catch {
     throw new Error('IMAGE_PACKAGE_JSON_INVALID');
   }
+}
+
+const GENERATED_PROJECT_DIRECTORIES = new Set([
+  '.git',
+  '.local-engineer',
+  'build',
+  'coverage',
+  'dist',
+  'node_modules',
+  'target',
+]);
+
+function discoveredProjectDirectory(workingDirectory: string): string {
+  if (hasSupportedManifest(workingDirectory)) return workingDirectory;
+  const candidates = readdirSync(workingDirectory, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && !GENERATED_PROJECT_DIRECTORIES.has(entry.name))
+    .map((entry) => join(workingDirectory, entry.name))
+    .filter(hasSupportedManifest)
+    .sort((left, right) => left.localeCompare(right));
+  return candidates.length === 1 ? candidates[0]! : workingDirectory;
+}
+
+function hasSupportedManifest(directory: string): boolean {
+  if (existsSync(join(directory, 'package.json'))) return true;
+  if (existsSync(join(directory, 'Cargo.toml'))) return true;
+  return readdirSync(directory).some((name) => /^requirements(?:[-_.][a-z0-9_.-]+)?\.txt$/i.test(name));
+}
+
+function relativeProjectPath(projectDirectory: string, name: string): string {
+  return projectDirectory ? join(projectDirectory, name).split(sep).join('/') : name;
 }
 
 function safeProjectFile(root: string, path: string, errorCode: string): string {

@@ -2,10 +2,47 @@ import { mkdirSync, mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { Config, Run } from '../src/domain.js';
-import { LocalEngineer, codexTurnFailure, completedAgentMessage, safe } from '../src/service.js';
+import {
+  LocalEngineer,
+  codexTurnFailure,
+  completedAgentMessage,
+  maskedPatchExitCode,
+  safe,
+  safeHarnessFailureDetail,
+  isMissingRecoveredThread,
+} from '../src/service.js';
 import { RunStore } from '../src/store.js';
 
 describe('agent lifecycle history', () => {
+  it('allows an exact opaque agent handle to recover review metadata after an MCP process changes', () => {
+    const stateDirectory = mkdtempSync(join(testTemporaryDirectory(), 'service-capability-'));
+    const store = new RunStore(stateDirectory);
+    const engine = new LocalEngineer(config(stateDirectory), store, 'owner_new_connection');
+    const reviewed = {
+      ...run('run_retained', 'ready_for_review', 0),
+      ownerId: 'owner_original_connection',
+      changeSet: { revision: 1, previous_revision: 0, digest: `sha256:${'b'.repeat(64)}`, repositories: [] },
+    };
+    store.add(reviewed);
+
+    expect(engine.status(undefined, [reviewed.agentId])).toHaveLength(1);
+    expect(engine.getChanges(reviewed.agentId)).toMatchObject({
+      run_id: reviewed.runId,
+      change_set: { revision: 1 },
+    });
+    expect(engine.list({ limit: 10 })).toHaveLength(0);
+  });
+
+  it('returns a bounded actionable setup diagnostic without leaking local paths', () => {
+    expect(safeHarnessFailureDetail(new Error('REPOSITORY_HEAD_REQUIRED'))).toBe('REPOSITORY_HEAD_REQUIRED');
+    expect(safeHarnessFailureDetail(new Error('untrusted output C:\\Users\\someone\\secret'))).not.toContain('secret');
+  });
+
+  it('recognizes the app-server thread loss that requires a retained-container fallback', () => {
+    expect(isMissingRecoveredThread(new Error('CODEX_RPC_ERROR:thread not found: private-thread'))).toBe(true);
+    expect(isMissingRecoveredThread(new Error('CODEX_RPC_ERROR:permission denied'))).toBe(false);
+  });
+
   it('records direct parent task and grounding text for an initial assignment', () => {
     const stateDirectory = mkdtempSync(join(testTemporaryDirectory(), 'service-start-'));
     const testConfig = config(stateDirectory);
@@ -51,6 +88,42 @@ describe('agent lifecycle history', () => {
       diagnostics: {
         exit_reason:
           'A Local Engineer repository needs at least one Git commit (a valid HEAD) before a worker can start.',
+      },
+    });
+  });
+
+  it('adds bounded live progress to timed-out wait projections', async () => {
+    const stateDirectory = mkdtempSync(join(testTemporaryDirectory(), 'service-progress-'));
+    const store = new RunStore(stateDirectory);
+    const engine = new LocalEngineer(config(stateDirectory), store, 'owner_test');
+    const running = {
+      ...run('run_progress', 'running', 0),
+      diagnostics: {
+        last_phase: 'agent_message_streaming',
+        last_activity_at: new Date().toISOString(),
+        last_agent_message_at: new Date().toISOString(),
+        last_agent_message_excerpt: 'Applying the validated next patch.',
+        commands_started_count: 4,
+        commands_completed_count: 4,
+        commands_active_count: 0,
+      },
+    };
+    store.add(running);
+    const manager = (
+      engine as unknown as { containerManager: { liveChangeCount: (agentId: string) => Promise<number> } }
+    ).containerManager;
+    manager.liveChangeCount = async () => 3;
+
+    const projected = await (
+      engine as unknown as { waitProjection: (run: Run) => Promise<Record<string, unknown>> }
+    ).waitProjection(running);
+
+    expect(projected).toMatchObject({
+      live_progress: {
+        state: 'producing_message',
+        changed_file_count: 3,
+        recent_message_excerpt: 'Applying the validated next patch.',
+        recommended_parent_action: 'continue_waiting',
       },
     });
   });
@@ -117,7 +190,7 @@ describe('agent lifecycle history', () => {
     ]);
   });
 
-  it('supersedes the prior review run when a continuation is queued', () => {
+  it('supersedes the prior review run when a continuation is queued', async () => {
     const stateDirectory = mkdtempSync(join(testTemporaryDirectory(), 'service-reply-'));
     const store = new RunStore(stateDirectory);
     const engine = new LocalEngineer(config(stateDirectory), store, 'owner_test');
@@ -128,7 +201,7 @@ describe('agent lifecycle history', () => {
     store.add(reviewed);
     Object.defineProperty(engine, 'queue', { value: () => undefined });
 
-    const continuation = engine.reply({
+    const continuation = await engine.reply({
       agentId: reviewed.agentId,
       title: 'Focused correction',
       message: 'Correct one reviewed issue.',
@@ -149,6 +222,33 @@ describe('agent lifecycle history', () => {
       task_characters: 'Correct one reviewed issue.'.length,
       grounding_characters: 0,
       characters: 'Focused correction'.length + 'Correct one reviewed issue.'.length,
+    });
+  });
+
+  it('retries from the retained reviewed revision after a continuation fails', async () => {
+    const stateDirectory = mkdtempSync(join(testTemporaryDirectory(), 'service-reply-recovery-'));
+    const store = new RunStore(stateDirectory);
+    const engine = new LocalEngineer(config(stateDirectory), store, 'owner_test');
+    const reviewed = {
+      ...run('run_reviewed', 'superseded', 0),
+      workerThreadId: 'thread_private',
+      changeSet: { revision: 1, previous_revision: 0, digest: `sha256:${'c'.repeat(64)}`, repositories: [] },
+    };
+    const failed = { ...run('run_failed', 'failed', 1), agentId: reviewed.agentId };
+    store.add(reviewed);
+    store.add(failed);
+    Object.defineProperty(engine, 'queue', { value: () => undefined });
+
+    const retry = await engine.reply({
+      agentId: reviewed.agentId,
+      title: 'Retry retained review',
+      message: 'Validate the existing revision and report.',
+    });
+
+    expect(retry).toMatchObject({
+      continuation_index: 2,
+      continuation_of_run_id: failed.runId,
+      status: 'queued',
     });
   });
 
@@ -291,6 +391,21 @@ describe('completed assistant message extraction', () => {
       completedAgentMessage({ method: 'item/completed', params: { item: { type: 'agentMessage', id: 'x' } } }),
     ).toBeUndefined();
     expect(completedAgentMessage({})).toBeUndefined();
+  });
+});
+
+describe('masked patch exit-code detection', () => {
+  it('preserves a failed apply_patch status hidden by a trailing echo', () => {
+    expect(
+      maskedPatchExitCode(
+        { command: 'apply_patch <<\'PATCH\'\n...\nPATCH\necho "e:$?"' },
+        'apply_patch: patch context did not match src/example.ts\ne:128',
+      ),
+    ).toBe(128);
+  });
+
+  it('does not reinterpret unrelated command output', () => {
+    expect(maskedPatchExitCode({ command: 'echo "e:128"' }, 'e:128')).toBeUndefined();
   });
 });
 

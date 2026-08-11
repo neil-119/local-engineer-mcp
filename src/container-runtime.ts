@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 
 export interface RuntimeCommandResult {
   exitCode: number;
@@ -23,13 +23,33 @@ export interface ContainerRuntimeProbe {
 }
 
 const RESOURCE_NAME = /^[a-z0-9][a-z0-9_.-]{0,127}$/;
+const AGENT_NETWORK_POOL = /^10\.(\d{1,3})\.0\.0\/16$/;
+
+/**
+ * Docker's automatic address allocator can select private ranges occupied by
+ * the local model LAN. Keep every Local Engineer agent in a configurable,
+ * deterministic /24 pair under an explicit 10.x /16 pool instead.
+ */
+export function agentNetworkSubnets(identity: string, pool = '10.240.0.0/16'): { internal: string; egress: string } {
+  const match = AGENT_NETWORK_POOL.exec(pool);
+  if (!match) throw new Error('CONTAINER_AGENT_NETWORK_POOL_INVALID');
+  const secondOctet = Number(match[1]);
+  const slot = createHash('sha256').update(identity).digest().readUInt16BE(0) % 128;
+  const thirdOctet = slot * 2;
+  return {
+    internal: `10.${secondOctet}.${thirdOctet}.0/24`,
+    egress: `10.${secondOctet}.${thirdOctet + 1}.0/24`,
+  };
+}
 
 export class ContainerRuntime {
   constructor(
     readonly executable: string,
     private readonly execute: RuntimeCommandExecutor = executeRuntimeCommand,
+    readonly context?: string,
   ) {
     if (!executable.trim() || /[\r\n\0]/.test(executable)) throw new Error('CONTAINER_COMMAND_INVALID');
+    if (context && !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(context)) throw new Error('CONTAINER_CONTEXT_INVALID');
   }
 
   async probe(baseImage: string): Promise<ContainerRuntimeProbe> {
@@ -109,7 +129,8 @@ export class ContainerRuntime {
 
   run(arguments_: readonly string[], options?: { input?: string; timeoutMs?: number }): Promise<RuntimeCommandResult> {
     validateArguments(arguments_);
-    return this.execute(this.executable, arguments_, options).then((result) => {
+    const contextArguments = this.context ? ['--context', this.context] : [];
+    return this.execute(this.executable, [...contextArguments, ...arguments_], options).then((result) => {
       if (result.exitCode !== 0)
         throw new Error(
           `CONTAINER_RUNTIME_COMMAND_FAILED:${result.exitCode}:${boundedEnd(result.stderr.trim(), 4000) || 'unknown'}`,
@@ -118,9 +139,22 @@ export class ContainerRuntime {
     });
   }
 
-  createNetwork(name: string, internal: boolean, labels: Record<string, string>): Promise<RuntimeCommandResult> {
+  createNetwork(
+    name: string,
+    internal: boolean,
+    labels: Record<string, string>,
+    subnet?: string,
+  ): Promise<RuntimeCommandResult> {
     validateResourceName(name);
-    return this.run(['network', 'create', ...(internal ? ['--internal'] : []), ...labelArguments(labels), name]);
+    if (subnet && !/^10\.\d{1,3}\.\d{1,3}\.0\/24$/.test(subnet)) throw new Error('CONTAINER_NETWORK_SUBNET_INVALID');
+    return this.run([
+      'network',
+      'create',
+      ...(internal ? ['--internal'] : []),
+      ...(subnet ? ['--subnet', subnet] : []),
+      ...labelArguments(labels),
+      name,
+    ]);
   }
 
   removeNetwork(name: string): Promise<RuntimeCommandResult> {

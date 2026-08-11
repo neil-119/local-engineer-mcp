@@ -55,6 +55,15 @@ const workerSchema = z
 const containerSchema = z
   .object({
     command: z.string().trim().min(1),
+    context: z
+      .string()
+      .trim()
+      .regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/)
+      .optional(),
+    agent_network_pool: z
+      .string()
+      .regex(/^10\.(?:[0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.0\.0\/16$/)
+      .default('10.240.0.0/16'),
     image: z
       .string()
       .trim()

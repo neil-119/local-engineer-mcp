@@ -70,6 +70,35 @@
 - Added SQLite-backed message deduplication, truncation, newest-message
   retention, private sequence cursors, and tests proving Codex item IDs do not
   enter monitor responses.
+- Replaced the fragile Git-diff `apply_patch` wrapper with one structured,
+  line-ending-preserving patch helper. It rejects mixed formats and unmatched
+  context rather than silently accepting malformed hunks.
+- Added `apply_patch --check`, exact structured-patch guidance, and lifecycle
+  detection for error-masking `echo "e:$?"` wrappers so failed edits cannot be
+  reported as successful commands.
+- Added an optional explicit Docker-compatible CLI context so Local Engineer
+  consistently targets a selected daemon when Docker Desktop and Rancher
+  Desktop coexist.
+- Preserve app-server relay errors that precede an `interrupted` turn so an
+  unreachable model endpoint is reported as `MODEL_UPSTREAM_UNREACHABLE`
+  instead of an empty worker result.
+- Reserve deterministic Local Engineer network subnets under a configurable
+  `10.x.0.0/16` pool, preventing Docker's automatic bridge allocation from
+  overlapping a LAN-hosted model endpoint.
+- Added deterministic direct-child manifest discovery plus locked Cargo profile
+  planning with the minimal crates.io registry domains and cached Cargo home.
+- Added a hard-blocker prompt rule requiring a prompt structured blocked report
+  instead of broad exploration or external installer retries.
+- Added bounded pending-run live progress to wait responses: state, activity
+  age, active-command count, live changed-file count, and sanitized recent
+  worker-message excerpt so parents can supervise long-running work accurately.
+- Added the stable Rust toolchain and Linux Tauri/WebKitGTK build prerequisites
+  to the bundled worker image; project-specific CLI packages and dependencies
+  remain profile or worktree concerns.
+- Made returned opaque run/agent handles durable recovery capabilities across
+  Codex STDIO MCP-process churn. Retained workers reattach from persisted
+  resource and snapshot metadata while broad run listing remains private to the
+  current parent connection.
 
 ## Pending
 

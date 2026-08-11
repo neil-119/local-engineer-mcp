@@ -138,6 +138,7 @@ export interface ProjectedRun {
       follow_up_messages: number;
     };
     parent_visible_review_tokens_estimate: number;
+    estimated_savings_tokens: number;
   };
 }
 
@@ -310,6 +311,13 @@ function projectDelegation(run: Run): ProjectedRun['delegation_impact'] | undefi
         }
       : {}),
     parent_visible_review_tokens_estimate: stats.parent_visible?.estimated_tokens ?? 0,
+    estimated_savings_tokens: Math.max(
+      0,
+      (stats.worker_tokens?.output ?? 0) +
+        (stats.worker_tokens?.reasoning_output ?? 0) -
+        (stats.parent_to_worker?.estimated_tokens ?? 0) -
+        (stats.parent_visible?.estimated_tokens ?? 0),
+    ),
   };
 }
 

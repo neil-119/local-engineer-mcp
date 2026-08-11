@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
@@ -23,6 +23,25 @@ describe('repository snapshots', () => {
     git(parent, ['init']);
 
     await expect(createRepositorySnapshot(parent, join(root, 'snapshot'))).rejects.toThrow('REPOSITORY_HEAD_REQUIRED');
+  });
+
+  it('accepts a project directory inside a Git checkout and snapshots the checkout root', async () => {
+    const root = mkdtempSync(join(testTemporaryDirectory(), 'nested-repository-'));
+    temporaryRoots.push(root);
+    const parent = join(root, 'parent');
+    const nested = join(parent, 'backend');
+    mkdirSync(nested, { recursive: true });
+    git(parent, ['init']);
+    git(parent, ['config', 'user.name', 'Test']);
+    git(parent, ['config', 'user.email', 'test@example.invalid']);
+    writeFileSync(join(nested, 'Cargo.toml'), '[package]\nname = "backend"\nversion = "0.1.0"\n');
+    git(parent, ['add', '.']);
+    git(parent, ['commit', '-m', 'initial']);
+
+    const snapshot = await createRepositorySnapshot(nested, join(root, 'snapshot'));
+
+    expect(snapshot.parentPath).toBe(realpathSync.native(parent));
+    expect(readFileSync(join(snapshot.snapshotPath, 'backend', 'Cargo.toml'), 'utf8')).toContain('name = "backend"');
   });
 
   it('makes dirty parent state part of the private baseline', async () => {

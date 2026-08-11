@@ -4,11 +4,12 @@ import { join, posix, resolve } from 'node:path';
 import type { ContainerChangeSet, ContainerConfig, RepositoryChangeSummary, RunRepository, Worker } from './domain.js';
 import type { ContainerAppServerWorker } from './codex.js';
 import { relayedModelBaseUrl, writeContainerCodexConfigs } from './container-codex-config.js';
-import { ContainerRuntime } from './container-runtime.js';
+import { agentNetworkSubnets, ContainerRuntime } from './container-runtime.js';
 import {
   checkRepositoryPromotion,
   createRepositorySnapshot,
   promoteRepositoryChanges,
+  recoverRepositorySnapshot,
   type RepositoryChanges,
   type RepositorySnapshot,
   writePatchArtifact,
@@ -48,6 +49,13 @@ export interface ContainerAgentResources {
   revision: number;
 }
 
+interface RecoveryInput {
+  agentId: string;
+  image: string;
+  repositories: RunRepository[];
+  changeSet?: ContainerChangeSet;
+}
+
 export class ContainerAgentManager {
   private readonly runtime: ContainerRuntime;
   private readonly agents = new Map<string, ContainerAgentResources>();
@@ -58,7 +66,7 @@ export class ContainerAgentManager {
     private readonly stateDir: string,
     runtime?: ContainerRuntime,
   ) {
-    this.runtime = runtime ?? new ContainerRuntime(config.command);
+    this.runtime = runtime ?? new ContainerRuntime(config.command, undefined, config.context);
   }
 
   async probe(image = this.config.image) {
@@ -75,6 +83,25 @@ export class ContainerAgentManager {
     const logs = await this.runtime.containerLogs(resources.proxyContainer, 80).catch(() => undefined);
     const text = `${logs?.stdout ?? ''}\n${logs?.stderr ?? ''}`.trim();
     return text ? sanitizeProxyDiagnostic(text) : undefined;
+  }
+
+  /** Bounded live change count for parent supervision; paths remain private until review. */
+  async liveChangeCount(agentId: string): Promise<number | undefined> {
+    const resources = this.agents.get(agentId);
+    if (!resources) return undefined;
+    let total = 0;
+    for (const repository of resources.repositories.values()) {
+      const result = await this.runtime
+        .execContainer(
+          resources.workerContainer,
+          ['git', '-C', repository.runRepository.containerPath, 'status', '--porcelain=v1', '-z'],
+          { user: this.config.worker_user },
+        )
+        .catch(() => undefined);
+      if (!result || result.exitCode !== 0) return undefined;
+      total += result.stdout.split('\0').filter((entry) => /^[ MADRCU?!]{2} /.test(entry)).length;
+    }
+    return total;
   }
 
   async prepare(
@@ -108,6 +135,7 @@ export class ContainerAgentManager {
       'local-engineer.agent-id': agentId,
       'local-engineer.managed': 'true',
     };
+    const subnets = agentNetworkSubnets(agentId, this.config.agent_network_pool);
     const agentState = join(this.stateDir, 'container-agents', agentId);
     mkdirSync(agentState, { recursive: true });
     try {
@@ -125,12 +153,21 @@ export class ContainerAgentManager {
           reviewCommits: new Map([[0, snapshot.baselineCommit]]),
         });
       }
+      writeFileSync(
+        join(agentState, 'snapshots.json'),
+        JSON.stringify(
+          [...resources.repositories.values()].map(({ runRepository, snapshot }) => ({ runRepository, snapshot })),
+          null,
+          2,
+        ),
+        { encoding: 'utf8', mode: 0o600 },
+      );
       const workerConfigPath = join(agentState, 'worker-config.toml');
       const proxyConfigPath = join(agentState, 'proxy-config.toml');
       writeContainerCodexConfigs(worker, this.config, workerConfigPath, proxyConfigPath);
 
-      await this.runtime.createNetwork(resources.internalNetwork, true, labels);
-      await this.runtime.createNetwork(resources.egressNetwork, false, labels);
+      await this.runtime.createNetwork(resources.internalNetwork, true, labels, subnets.internal);
+      await this.runtime.createNetwork(resources.egressNetwork, false, labels, subnets.egress);
       await this.runtime.createVolume(resources.workspaceVolume, labels);
       await this.runtime.createVolume(resources.workerConfigVolume, labels);
       await this.runtime.createVolume(resources.proxyConfigVolume, labels);
@@ -262,6 +299,109 @@ export class ContainerAgentManager {
       rmSync(agentState, { recursive: true, force: true });
       throw cause;
     }
+  }
+
+  /** Reconstruct retained disposable-agent handles after an STDIO MCP process changes. */
+  async recover(input: RecoveryInput): Promise<ContainerAgentResources> {
+    const existing = this.agents.get(input.agentId);
+    if (existing) return existing;
+    const suffix = createHash('sha256').update(input.agentId).digest('hex').slice(0, 20);
+    const prefix = `le-${suffix}`;
+    const state = join(this.stateDir, 'container-agents', input.agentId);
+    const resourcePath = join(state, 'resources.json');
+    if (!existsSync(resourcePath)) throw new Error('CONTAINER_AGENT_RETAINED_STATE_NOT_FOUND');
+    const persisted = JSON.parse(readFileSync(resourcePath, 'utf8')) as Record<string, unknown>;
+    const expected = {
+      worker_container: `${prefix}-worker`,
+      proxy_container: `${prefix}-proxy`,
+      internal_network: `${prefix}-internal`,
+      egress_network: `${prefix}-egress`,
+      workspace_volume: `${prefix}-workspace`,
+      worker_config_volume: `${prefix}-worker-config`,
+      proxy_config_volume: `${prefix}-proxy-config`,
+      proxy_shared_volume: `${prefix}-proxy-shared`,
+      dependency_volume: `${prefix}-dependencies`,
+    };
+    if (
+      persisted.agent_id !== input.agentId ||
+      Object.entries(expected).some(([key, value]) => persisted[key] !== value)
+    )
+      throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+    const snapshotsPath = join(state, 'snapshots.json');
+    const savedSnapshots = existsSync(snapshotsPath)
+      ? (JSON.parse(readFileSync(snapshotsPath, 'utf8')) as Array<{
+          runRepository: RunRepository;
+          snapshot: RepositorySnapshot;
+        }>)
+      : [];
+    const resources: ContainerAgentResources = {
+      agentId: input.agentId,
+      image: input.image,
+      profileRepository: input.repositories[0]?.name,
+      workerContainer: expected.worker_container,
+      proxyContainer: expected.proxy_container,
+      internalNetwork: expected.internal_network,
+      egressNetwork: expected.egress_network,
+      workspaceVolume: expected.workspace_volume,
+      workerConfigVolume: expected.worker_config_volume,
+      proxyConfigVolume: expected.proxy_config_volume,
+      proxySharedVolume: expected.proxy_shared_volume,
+      dependencyVolume: expected.dependency_volume,
+      repositories: new Map(),
+      revision: input.changeSet?.revision ?? 0,
+    };
+    for (const repository of input.repositories) {
+      const saved = savedSnapshots.find((entry) => entry.runRepository.name === repository.name);
+      const snapshotPath = saved?.snapshot.snapshotPath ?? join(state, 'snapshots', repository.name);
+      if (!existsSync(snapshotPath) || !repository.baselineCommit || !repository.parentHead)
+        throw new Error('CONTAINER_AGENT_RECOVERY_SNAPSHOT_NOT_FOUND');
+      const snapshot: RepositorySnapshot =
+        saved?.snapshot ??
+        (await recoverRepositorySnapshot(
+          repository.parentPath,
+          snapshotPath,
+          repository.parentHead,
+          repository.baselineCommit,
+          repository.baselineKind ?? 'clean_head',
+        ));
+      const reviewCommits = new Map<number, string>([[0, snapshot.baselineCommit]]);
+      if (resources.revision > 0) {
+        const head = (
+          await this.runtime.execContainer(resources.workerContainer, [
+            'git',
+            '-C',
+            repository.containerPath,
+            'rev-parse',
+            'HEAD',
+          ])
+        ).stdout.trim();
+        if (!/^[0-9a-f]{40,64}$/i.test(head)) throw new Error('CONTAINER_AGENT_RECOVERY_REVIEW_COMMIT_INVALID');
+        reviewCommits.set(resources.revision, head);
+      }
+      const summary = input.changeSet?.repositories.find((item) => item.repository === repository.name);
+      const patchPath = summary
+        ? join(state, 'patches', `revision-${resources.revision}`, `${repository.name}.full.patch`)
+        : undefined;
+      const changes =
+        summary && patchPath && existsSync(patchPath)
+          ? {
+              patch: readFileSync(patchPath, 'utf8'),
+              patchDigest: summary.patch_digest,
+              changedPaths: summary.changed_paths,
+              additions: summary.additions,
+              deletions: summary.deletions,
+            }
+          : undefined;
+      resources.repositories.set(repository.name, {
+        runRepository: repository,
+        snapshot,
+        changes,
+        patchPath,
+        reviewCommits,
+      });
+    }
+    this.agents.set(input.agentId, resources);
+    return resources;
   }
 
   appServerWorker(worker: Worker, resources: ContainerAgentResources): ContainerAppServerWorker {

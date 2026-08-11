@@ -16,6 +16,10 @@ When the `local_engineer_*` MCP tools are available, ALWAYS use configured Local
 - Give every worker a precise title, working directory, constraints, expected deliverables, and the tests or evidence it should return. Do not ask a worker to modify files outside its assigned workspace.
 - Start independent tasks in parallel only when their workspaces and expected edits do not conflict. Respect the configured worker and server concurrency limits.
 - Use `local_engineer_wait_for_completion` with `any` while supervising several runs, then inspect each bounded result. Follow up through `local_engineer_reply` when a result needs clarification or a focused next step.
+- Retain every returned opaque `run_id` and `agent_id`. They are required to
+  recover exact retained workers when Codex replaces an STDIO MCP process; do
+  not discard them until the agent is promoted or deleted. Broad listing stays
+  private to the current parent connection.
 - When a settled run includes `delegation_impact`, consider telling the user how
   much work the local agent processed. Call it **offloaded local work**, not
   parent-token savings, unless a controlled direct-vs-delegated A/B comparison

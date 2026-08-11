@@ -51,6 +51,8 @@ export class CodexAppServer {
     { resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void }
   >();
   private readonly turnMessages = new Map<string, string>();
+  /** Last upstream error reported for a turn before Codex marks it interrupted. */
+  private readonly turnErrors = new Map<string, string>();
 
   constructor(
     private readonly worker: ContainerAppServerWorker,
@@ -104,6 +106,7 @@ export class CodexAppServer {
     if (message.method) {
       this.onEvent(message);
       this.captureAgentMessage(message);
+      this.captureTurnError(message);
       if (message.id !== undefined) {
         if (message.method.includes('requestApproval')) this.approveContainerRequest(message);
         return;
@@ -126,8 +129,9 @@ export class CodexAppServer {
       const turn = recordAt(message.params, ['turn']);
       const status = stringAt(turn, ['status']);
       const resolver = this.turnResolvers.get(turnId);
-      if (status === 'failed') {
-        resolver?.reject(new Error(`CODEX_TURN_FAILED:${turnFailureDetail(turn)}`));
+      const priorError = this.turnErrors.get(turnId);
+      if (status === 'failed' || (status === 'interrupted' && priorError)) {
+        resolver?.reject(new Error(`CODEX_TURN_FAILED:${priorError ?? turnFailureDetail(turn)}`));
         return;
       }
       resolver?.resolve({
@@ -219,6 +223,7 @@ export class CodexAppServer {
       this.turnDone.delete(turnId);
       this.turnResolvers.delete(turnId);
       this.turnMessages.delete(turnId);
+      this.turnErrors.delete(turnId);
     });
   }
 
@@ -235,11 +240,23 @@ export class CodexAppServer {
     this.turnMessages.set(turnId, (current + delta).slice(-64_000));
   }
 
+  private captureTurnError(message: Rpc): void {
+    if (message.method !== 'error') return;
+    const turnId = stringAt(message.params, ['turnId']) ?? stringAt(message.params, ['turn_id']);
+    const error = recordAt(message.params, ['error']);
+    const detail =
+      stringAt(error, ['additionalDetails']) ??
+      stringAt(error, ['message']) ??
+      stringAt(message.params, ['additionalDetails']);
+    if (turnId && detail) this.turnErrors.set(turnId, boundedErrorDetail(detail));
+  }
+
   private failActiveTurns(error: Error): void {
     for (const pending of this.turnResolvers.values()) pending.reject(error);
     this.turnResolvers.clear();
     this.turnDone.clear();
     this.turnMessages.clear();
+    this.turnErrors.clear();
   }
 }
 
@@ -266,6 +283,13 @@ function recordAt(value: unknown, path: string[]): Record<string, unknown> | und
 function turnFailureDetail(turn: Record<string, unknown> | undefined): string {
   const detail = stringAt(turn, ['error', 'message']) ?? 'Codex turn failed without an error message.';
   return detail
+    .replace(/[\r\n]/g, ' ')
+    .replaceAll('\0', ' ')
+    .slice(0, 1000);
+}
+
+function boundedErrorDetail(value: string): string {
+  return value
     .replace(/[\r\n]/g, ' ')
     .replaceAll('\0', ' ')
     .slice(0, 1000);
