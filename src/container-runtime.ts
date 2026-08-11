@@ -31,15 +31,29 @@ const AGENT_NETWORK_POOL = /^10\.(\d{1,3})\.0\.0\/16$/;
  * deterministic /24 pair under an explicit 10.x /16 pool instead.
  */
 export function agentNetworkSubnets(identity: string, pool = '10.240.0.0/16'): { internal: string; egress: string } {
+  return agentNetworkSubnetCandidates(identity, pool)[0]!;
+}
+
+/**
+ * Returns every non-overlapping /24 pair in a deterministic, identity-specific
+ * order. The first pair preserves the original allocation behavior; callers
+ * can fall back safely when a retained agent already owns that range.
+ */
+export function agentNetworkSubnetCandidates(
+  identity: string,
+  pool = '10.240.0.0/16',
+): Array<{ internal: string; egress: string }> {
   const match = AGENT_NETWORK_POOL.exec(pool);
   if (!match) throw new Error('CONTAINER_AGENT_NETWORK_POOL_INVALID');
   const secondOctet = Number(match[1]);
-  const slot = createHash('sha256').update(identity).digest().readUInt16BE(0) % 128;
-  const thirdOctet = slot * 2;
-  return {
-    internal: `10.${secondOctet}.${thirdOctet}.0/24`,
-    egress: `10.${secondOctet}.${thirdOctet + 1}.0/24`,
-  };
+  const startSlot = createHash('sha256').update(identity).digest().readUInt16BE(0) % 128;
+  return Array.from({ length: 128 }, (_, offset) => {
+    const thirdOctet = ((startSlot + offset) % 128) * 2;
+    return {
+      internal: `10.${secondOctet}.${thirdOctet}.0/24`,
+      egress: `10.${secondOctet}.${thirdOctet + 1}.0/24`,
+    };
+  });
 }
 
 export class ContainerRuntime {
@@ -155,6 +169,33 @@ export class ContainerRuntime {
       ...labelArguments(labels),
       name,
     ]);
+  }
+
+  /**
+   * Atomically enough for Docker-compatible runtimes: if either half of a
+   * pair overlaps a pre-existing network, remove only the just-created managed
+   * half and try the next candidate. This avoids a hash collision between
+   * retained agents while never deleting another agent's resources.
+   */
+  async createNetworkPair(input: {
+    internalName: string;
+    egressName: string;
+    labels: Record<string, string>;
+    candidates: ReadonlyArray<{ internal: string; egress: string }>;
+  }): Promise<{ internal: string; egress: string }> {
+    for (const candidate of input.candidates) {
+      let internalCreated = false;
+      try {
+        await this.createNetwork(input.internalName, true, input.labels, candidate.internal);
+        internalCreated = true;
+        await this.createNetwork(input.egressName, false, input.labels, candidate.egress);
+        return candidate;
+      } catch (cause) {
+        if (internalCreated) await this.removeNetwork(input.internalName).catch(() => undefined);
+        if (!isNetworkPoolOverlap(cause)) throw cause;
+      }
+    }
+    throw new Error('CONTAINER_AGENT_NETWORK_POOL_EXHAUSTED');
   }
 
   removeNetwork(name: string): Promise<RuntimeCommandResult> {
@@ -422,4 +463,11 @@ function runtimeErrorSummary(cause: unknown, executable: string): string {
     return 'The container runtime capability probe timed out. Verify the container runtime is healthy and retry the agent.';
   }
   return 'The configured container runtime failed its capability probe. Run `local-engineer doctor` for safe diagnostics.';
+}
+
+function isNetworkPoolOverlap(cause: unknown): boolean {
+  return (
+    cause instanceof Error &&
+    /pool overlaps with other one|overlaps with other one on this address space/i.test(cause.message)
+  );
 }

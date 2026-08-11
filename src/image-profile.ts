@@ -12,7 +12,7 @@ import {
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import type { Config } from './domain.js';
 import { generatedProxyConfig } from './container-codex-config.js';
-import { agentNetworkSubnets, ContainerRuntime } from './container-runtime.js';
+import { agentNetworkSubnetCandidates, ContainerRuntime } from './container-runtime.js';
 
 export interface ImagePlanInput {
   path: string;
@@ -332,15 +332,18 @@ export class ImageProfileManager {
       'local-engineer.agent-id': `image-${suffix}`,
       'local-engineer.managed': 'true',
     };
-    const subnets = agentNetworkSubnets(`image-${suffix}`, this.config.container.agent_network_pool);
     const proxyConfigPath = join(buildDirectory, 'proxy-config.toml');
     writeFileSync(proxyConfigPath, generatedProxyConfig(this.config.container), {
       encoding: 'utf8',
       mode: 0o600,
     });
     try {
-      await this.runtime.createNetwork(internalNetwork, true, labels, subnets.internal);
-      await this.runtime.createNetwork(egressNetwork, false, labels, subnets.egress);
+      await this.runtime.createNetworkPair({
+        internalName: internalNetwork,
+        egressName: egressNetwork,
+        labels,
+        candidates: agentNetworkSubnetCandidates(`image-${suffix}`, this.config.container.agent_network_pool),
+      });
       await this.runtime.createVolume(configVolume, labels);
       await this.runtime.createVolume(sharedVolume, labels);
       await this.runtime.createContainer({

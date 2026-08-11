@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { agentNetworkSubnets, ContainerRuntime, type RuntimeCommandExecutor } from '../src/container-runtime.js';
+import {
+  agentNetworkSubnetCandidates,
+  agentNetworkSubnets,
+  ContainerRuntime,
+  type RuntimeCommandExecutor,
+} from '../src/container-runtime.js';
 
 describe('container runtime adapter', () => {
   it('uses the configured executable but constructs every argument internally', async () => {
@@ -72,6 +77,35 @@ describe('container runtime adapter', () => {
     expect(first.egress).toMatch(/^10\.240\.\d+\.0\/24$/);
     expect(first.internal).not.toBe(first.egress);
     expect(() => agentNetworkSubnets('agt_example', '192.168.0.0/16')).toThrow('CONTAINER_AGENT_NETWORK_POOL_INVALID');
+  });
+
+  it('falls back to the next deterministic network pair when the preferred range overlaps', async () => {
+    const calls: string[][] = [];
+    const preferred = agentNetworkSubnetCandidates('agt_collision', '10.240.0.0/16')[0]!;
+    const fallback = agentNetworkSubnetCandidates('agt_collision', '10.240.0.0/16')[1]!;
+    const runtime = new ContainerRuntime('docker', async (_executable, arguments_) => {
+      calls.push([...arguments_]);
+      const subnet = arguments_[arguments_.indexOf('--subnet') + 1];
+      if (arguments_.includes('network') && arguments_.includes('create') && subnet === preferred.egress)
+        return {
+          exitCode: 1,
+          stdout: '',
+          stderr: 'invalid pool request: Pool overlaps with other one on this address space',
+        };
+      return { exitCode: 0, stdout: '', stderr: '' };
+    });
+
+    await expect(
+      runtime.createNetworkPair({
+        internalName: 'le-collision-internal',
+        egressName: 'le-collision-egress',
+        labels: { 'local-engineer.agent-id': 'agt_collision', 'local-engineer.managed': 'true' },
+        candidates: [preferred, fallback],
+      }),
+    ).resolves.toEqual(fallback);
+    expect(calls).toContainEqual(['network', 'rm', 'le-collision-internal']);
+    expect(calls.filter((call) => call.includes('--subnet') && call.includes(fallback.internal))).toHaveLength(1);
+    expect(calls.filter((call) => call.includes('--subnet') && call.includes(fallback.egress))).toHaveLength(1);
   });
 
   it('permits only the narrowly scoped setup capability', async () => {

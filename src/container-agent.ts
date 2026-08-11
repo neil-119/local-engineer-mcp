@@ -4,7 +4,7 @@ import { join, posix, resolve } from 'node:path';
 import type { ContainerChangeSet, ContainerConfig, RepositoryChangeSummary, RunRepository, Worker } from './domain.js';
 import type { ContainerAppServerWorker } from './codex.js';
 import { relayedModelBaseUrl, writeContainerCodexConfigs } from './container-codex-config.js';
-import { agentNetworkSubnets, ContainerRuntime } from './container-runtime.js';
+import { agentNetworkSubnetCandidates, ContainerRuntime } from './container-runtime.js';
 import {
   checkRepositoryPromotion,
   createRepositorySnapshot,
@@ -135,7 +135,6 @@ export class ContainerAgentManager {
       'local-engineer.agent-id': agentId,
       'local-engineer.managed': 'true',
     };
-    const subnets = agentNetworkSubnets(agentId, this.config.agent_network_pool);
     const agentState = join(this.stateDir, 'container-agents', agentId);
     mkdirSync(agentState, { recursive: true });
     try {
@@ -166,8 +165,12 @@ export class ContainerAgentManager {
       const proxyConfigPath = join(agentState, 'proxy-config.toml');
       writeContainerCodexConfigs(worker, this.config, workerConfigPath, proxyConfigPath);
 
-      await this.runtime.createNetwork(resources.internalNetwork, true, labels, subnets.internal);
-      await this.runtime.createNetwork(resources.egressNetwork, false, labels, subnets.egress);
+      await this.runtime.createNetworkPair({
+        internalName: resources.internalNetwork,
+        egressName: resources.egressNetwork,
+        labels,
+        candidates: agentNetworkSubnetCandidates(agentId, this.config.agent_network_pool),
+      });
       await this.runtime.createVolume(resources.workspaceVolume, labels);
       await this.runtime.createVolume(resources.workerConfigVolume, labels);
       await this.runtime.createVolume(resources.proxyConfigVolume, labels);
