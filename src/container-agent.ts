@@ -411,6 +411,7 @@ export class ContainerAgentManager {
     return {
       command: this.config.command,
       args: [
+        ...(this.config.context ? ['--context', this.config.context] : []),
         'exec',
         '--interactive',
         resources.workerContainer,

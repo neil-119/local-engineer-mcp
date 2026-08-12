@@ -342,6 +342,10 @@ export class LocalEngineer {
   }> {
     const run = this.requireAgentCapability(agentId);
     if (['queued', 'starting', 'running', 'cancel_requested'].includes(run.status)) await this.cancel(run.runId);
+    // A fresh STDIO process has no in-memory container registry. Rehydrate the
+    // exact retained resources before cleanup so deletion works after a Codex
+    // or MCP restart instead of merely removing the local state record.
+    await this.restoreContainerAgent(this.requireAgentCapability(agentId));
     await this.containerManager.delete(agentId);
     this.adapters.delete(agentId);
     for (const key of this.diffCheckpoints.keys()) if (key.startsWith(`${agentId}\0`)) this.diffCheckpoints.delete(key);

@@ -32,6 +32,7 @@ describe('container agent workspace seeding', () => {
     } satisfies ContainerAgentResources);
 
     expect(appServer.args).toContain('model_providers.local-provider.base_url="http://local-engineer-proxy:8090/v1"');
+    expect(appServer.args.slice(0, 3)).toEqual(['--context', 'default', 'exec']);
   });
 
   it('copies the immutable Git baseline, overlays ignored dependencies, and locks read-only repositories', async () => {
@@ -265,6 +266,7 @@ describe('container agent workspace seeding', () => {
 function containerConfig(): ContainerConfig {
   return {
     command: 'docker',
+    context: 'default',
     image: 'local-engineer/worker:test',
     base_image: 'node:24-bookworm-slim',
     codex_version: '0.144.6',
