@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -67,5 +67,98 @@ describe('container apply_patch helper', () => {
 `;
     expect(apply(directory, unmatched).status).not.toBe(0);
     expect(apply(directory, unmatched).stderr).toContain('patch context did not match');
+  });
+
+  it('accepts patch from a patch file path or raw string argument, and deletes files', () => {
+    const directory = worktree();
+    const file = join(directory, 'src', 'to-delete.ts');
+    writeFileSync(file, 'export const removeMe = true;\n', 'utf8');
+
+    // Test file argument
+    const patchContent = `*** Begin Patch
+*** Delete File: src/to-delete.ts
+*** End Patch
+`;
+    const patchFile = join(directory, 'delete.patch');
+    writeFileSync(patchFile, patchContent, 'utf8');
+
+    // Check with --check and patch file argument
+    const checkResult = spawnSync(process.execPath, [helper, '--check', patchFile], {
+      cwd: directory,
+      encoding: 'utf8',
+    });
+    expect(checkResult.status).toBe(0);
+    expect(readFileSync(file, 'utf8')).toBe('export const removeMe = true;\n');
+
+    // Apply with patch file argument
+    const applyResult = spawnSync(process.execPath, [helper, patchFile], {
+      cwd: directory,
+      encoding: 'utf8',
+    });
+    expect(applyResult.status).toBe(0);
+    expect(() => readFileSync(file, 'utf8')).toThrow();
+
+    // Test raw string argument for adding a file
+    const addPatch = `*** Begin Patch
+*** Add File: src/added.ts
++export const added = 100;
+*** End Patch
+`;
+    const addResult = spawnSync(process.execPath, [helper, addPatch], {
+      cwd: directory,
+      encoding: 'utf8',
+    });
+    expect(addResult.status).toBe(0);
+    expect(readFileSync(join(directory, 'src', 'added.ts'), 'utf8')).toBe('export const added = 100;\n');
+  });
+
+  it('rejects writes through a symbolic-link parent outside the worktree', () => {
+    const directory = worktree();
+    const outside = mkdtempSync(join(process.cwd(), '.tmp', 'worker-patch-outside-'));
+    temporaryDirectories.push(outside);
+    symlinkSync(outside, join(directory, 'escape'), 'junction');
+    const patch = `*** Begin Patch
+*** Add File: escape/leak.txt
++blocked
+*** End Patch
+`;
+
+    const result = apply(directory, patch);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('path escapes worktree through symbolic link');
+  });
+
+  it('rejects adding a file over an existing or dangling symbolic link', () => {
+    const directory = worktree();
+    const outside = join(directory, 'nonexistent-target');
+    symlinkSync(outside, join(directory, 'src', 'dangling.ts'), 'junction');
+    const patch = `*** Begin Patch
+*** Add File: src/dangling.ts
++malicious
+*** End Patch
+`;
+
+    const result = apply(directory, patch);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('refusing to overwrite symbolic link');
+  });
+
+  it('rejects Alternate Data Streams and 8.3 git alias escapes', () => {
+    const directory = worktree();
+    const adsPatch = `*** Begin Patch
+*** Add File: src/sample.ts:hidden
++stream
+*** End Patch
+`;
+    expect(apply(directory, adsPatch).status).not.toBe(0);
+    expect(apply(directory, adsPatch).stderr).toContain('invalid relative path');
+
+    const gitAliasPatch = `*** Begin Patch
+*** Add File: GIT~1/hooks/pre-commit
++evil
+*** End Patch
+`;
+    expect(apply(directory, gitAliasPatch).status).not.toBe(0);
+    expect(apply(directory, gitAliasPatch).stderr).toContain('path escapes worktree');
   });
 });

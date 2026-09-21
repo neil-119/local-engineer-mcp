@@ -1,3 +1,14 @@
+/**
+ * Codex App Server JSON-RPC 2.0 Client
+ *
+ * Manages the lifecycle of and communication with the Codex CLI running in `app-server` mode:
+ * - Spawns and supervises the child process (or `docker exec` wrapper) with stdio JSON-RPC piping.
+ * - Manages session threads (`thread/start`) and turn executions (`turn/start`, `turn/interrupt`).
+ * - Automatically grants container execution permissions (`item/permissions/requestApproval`).
+ * - Buffers assistant messages and diagnostic events for live progress tracking.
+ * - Safely terminates processes (`stop()`) to release handles and prevent event loop hanging.
+ */
+
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 
@@ -38,6 +49,9 @@ export const appServerInheritedEnvironmentNames = [
   'DOCKER_CONTEXT',
 ] as const;
 
+/**
+ * Manages a stateful connection to the Codex app server running inside the container.
+ */
 export class CodexAppServer {
   private process?: ChildProcessWithoutNullStreams;
   private nextId = 1;
@@ -70,6 +84,7 @@ export class CodexAppServer {
       stdio: 'pipe',
       windowsHide: true,
     });
+    this.process.stdin.on('error', () => undefined);
     this.process.stderr.on('data', (data) =>
       this.onEvent({ jsonrpc: '2.0', method: 'stderr', params: { text: String(data) } }),
     );
@@ -141,6 +156,10 @@ export class CodexAppServer {
     }
   }
 
+  /**
+   * Automatically approves permission and execution requests inside the worker container.
+   * Container boundary isolation (Hyper-V VM / dropped capabilities) replaces interactive user prompts.
+   */
   private approveContainerRequest(message: Rpc): void {
     if (message.method === 'item/permissions/requestApproval') {
       this.write({
@@ -172,6 +191,9 @@ export class CodexAppServer {
     this.write({ jsonrpc: '2.0', method, params });
   }
 
+  /**
+   * Initializes a new thread session and begins the first turn.
+   */
   async createAndStart(cwd: string, prompt: string): Promise<StartedSession> {
     await this.start();
     const thread = await this.request('thread/start', {
@@ -188,6 +210,9 @@ export class CodexAppServer {
     return { threadId, turnId: await this.startTurn(threadId, cwd, prompt) };
   }
 
+  /**
+   * Appends a continuation turn to an existing thread session.
+   */
   async continue(threadId: string, cwd: string, prompt: string): Promise<string> {
     await this.start();
     return this.startTurn(threadId, cwd, prompt);
@@ -216,6 +241,9 @@ export class CodexAppServer {
     return turnId;
   }
 
+  /**
+   * Returns a promise that resolves when the specified turn completes or fails.
+   */
   wait(turnId: string): Promise<Record<string, unknown>> {
     const outcome = this.turnDone.get(turnId);
     if (!outcome) return Promise.reject(new Error('CODEX_TURN_UNKNOWN'));
@@ -227,8 +255,32 @@ export class CodexAppServer {
     });
   }
 
+  /**
+   * Signals the Codex server to cancel the active turn.
+   */
   async interrupt(threadId: string, turnId: string): Promise<void> {
     await this.request('turn/interrupt', { threadId, turnId });
+  }
+
+  /**
+   * Shuts down the process, closes stdio streams, and terminates child processes.
+   */
+  async stop(): Promise<void> {
+    if (!this.process) return;
+    const proc = this.process;
+    this.process = undefined;
+    try {
+      proc.stdin?.end();
+    } catch {
+      // ignore
+    }
+    if (!proc.killed && proc.exitCode === null && proc.signalCode === null) {
+      try {
+        proc.kill();
+      } catch {
+        // ignore
+      }
+    }
   }
 
   private captureAgentMessage(message: Rpc): void {

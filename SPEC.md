@@ -35,9 +35,13 @@ The capability probe MUST use uniquely named temporary resources and MUST
 verify:
 
 - runtime and daemon availability;
+- configured daemon container OS;
 - configured image availability;
 - container creation and removal;
-- internal-network creation and connection; and
+- platform-specific network creation and connection;
+- Hyper-V isolation when the configured container OS is Windows; and
+- the Windows image's effective route isolation and `ContainerUser` boundary;
+  and
 - exact cleanup of probe resources.
 
 ## 4. Agent isolation
@@ -46,7 +50,8 @@ Each agent MUST own:
 
 - one worker container;
 - one network-policy proxy sidecar;
-- one internal network without direct egress;
+- one worker-side network with direct egress blocked by a platform-specific
+  boundary;
 - one egress-capable network connected only to the proxy;
 - one ephemeral workspace volume;
 - separate ephemeral worker and proxy configuration volumes; and
@@ -61,9 +66,17 @@ The worker MUST NOT receive:
 - a reusable host `CODEX_HOME`; or
 - parent plugins, hooks, web search, or MCP server configuration.
 
-Long-lived containers MUST use read-only root filesystems and drop all Linux
-capabilities. A short-lived setup container MAY use only the capability needed
-to seed ownership and MUST be removed before the worker starts.
+Linux containers MUST use read-only root filesystems, drop all Linux
+capabilities, and run the worker as an unprivileged user. A short-lived Linux
+setup container MAY use only the capability needed to seed ownership and MUST
+be removed before the worker starts.
+
+Windows containers MUST use verified Hyper-V isolation. Process isolation MUST
+NOT be accepted. Untrusted work MUST run as `ContainerUser`; setup-only
+operations MAY run as `ContainerAdministrator` before the worker starts.
+Windows containers MUST have configured memory and CPU ceilings. Read-only
+repositories MUST be protected from `ContainerUser` by Docker read-only volume mounts
+and verified via write-probe assertions.
 
 ## 5. Network policy
 
@@ -85,6 +98,18 @@ The policy sidecar MUST:
 
 The proxy is defense in depth; environment proxy variables alone are not an
 acceptable network boundary.
+
+Linux MUST enforce the direct-egress boundary with an internal container
+network. Because Windows NAT networks do not provide an equivalent internal
+mode, every Windows setup container that handles repository data MUST remove
+its default, subnet, multicast, broadcast, and non-self IPv6 routes before that
+data is processed. The Windows worker MUST retain only loopback, its own
+addresses, and one on-link `/32` route to the policy sidecar's exact internal
+IPv4 address. The worker MUST strictly verify the resulting IPv4 and IPv6 route
+tables before starting Codex. Route configuration MUST run as
+`ContainerAdministrator`; untrusted work MUST run as `ContainerUser`, which
+cannot restore privileged routes. The sidecar alone MAY connect the worker
+network to an egress-capable network.
 
 ## 6. Repository snapshots
 
@@ -143,7 +168,9 @@ Generated Codex configuration MUST use autonomous approval and sandbox settings
 inside the container. The external container, network, and Git-promotion
 boundaries are authoritative.
 
-The bundled worker image MUST provide Node.js 24, Python 3.12, pip, and venv.
+The bundled worker image MUST provide Node.js 24, Python, pip, and venv. The
+Linux image SHOULD use Python 3.12; the Windows image MAY use the current
+official Windows Server Core Python release.
 Projects MAY select a custom base image for additional toolchains or caches.
 Project dependency downloads remain subject to the explicit read-only domain
 list.
@@ -164,6 +191,10 @@ Unsupported toolchains MUST return a reviewed external-base-image
 recommendation rather than guess. The hardened project-image builder MUST NOT
 execute arbitrary project Dockerfiles. Local Engineer MUST NOT edit `AGENTS.md`;
 it MAY return a suggested profile instruction.
+
+Project image profiles MAY be unsupported on Windows, but planning, resolving,
+and building such a profile MUST fail closed rather than use a Linux builder or
+weaker network path.
 
 Dependency installation MUST run in a temporary root-owned container connected
 only to a per-build internal network. Only the limited dependency proxy MAY
@@ -334,7 +365,8 @@ MUST use exact affected-path checks and repository locks.
 ## 16. Portability and limitations
 
 The implementation targets Windows, macOS, and Linux hosts with a
-Docker-compatible runtime.
+Docker-compatible runtime. Native Windows containers require a Windows daemon
+and verified Hyper-V isolation.
 
 Version-one limitations MAY include:
 

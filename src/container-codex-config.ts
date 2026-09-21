@@ -69,10 +69,12 @@ export function generatedProxyConfig(container: ContainerConfig): string {
   ].join('\n');
 }
 
-export function relayedModelBaseUrl(upstreamBaseUrl: string): string {
+export function relayedModelBaseUrl(upstreamBaseUrl: string, relayAuthority = 'local-engineer-proxy'): string {
+  if (!/^(?:[A-Za-z0-9][A-Za-z0-9.-]{0,252}|\d{1,3}(?:\.\d{1,3}){3})$/.test(relayAuthority))
+    throw new Error('CONTAINER_MODEL_RELAY_AUTHORITY_INVALID');
   const upstream = new URL(upstreamBaseUrl);
   const path = upstream.pathname.replace(/\/+$/, '');
-  return `http://local-engineer-proxy:8090${path}`;
+  return `http://${relayAuthority}:8090${path}`;
 }
 
 export function readCustomCodexConfig(path: string, maximumBytes = 1024 * 1024): string {

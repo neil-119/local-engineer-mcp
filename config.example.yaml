@@ -27,6 +27,8 @@ security:
 container:
   # Any Docker-compatible CLI that passes `local-engineer doctor`.
   command: docker
+  # `windows` requires Docker Windows-container mode and mandatory Hyper-V isolation.
+  platform: linux
   # Optional CLI context, useful when Docker Desktop and Rancher Desktop coexist.
   # context: default
   # Dedicated Local Engineer /16. Avoid a range used by your LAN or model endpoint.
@@ -37,8 +39,18 @@ container:
   workspace_path: /workspace
   worker_user: codex
   codex_command: codex
+  # Applied to every Windows Hyper-V utility VM; ignored for Linux containers.
+  windows_memory_limit: 4g
+  windows_cpu_count: 2
+  # Windows alternatives:
+  # image: local-engineer/codex-worker-windows:0.144.6
+  # base_image: mcr.microsoft.com/windows/servercore:ltsc2025
+  # workspace_path: C:/workspace
+  # worker_user: ContainerUser
   network:
     model_domains: [model-provider.example]
+    # Permitted read-only domains (GET, HEAD, OPTIONS only).
+    # Examples: [registry.npmjs.org, pypi.org, index.crates.io, registry.terraform.io, releases.hashicorp.com, learn.microsoft.com, developers.cloudflare.com, nodejs.org]
     read_only_domains: []
     allow_private_model_endpoint: false
 

@@ -11,7 +11,7 @@ describe('container runtime adapter', () => {
     const calls: Array<{ executable: string; arguments_: readonly string[] }> = [];
     const execute: RuntimeCommandExecutor = async (executable, arguments_) => {
       calls.push({ executable, arguments_ });
-      return { exitCode: 0, stdout: '{}', stderr: '' };
+      return { exitCode: 0, stdout: '{"Server":{"Os":"linux"}}', stderr: '' };
     };
     const runtime = new ContainerRuntime('podman', execute);
 
@@ -144,6 +144,157 @@ describe('container runtime adapter', () => {
     });
   });
 
+  it('uses mandatory Hyper-V isolation and no Linux-only flags for Windows containers', async () => {
+    const calls: string[][] = [];
+    const runtime = new ContainerRuntime(
+      'docker',
+      async (_executable, arguments_) => {
+        calls.push([...arguments_]);
+        if (arguments_.includes('version'))
+          return { exitCode: 0, stdout: '{"Server":{"Os":"windows","Version":"29.7.2"}}', stderr: '' };
+        if (arguments_.includes('{{.HostConfig.Isolation}}')) return { exitCode: 0, stdout: 'hyperv\n', stderr: '' };
+        if (arguments_.includes('{{json .HostConfig}}'))
+          return { exitCode: 0, stdout: '{"Memory":6442450944,"CpuCount":3}', stderr: '' };
+        if (arguments_.includes('{{json .NetworkSettings.Networks}}')) {
+          const container = arguments_.at(-1)!;
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              [container.replace(/-container$/, '-internal')]: {
+                IPAddress: '10.240.7.3',
+                MacAddress: '00:15:5d:00:00:03',
+              },
+            }),
+            stderr: '',
+          };
+        }
+        if (arguments_.some((argument) => argument.endsWith('/configure-worker-network.ps1')))
+          return { exitCode: 0, stdout: 'LOCAL_ENGINEER_NETWORK_OK\n', stderr: '' };
+        if (arguments_.some((argument) => argument.endsWith('whoami.exe')))
+          return { exitCode: 0, stdout: 'BUILTIN\\Users S-1-5-32-545 Enabled group\n', stderr: '' };
+        if (arguments_.some((argument) => argument.includes('.local-engineer-write-probe')))
+          return { exitCode: 0, stdout: 'LOCAL_ENGINEER_IMAGE_LOCKED', stderr: '' };
+        return { exitCode: 0, stdout: '{}', stderr: '' };
+      },
+      'desktop-windows',
+      'windows',
+      { memoryLimit: '6g', cpuCount: 3 },
+    );
+
+    await expect(runtime.probe('local-engineer/windows:test')).resolves.toMatchObject({ supported: true });
+    const create = calls.find(
+      (call) => call[0] === '--context' && call.includes('create') && call.includes('--isolation'),
+    )!;
+    expect(create).toContain('hyperv');
+    expect(create).toContain('6g');
+    expect(create).toContain('3');
+    expect(create).not.toContain('--cap-drop');
+    expect(create).not.toContain('--security-opt');
+    expect(create).not.toContain('--tmpfs');
+    const internalNetwork = calls.find(
+      (call) => call.includes('network') && call.some((argument) => argument.endsWith('-internal')),
+    )!;
+    expect(internalNetwork).toContain('nat');
+    expect(internalNetwork).not.toContain('--internal');
+    expect(calls.some((call) => call.some((argument) => argument.endsWith('/configure-worker-network.ps1')))).toBe(
+      true,
+    );
+    expect(calls.some((call) => call.includes('disconnect'))).toBe(true);
+    const imageLockProbe = calls.find((call) =>
+      call.some((argument) => argument.includes('.local-engineer-write-probe')),
+    )!;
+    expect(imageLockProbe.join(' ')).toContain('C:/Node');
+    expect(imageLockProbe.join(' ')).toContain('C:/Python');
+    expect(imageLockProbe.join(' ')).toContain('C:/MinGit');
+    expect(imageLockProbe.join(' ')).toContain('C:/BuildTools');
+    const start = calls.findIndex((call) => call.includes('start'));
+    const configure = calls.findIndex((call) =>
+      call.some((argument) => argument.endsWith('/configure-worker-network.ps1')),
+    );
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(configure).toBeGreaterThan(start);
+  });
+
+  it('fails closed when Docker daemon platform does not match configuration', async () => {
+    const runtime = new ContainerRuntime(
+      'docker',
+      async () => ({ exitCode: 0, stdout: '{"Server":{"Os":"linux"}}', stderr: '' }),
+      undefined,
+      'windows',
+    );
+    await expect(runtime.probe('worker:windows')).resolves.toMatchObject({
+      supported: false,
+      errorCode: 'CONTAINER_RUNTIME_PLATFORM_MISMATCH',
+      errorSummary:
+        'The configured Docker daemon is running the wrong container platform. Switch Docker Desktop to the configured platform and retry.',
+    });
+  });
+
+  it('rejects process isolation and unverifiable Windows route isolation', async () => {
+    const processIsolated = new ContainerRuntime(
+      'docker',
+      async (_executable, arguments_) => {
+        if (arguments_.includes('version')) return { exitCode: 0, stdout: '{"Server":{"Os":"windows"}}', stderr: '' };
+        if (arguments_.includes('{{.HostConfig.Isolation}}')) return { exitCode: 0, stdout: 'process\n', stderr: '' };
+        return { exitCode: 0, stdout: '{}', stderr: '' };
+      },
+      undefined,
+      'windows',
+    );
+    await expect(processIsolated.probe('worker:windows')).resolves.toMatchObject({
+      supported: false,
+      errorCode: 'CONTAINER_WINDOWS_HYPERV_REQUIRED',
+    });
+
+    const networkIsolationUnavailable = new ContainerRuntime(
+      'docker',
+      async (_executable, arguments_) => {
+        if (arguments_.includes('version')) return { exitCode: 0, stdout: '{"Server":{"Os":"windows"}}', stderr: '' };
+        if (arguments_.includes('{{.HostConfig.Isolation}}')) return { exitCode: 0, stdout: 'hyperv\n', stderr: '' };
+        if (arguments_.includes('{{json .HostConfig}}'))
+          return { exitCode: 0, stdout: '{"Memory":4294967296,"CpuCount":2}', stderr: '' };
+        if (arguments_.includes('{{json .NetworkSettings.Networks}}')) {
+          const container = arguments_.at(-1)!;
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              [container.replace(/-container$/, '-internal')]: {
+                IPAddress: '10.240.7.3',
+                MacAddress: '00:15:5d:00:00:03',
+              },
+            }),
+            stderr: '',
+          };
+        }
+        return { exitCode: 0, stdout: '{}', stderr: '' };
+      },
+      undefined,
+      'windows',
+    );
+    await expect(networkIsolationUnavailable.probe('worker:windows')).resolves.toMatchObject({
+      supported: false,
+      errorCode: 'CONTAINER_WINDOWS_NETWORK_ISOLATION_UNAVAILABLE',
+    });
+  });
+
+  it('validates Windows container copy paths without treating drive colons as resource separators', async () => {
+    const calls: string[][] = [];
+    const runtime = new ContainerRuntime(
+      'docker',
+      async (_executable, arguments_) => {
+        calls.push([...arguments_]);
+        return { exitCode: 0, stdout: '', stderr: '' };
+      },
+      undefined,
+      'windows',
+    );
+    await runtime.copyToContainer('C:/host/config.toml', 'worker', 'C:/local-engineer/config.toml');
+    expect(calls[0]).toEqual(['cp', 'C:/host/config.toml', 'worker:C:/local-engineer/config.toml']);
+    expect(() => runtime.copyToContainer('C:/host/config.toml', 'worker', '/linux/path')).toThrow(
+      'CONTAINER_COPY_PATH_INVALID',
+    );
+  });
+
   it('builds the shared worker/proxy image with explicit trusted arguments', async () => {
     const calls: string[][] = [];
     const runtime = new ContainerRuntime('nerdctl', async (_executable, arguments_) => {
@@ -171,5 +322,154 @@ describe('container runtime adapter', () => {
       'CODEX_VERSION=0.144.6',
       'C:/package/container',
     ]);
+  });
+
+  it('lists volumes and containers filtered by ownership labels', async () => {
+    const calls: string[][] = [];
+    const runtime = new ContainerRuntime('docker', async (_executable, arguments_) => {
+      calls.push([...arguments_]);
+      if (arguments_[0] === 'volume' && arguments_[1] === 'ls') {
+        return { exitCode: 0, stdout: 'le-vol-1\r\nle-vol-2\n', stderr: '' };
+      }
+      if (arguments_[0] === 'ps' && arguments_[1] === '-a') {
+        return { exitCode: 0, stdout: 'le-worker\r\nle-proxy\n', stderr: '' };
+      }
+      return { exitCode: 0, stdout: '', stderr: '' };
+    });
+
+    const volumes = await runtime.listVolumesByLabels({
+      'local-engineer.agent-id': 'agt_123',
+      'local-engineer.managed': 'true',
+    });
+    expect(volumes).toEqual(['le-vol-1', 'le-vol-2']);
+    expect(calls[0]).toEqual([
+      'volume',
+      'ls',
+      '--filter',
+      'label=local-engineer.agent-id=agt_123',
+      '--filter',
+      'label=local-engineer.managed=true',
+      '--format',
+      '{{.Name}}',
+    ]);
+
+    const containers = await runtime.listContainersByLabels({
+      'local-engineer.agent-id': 'agt_123',
+      'local-engineer.managed': 'true',
+    });
+    expect(containers).toEqual(['le-worker', 'le-proxy']);
+    expect(calls[1]).toEqual([
+      'ps',
+      '-a',
+      '--filter',
+      'label=local-engineer.agent-id=agt_123',
+      '--filter',
+      'label=local-engineer.managed=true',
+      '--format',
+      '{{.Names}}',
+    ]);
+  });
+
+  it('enforces safe workdir and normalizes binary paths for privileged Windows executions', async () => {
+    const calls: string[][] = [];
+    const runtime = new ContainerRuntime(
+      'docker',
+      async (_executable, arguments_) => {
+        calls.push([...arguments_]);
+        return { exitCode: 0, stdout: '', stderr: '' };
+      },
+      undefined,
+      'windows',
+    );
+
+    // 1. Privileged execution without an explicit workdir enforces C:/Windows/System32
+    await runtime.execContainer('test-container', ['git', 'status'], { user: 'ContainerAdministrator' });
+    expect(calls[0]).toContain('--workdir');
+    expect(calls[0]).toContain('C:/Windows/System32');
+    expect(calls[0]).toContain('C:/MinGit/cmd/git.exe');
+    expect(calls[0]).not.toContain('git');
+
+    // 2. Privileged execution with the correct workdir succeeds
+    await runtime.execContainer('test-container', ['powershell.exe', '-Command', 'echo 1'], {
+      user: 'ContainerAdministrator',
+      workdir: 'C:\\Windows\\System32',
+    });
+    expect(calls[1]).toContain('--workdir');
+    expect(calls[1]).toContain('C:/Windows/System32');
+    expect(calls[1]).toContain('C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe');
+
+    // 3. Privileged execution with C:/workspace fails closed
+    await expect(
+      runtime.execContainer('test-container', ['git', 'status'], {
+        user: 'ContainerAdministrator',
+        workdir: 'C:/workspace',
+      }),
+    ).rejects.toThrow('CONTAINER_PRIVILEGED_WORKDIR_UNSAFE: Privileged executions must use C:/Windows/System32');
+
+    // 4. Unprivileged executions: caller-supplied workdir is preserved
+    await runtime.execContainer('test-container', ['git', 'status'], {
+      user: 'ContainerUser',
+      workdir: 'C:/workspace',
+    });
+    expect(calls[2]).toContain('--workdir');
+    expect(calls[2]).toContain('C:/workspace');
+    expect(calls[2]).toContain('git');
+
+    // 5. Unprivileged executions: omitted workdir does not inject --workdir
+    await runtime.execContainer('test-container', ['git', 'status'], { user: 'ContainerUser' });
+    expect(calls[3]).not.toContain('--workdir');
+    expect(calls[3]).toContain('git');
+  });
+
+  it('enforces safe workdir across all Linux UID 0 user specifications and preserves non-root workdirs', async () => {
+    const calls: string[][] = [];
+    const runtime = new ContainerRuntime(
+      'docker',
+      async (_executable, arguments_) => {
+        calls.push([...arguments_]);
+        return { exitCode: 0, stdout: '', stderr: '' };
+      },
+      undefined,
+      'linux',
+    );
+
+    const privilegedUsers = ['0', '00', '+0', '-0', '0:0', '0:123', '00:123', '+0:123', '-0:123', 'root', 'root:wheel'];
+    for (const user of privilegedUsers) {
+      // Privileged execution with unsafe workdir fails closed
+      await expect(
+        runtime.execContainer('test-container', ['git', 'status'], {
+          user,
+          workdir: '/workspace',
+        }),
+      ).rejects.toThrow('CONTAINER_PRIVILEGED_WORKDIR_UNSAFE: Privileged executions must use /');
+
+      // Privileged execution without workdir enforces safe workdir /
+      calls.length = 0;
+      await runtime.execContainer('test-container', ['git', 'status'], { user });
+      expect(calls[0]).toContain('--workdir');
+      expect(calls[0]).toContain('/');
+
+      // Privileged execution with explicit safe workdir / succeeds
+      calls.length = 0;
+      await runtime.execContainer('test-container', ['git', 'status'], { user, workdir: '/' });
+      expect(calls[0]).toContain('--workdir');
+      expect(calls[0]).toContain('/');
+    }
+
+    // Unprivileged non-root users preserve caller-supplied workdir
+    const nonRootUsers = ['1000', '1000:1000', 'codex'];
+    for (const user of nonRootUsers) {
+      calls.length = 0;
+      await runtime.execContainer('test-container', ['git', 'status'], {
+        user,
+        workdir: '/workspace',
+      });
+      expect(calls[0]).toContain('--workdir');
+      expect(calls[0]).toContain('/workspace');
+
+      calls.length = 0;
+      await runtime.execContainer('test-container', ['git', 'status'], { user });
+      expect(calls[0]).not.toContain('--workdir');
+    }
   });
 });

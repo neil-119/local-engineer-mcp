@@ -25,6 +25,7 @@ const worker: Worker = {
 
 const container: ContainerConfig = {
   command: 'docker',
+  platform: 'linux',
   image: 'local-engineer/worker:latest',
   base_image: 'node:24-bookworm-slim',
   codex_version: '0.144.6',

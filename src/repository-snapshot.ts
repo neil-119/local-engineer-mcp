@@ -1,3 +1,14 @@
+/**
+ * Repository Snapshotting & Safe Review Promotion
+ *
+ * Implements isolated snapshotting of host repositories and atomic promotion of reviewed changes:
+ * - Creates an isolated, ephemeral snapshot of the parent repository checkout.
+ * - If the host repository has uncommitted changes, folds them into an ephemeral commit
+ *   so the container agent begins with the user's exact working state without modifying host Git history.
+ * - Tracks exact index hashes and file mtimes to protect the parent repo from race conditions
+ *   and overlapping host modifications during review promotion.
+ */
+
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import {
@@ -32,6 +43,12 @@ export interface RepositoryChanges {
   deletions: number;
 }
 
+/**
+ * Creates an isolated snapshot of a host Git repository for container staging:
+ * - Captures tracked, untracked, and ignored paths.
+ * - If dirty, creates an ephemeral baseline commit capturing uncommitted changes.
+ * - Fingerprints the parent index and working tree to guard against concurrent promotion conflicts.
+ */
 export async function createRepositorySnapshot(parentPath: string, snapshotPath: string): Promise<RepositorySnapshot> {
   const parent = realpathSync.native(parentPath);
   const topLevel = realpathSync.native((await git(parent, ['rev-parse', '--show-toplevel'])).trim());
@@ -201,6 +218,10 @@ export async function captureRepositoryChanges(snapshot: RepositorySnapshot): Pr
   };
 }
 
+/**
+ * Verifies that the host repository's HEAD, index, and affected working tree files
+ * have not diverged since the snapshot was taken, and tests that the patch applies cleanly.
+ */
 export async function checkRepositoryPromotion(
   snapshot: RepositorySnapshot,
   changes: RepositoryChanges,
@@ -218,6 +239,9 @@ export async function checkRepositoryPromotion(
   await git(snapshot.parentPath, ['apply', '--check', '--binary', '--whitespace=nowarn', '-'], changes.patch);
 }
 
+/**
+ * Validates and applies reviewed unified diff patches to the parent repository checkout.
+ */
 export async function promoteRepositoryChanges(
   snapshot: RepositorySnapshot,
   changes: RepositoryChanges,
@@ -246,7 +270,7 @@ export function readSnapshotFile(snapshot: RepositorySnapshot, path: string, max
 }
 
 function safeRepositoryPath(root: string, path: string): string {
-  if (!path || isAbsolute(path) || path.split(/[\\/]+/).includes('..') || path.includes('\0'))
+  if (!path || isAbsolute(path) || path.split(/[\\/]+/).includes('..') || path.includes('\0') || path.includes(':'))
     throw new Error('REPOSITORY_RELATIVE_PATH_INVALID');
   const destination = resolve(root, path);
   const relativePath = relative(resolve(root), destination);
@@ -298,6 +322,7 @@ function assertNoNestedRepository(root: string, path: string): void {
 function git(cwd: string, arguments_: string[], input?: string): Promise<string> {
   return new Promise((resolvePromise, reject) => {
     const child = spawn('git', arguments_, { cwd, stdio: 'pipe', windowsHide: true, shell: false });
+    child.stdin.on('error', () => undefined);
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (chunk: Buffer) => {

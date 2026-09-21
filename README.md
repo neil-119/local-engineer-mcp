@@ -26,6 +26,7 @@ reviewed patch into the checkout.
 - [Installation](#installation)
 - [Teach Codex to delegate effectively](#teach-codex-to-delegate-effectively)
 - [Security model](#security-model)
+  - [Security - Learn More](#security---learn-more)
 - [How it works](#how-it-works)
   - [1. Snapshot the requested repositories](#1-snapshot-the-requested-repositories)
   - [2. Create an isolated worker](#2-create-an-isolated-worker)
@@ -35,6 +36,7 @@ reviewed patch into the checkout.
   - [5. Iterate, promote, or discard](#5-iterate-promote-or-discard)
 - [Configuration](#configuration)
   - [Container runtime](#container-runtime)
+  - [Docker Desktop Windows containers](#docker-desktop-windows-containers)
   - [Rancher Desktop on Windows](#rancher-desktop-on-windows)
   - [Project image profiles](#project-image-profiles)
   - [Model provider](#model-provider)
@@ -76,8 +78,10 @@ evidence, and deciding what to keep.
 - A reachable OpenAI-compatible model endpoint
 - At least one Git repository with a valid `HEAD`
 
-Windows is currently supported with macOS and Linux support fast following soon. Docker Desktop on Windows has received live end-to-end testing; every runtime and host combination should be validated
-with `local-engineer doctor`.
+Windows hosts, macOS, and Linux are supported with a compatible container
+runtime. Native Windows-container support requires Docker Desktop in Windows
+container mode and Hyper-V isolation. Every runtime, host, and container-OS
+combination must pass `local-engineer doctor` before use.
 
 ## Installation
 
@@ -210,9 +214,13 @@ from an external isolation and promotion boundary:
   repositories and inject only explicitly configured credentials.
 - The worker receives no container-runtime socket, host home, SSH agent, browser
   profile, parent MCP credentials, or reusable `CODEX_HOME`.
-- The worker has no direct egress route. Model and dependency traffic must pass
-  through a policy sidecar. Model requests use a fixed-target relay; dependency
-  hosts use a TLS-inspecting proxy limited to `GET`, `HEAD`, and `OPTIONS`.
+- The worker cannot send direct egress. On Linux this is enforced by an internal
+  network; on Windows it is enforced inside the Hyper-V utility VM by a
+  deny-by-default route table that retains only a `/32` route to the sidecar.
+  IPv4/IPv6 subnet, gateway, multicast, and broadcast routes are removed. Model
+  and dependency traffic must pass through the policy
+  sidecar. Model requests use a fixed-target relay; dependency hosts use a
+  TLS-inspecting proxy limited to `GET`, `HEAD`, and `OPTIONS`.
 - The configured local model endpoint is a separate trust boundary. Task
   prompts, worker tool results, and repository content needed for coding can be
   transmitted to it through the fixed-target relay. Treat the inference server
@@ -220,8 +228,12 @@ from an external isolation and promotion boundary:
   hosts and networks, require authentication and TLS when the provider supports
   them, and do not expose it publicly without an intentionally designed access
   boundary.
-- Long-lived worker and proxy containers use read-only root filesystems and drop
-  Linux capabilities. The writable repository data lives in an ephemeral volume.
+- Linux containers use read-only root filesystems, dropped capabilities, and an
+  unprivileged user. Windows containers require `--isolation hyperv`, run
+  untrusted work as `ContainerUser`, apply memory/CPU ceilings, protect installed
+  tools with NTFS ACLs, and enforce read-only repositories via Docker read-only
+  volume mounts and write-probe assertions. Process isolation is never accepted
+  for Windows workers.
 - Worker changes reach the parent only through an exact, independently captured
   Git revision that the parent reviews and explicitly promotes.
 - Promotion verifies the original repository state and applies nothing if an
@@ -229,6 +241,10 @@ from an external isolation and promotion boundary:
 
 The local model has broad freedom only inside the disposable container. The system does not treat a
 successful worker report as proof that the code is correct or safe.
+
+### Security - Learn More
+
+For an in-depth breakdown of Local Engineer's security architecture, trusted computing base, and limitations—including Hyper-V isolation, route lockdown, deterministic 10.x subnet allocation, TLS-inspecting dependency proxy, read-only volume mounts, NTFS ACLs, and patch promotion verification—see [SECURITY.md](SECURITY.md).
 
 ## How it works
 
@@ -307,7 +323,8 @@ Each agent receives:
 
 - one worker container;
 - one network-policy proxy sidecar;
-- one internal network with no direct egress;
+- one worker-side network with direct egress blocked by the platform-specific
+  network boundary;
 - one egress-capable network connected only to the proxy;
 - one ephemeral workspace volume;
 - separate ephemeral worker and proxy configuration volumes; and
@@ -433,6 +450,7 @@ in [config.example.yaml](config.example.yaml).
 ```yaml
 container:
   command: docker
+  platform: linux
   # Optional explicit Docker context; prevents accidental use of a stale Desktop context.
   # context: default
   # Reserved for Local Engineer's per-agent networks; must not overlap your LAN.
@@ -465,9 +483,61 @@ Local Engineer derives one internal and one egress `/24` per agent from this
 reserved `/16`; choose a `10.x.0.0/16` range that is unused by your LAN, VPN,
 and model network.
 
+### Docker Desktop Windows containers
+
+If you do development on "pure" Windows (instead of WSL/Linux or alternative) and wish to iterate on a Windows-compatible container environment, this section details the Windows container runtime.
+
+Docker Desktop is the trusted container-runtime administrator, not the worker security boundary.
+
+Native Windows workers fail closed unless all of these controls are active:
+
+- the daemon reports `windows` container mode;
+- every container is created with Hyper-V isolation and the result is verified
+  through container inspection;
+- untrusted commands run as `ContainerUser`, never
+  `ContainerAdministrator`;
+- each Hyper-V utility VM receives explicit memory and CPU ceilings;
+- setup containers lose all non-loopback routes before they process repository
+  data; and
+- the worker retains only its own address and an on-link `/32` route to the
+  current sidecar IP. `ContainerUser` cannot restore privileged routes.
+
+Example:
+
+```yaml
+container:
+  command: docker
+  platform: windows
+  context: desktop-windows
+  image: local-engineer/codex-worker-windows:0.144.6
+  base_image: mcr.microsoft.com/windows/servercore:ltsc2025
+  workspace_path: C:/workspace
+  worker_user: ContainerUser
+  windows_memory_limit: 4g
+  windows_cpu_count: 2
+```
+
+Build and validate after switching Docker Desktop to Windows containers:
+
+```powershell
+$env:LOCAL_ENGINEER_CONFIG = 'C:\work\local-engineer-config.yaml'
+pnpm build
+node .\dist\index.js image build
+node .\dist\index.js doctor
+```
+
+The Windows image provides Node.js 24, Python 3.14, Git, Rust, Codex, and the
+same policy sidecar. Downloaded Node, Rustup, MinGit, and Codex source inputs
+are pinned by SHA-256; the Rust compiler version is checked before building the
+proxy; and the Microsoft Build Tools bootstrapper must have a valid Microsoft
+Authenticode signature. Windows project image profiles are currently rejected
+rather than falling back to a weaker build path.
+
 ### Rancher Desktop on Windows
 
 Local Engineer works with Rancher Desktop's `dockerd (moby)` container engine.
+This workflow uses Linux containers. Use Docker Desktop and the preceding
+section for native Windows containers.
 This is useful when Rancher Desktop already owns the local Kubernetes and
 container workflow: Docker Desktop does not need to be running, and its image
 store is separate from Rancher's.
@@ -520,8 +590,9 @@ hosts. Never bake credentials into the image.
 
 The shared image supplies Codex and common runtimes. A project image profile is
 a reusable, immutable layer containing one repository's Linux-compatible
-dependencies. The parent does not normally invent or pass a Dockerfile.
-Instead, it asks Local Engineer to plan from the repository:
+dependencies. Profiles are currently Linux-only; Windows mode fails closed
+with `IMAGE_PROFILE_WINDOWS_UNSUPPORTED`. The parent does not normally invent
+or pass a Dockerfile. Instead, it asks Local Engineer to plan from the repository:
 
 ```json
 {
@@ -973,7 +1044,7 @@ Concurrency is layered:
 | `server.max_concurrency`    | Active agents across the shared state directory.                  |
 | `workers[].max_concurrency` | Active agents for one worker profile.                             |
 | Per-agent queue             | Continuations for one private Codex session run serially.         |
-| Promotion locks             | Affected parent repositories are checked and promoted atomically. |
+| Promotion locks             | Affected parent repositories are locked during pre-flight check and promotion. |
 
 Workers may run concurrently because they edit separate snapshots. Promotion
 still conflicts when another actor changes an affected parent path.
@@ -1028,8 +1099,9 @@ separate future decision.
   configured credential environment.
 - Host dependency trees are copied as-is. Native binaries, virtual environments,
   or launchers may not run when the host and worker container use different
-  operating systems or architectures. The bundled image provides Node.js 24 and
-  Python 3.12, but incompatible project dependencies may still need to be
+  operating systems or architectures. The bundled Linux image provides Node.js
+  24 and Python 3.12; the Windows image provides Node.js 24 and Python 3.14.
+  Incompatible project dependencies may still need to be
   reinstalled inside the private read-write worktree. This requires the relevant
   registry and artifact domains to be explicitly allowlisted.
 - The shared image provides Rust and Linux Tauri build prerequisites, not every
@@ -1044,4 +1116,8 @@ separate future decision.
 - Submodules, Git LFS, unusual file modes, very large binaries, and non-Git
   state may have limitations.
 - Crash-orphan reconciliation is pending.
-- Podman, nerdctl, and non-Windows hosts follow the configurable CLI contract but have not received the same live test coverage as Docker Desktop on Windows.
+- Windows project image profiles are not supported.
+- Native Windows-container mode requires Docker Desktop and Hyper-V isolation;
+  process-isolated Windows containers are intentionally unsupported.
+- Podman, nerdctl, and other runtime/host combinations follow the configurable
+  CLI contract but may not have the same live test coverage.

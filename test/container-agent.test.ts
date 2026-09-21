@@ -186,6 +186,221 @@ describe('container agent workspace seeding', () => {
     await expect(manager.delete('agt_already_cleaned')).resolves.toBeUndefined();
   });
 
+  it('rejects invalid, absolute, traversal, ADS, or .git file paths in getFile', async () => {
+    const root = mkdtempSync(join(testTemporaryDirectory(), 'container-agent-path-'));
+    temporaryRoots.push(root);
+    const manager = new ContainerAgentManager(
+      containerConfig(),
+      join(root, 'state'),
+      new ContainerRuntime('docker', async () => ({ exitCode: 0, stdout: '', stderr: '' })),
+    );
+
+    await expect(manager.getFile('agt_test', 'repo', '/abs/path')).rejects.toThrow('CONTAINER_FILE_PATH_INVALID');
+    await expect(manager.getFile('agt_test', 'repo', '\\abs\\path')).rejects.toThrow('CONTAINER_FILE_PATH_INVALID');
+    await expect(manager.getFile('agt_test', 'repo', 'C:/Windows/win.ini')).rejects.toThrow(
+      'CONTAINER_FILE_PATH_INVALID',
+    );
+    await expect(manager.getFile('agt_test', 'repo', 'foo:stream')).rejects.toThrow('CONTAINER_FILE_PATH_INVALID');
+    await expect(manager.getFile('agt_test', 'repo', '../parent')).rejects.toThrow('CONTAINER_FILE_PATH_INVALID');
+    await expect(manager.getFile('agt_test', 'repo', '.git/config')).rejects.toThrow('CONTAINER_FILE_PATH_INVALID');
+  });
+
+  it('locks down Windows setup and worker containers before repository commands run', async () => {
+    const root = mkdtempSync(join(testTemporaryDirectory(), 'container-agent-windows-'));
+    temporaryRoots.push(root);
+    const parent = join(root, 'parent');
+    mkdirSync(parent);
+    git(parent, ['init']);
+    git(parent, ['config', 'user.name', 'Test']);
+    git(parent, ['config', 'user.email', 'test@example.invalid']);
+    writeFileSync(join(parent, 'source.ts'), 'export const value = 1;\n');
+    git(parent, ['add', 'source.ts']);
+    git(parent, ['commit', '-m', 'initial']);
+
+    const calls: string[][] = [];
+    const execute: RuntimeCommandExecutor = async (_executable, arguments_) => {
+      const args = [...arguments_];
+      calls.push(args);
+      if (args.includes('{{.HostConfig.Isolation}}')) return { exitCode: 0, stdout: 'hyperv\n', stderr: '' };
+      if (args.includes('{{json .NetworkSettings.Networks}}')) {
+        const proxy = args.at(-1)!;
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            [proxy.replace(
+              /-(?:proxy|worker|proxy-shared-seed|worker-config-seed|dependency-seed|proxy-config-seed|workspace-seed)$/,
+              '-internal',
+            )]: {
+              IPAddress: proxy.endsWith('-proxy') ? '10.240.7.2' : '10.240.7.3',
+              MacAddress: proxy.endsWith('-proxy') ? '00:15:5d:00:00:02' : '00:15:5d:00:00:03',
+            },
+          }),
+          stderr: '',
+        };
+      }
+      if (args.some((argument) => argument.endsWith('/configure-worker-network.ps1')))
+        return { exitCode: 0, stdout: 'LOCAL_ENGINEER_NETWORK_OK\n', stderr: '' };
+      if (args.some((argument) => argument.endsWith('whoami.exe')))
+        return { exitCode: 0, stdout: 'BUILTIN\\Users S-1-5-32-545 Enabled group\n', stderr: '' };
+      if (args.some((argument) => argument.includes('.local-engineer-read-only-probe-')))
+        return { exitCode: 0, stdout: 'LOCKED', stderr: '' };
+      return { exitCode: 0, stdout: '', stderr: '' };
+    };
+    const config = windowsContainerConfig();
+    const manager = new ContainerAgentManager(
+      config,
+      join(root, 'state'),
+      new ContainerRuntime('docker', execute, config.context, config.platform, {
+        memoryLimit: config.windows_memory_limit!,
+        cpuCount: config.windows_cpu_count!,
+      }),
+    );
+    const resources = await manager.prepare('agt_windows', worker(), [
+      {
+        name: 'application',
+        parentPath: parent,
+        containerPath: 'C:/workspace/application',
+        access: 'read-only',
+      },
+    ]);
+
+    const creates = calls.filter((args) => args.includes('create') && args.includes('--isolation'));
+    expect(creates.length).toBeGreaterThanOrEqual(7);
+    for (const args of creates) {
+      expect(args).toContain('hyperv');
+      expect(args).not.toContain('--cap-drop');
+      expect(args).not.toContain('--read-only');
+    }
+    const networkCalls = calls.filter((args) =>
+      args.some((argument) => argument.endsWith('/configure-worker-network.ps1')),
+    );
+    expect(networkCalls).toHaveLength(6);
+    expect(networkCalls.filter((args) => args.includes('-ProxyAddress'))).toHaveLength(1);
+    const workerCreate = creates.find((args) => args.includes(resources.workerContainer))!;
+    expect(workerCreate).toContain('HTTP_PROXY=http://10.240.7.2:3128');
+    const workerStart = calls.findIndex((args) => args.includes('start') && args.includes(resources.workerContainer));
+    const workerNetworkIsolation = calls.findIndex(
+      (args) =>
+        args.includes(resources.workerContainer) &&
+        args.some((argument) => argument.endsWith('/configure-worker-network.ps1')),
+    );
+    const workerReadyCheck = calls.findIndex(
+      (args) => args.includes(resources.workerContainer) && args.some((argument) => argument.includes('fs.existsSync')),
+    );
+    expect(workerNetworkIsolation).toBeGreaterThan(workerStart);
+    expect(workerReadyCheck).toBeGreaterThan(workerNetworkIsolation);
+    expect(
+      calls.some(
+        (args) =>
+          args.some((arg) => arg.endsWith('icacls.exe')) &&
+          args.includes('C:/workspace') &&
+          args.includes('*S-1-5-93-2-2:(OI)(CI)M') &&
+          args.includes('/T') &&
+          args.includes('/C'),
+      ),
+    ).toBe(true);
+    const appVolume = resources.repositoryVolumes.get('application')!;
+    expect(workerCreate).toContain(`type=volume,src=${appVolume},dst=C:/workspace/application,readonly`);
+    expect(
+      calls.some(
+        (args) =>
+          args.includes(resources.workerContainer) &&
+          args.some((argument) => argument.includes('.local-engineer-read-only-probe-')),
+      ),
+    ).toBe(true);
+    expect(manager.appServerWorker(worker(), resources).args).toContain(
+      'model_providers.local-provider.base_url="http://10.240.7.2:8090/v1"',
+    );
+    await manager.capture(resources.agentId);
+    const readOnlyIntegrityCheck = calls.find(
+      (args) => args.includes('status') && args.includes('--porcelain=v1') && args.includes('C:/workspace/application'),
+    )!;
+    expect(readOnlyIntegrityCheck).toContain('ContainerAdministrator');
+    expect(readOnlyIntegrityCheck).toContain('--workdir');
+    expect(readOnlyIntegrityCheck).toContain('C:/Windows/System32');
+    expect(readOnlyIntegrityCheck).toContain('C:/MinGit/cmd/git.exe');
+    expect(readOnlyIntegrityCheck).not.toContain('0');
+  });
+
+  it('recursively grants ContainerUser modify permissions on writable repositories in Windows containers', async () => {
+    const root = mkdtempSync(join(testTemporaryDirectory(), 'container-agent-writable-win-'));
+    temporaryRoots.push(root);
+    const parent = join(root, 'parent');
+    mkdirSync(parent);
+    git(parent, ['init']);
+    git(parent, ['config', 'user.name', 'Test']);
+    git(parent, ['config', 'user.email', 'test@example.invalid']);
+    writeFileSync(join(parent, 'source.ts'), 'export const value = 1;\n');
+    git(parent, ['add', 'source.ts']);
+    git(parent, ['commit', '-m', 'initial']);
+
+    const calls: string[][] = [];
+    const execute: RuntimeCommandExecutor = async (_executable, arguments_) => {
+      const args = [...arguments_];
+      calls.push(args);
+      if (args.includes('{{.HostConfig.Isolation}}')) return { exitCode: 0, stdout: 'hyperv\n', stderr: '' };
+      if (args.includes('{{json .NetworkSettings.Networks}}')) {
+        const proxy = args.at(-1)!;
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            [proxy.replace(
+              /-(?:proxy|worker|proxy-shared-seed|worker-config-seed|dependency-seed|proxy-config-seed|workspace-seed)$/,
+              '-internal',
+            )]: {
+              IPAddress: proxy.endsWith('-proxy') ? '10.240.7.2' : '10.240.7.3',
+              MacAddress: proxy.endsWith('-proxy') ? '00:15:5d:00:00:02' : '00:15:5d:00:00:03',
+            },
+          }),
+          stderr: '',
+        };
+      }
+      if (args.some((argument) => argument.endsWith('/configure-worker-network.ps1')))
+        return { exitCode: 0, stdout: 'LOCAL_ENGINEER_NETWORK_OK\n', stderr: '' };
+      if (args.some((argument) => argument.endsWith('whoami.exe')))
+        return { exitCode: 0, stdout: 'BUILTIN\\Users S-1-5-32-545 Enabled group\n', stderr: '' };
+      return { exitCode: 0, stdout: '', stderr: '' };
+    };
+    const config = windowsContainerConfig();
+    const manager = new ContainerAgentManager(
+      config,
+      join(root, 'state'),
+      new ContainerRuntime('docker', execute, config.context, config.platform, {
+        memoryLimit: config.windows_memory_limit!,
+        cpuCount: config.windows_cpu_count!,
+      }),
+    );
+    await manager.prepare('agt_windows_writable', worker(), [
+      {
+        name: 'writable-app',
+        parentPath: parent,
+        containerPath: 'C:/workspace/writable-app',
+        access: 'read-write',
+      },
+    ]);
+
+    expect(
+      calls.some(
+        (args) =>
+          args.some((arg) => arg.endsWith('icacls.exe')) &&
+          args.includes('C:/workspace') &&
+          args.includes('*S-1-5-93-2-2:(OI)(CI)M') &&
+          args.includes('/T') &&
+          args.includes('/C'),
+      ),
+    ).toBe(true);
+    expect(
+      calls.some(
+        (args) =>
+          args.some((arg) => arg.endsWith('icacls.exe')) &&
+          args.includes('C:/workspace/writable-app') &&
+          args.includes('*S-1-5-93-2-2:(OI)(CI)M') &&
+          args.includes('/T') &&
+          args.includes('/C'),
+      ),
+    ).toBe(true);
+  });
+
   it('records review commits and returns only the patch between revisions', async () => {
     const root = mkdtempSync(join(testTemporaryDirectory(), 'container-agent-revisions-'));
     temporaryRoots.push(root);
@@ -261,11 +476,96 @@ describe('container agent workspace seeding', () => {
       ),
     ).toBe(true);
   });
+
+  it('throws PROMOTION_ROLLBACK_INCOMPLETE when rollback fails after partial promotion', async () => {
+    const root = mkdtempSync(join(testTemporaryDirectory(), 'container-agent-rollback-'));
+    temporaryRoots.push(root);
+    const parent1 = join(root, 'parent1');
+    const parent2 = join(root, 'parent2');
+    mkdirSync(parent1);
+    mkdirSync(parent2);
+    git(parent1, ['init']);
+    git(parent1, ['config', 'user.name', 'Test']);
+    git(parent1, ['config', 'user.email', 'test@example.invalid']);
+    writeFileSync(join(parent1, 'file1.txt'), 'base1\n');
+    git(parent1, ['add', 'file1.txt']);
+    git(parent1, ['commit', '-m', 'init']);
+
+    git(parent2, ['init']);
+    git(parent2, ['config', 'user.name', 'Test']);
+    git(parent2, ['config', 'user.email', 'test@example.invalid']);
+    writeFileSync(join(parent2, 'file2.txt'), 'base2\n');
+    git(parent2, ['add', 'file2.txt']);
+    git(parent2, ['commit', '-m', 'init']);
+
+    // Prove the deterministic promotion rollback failure sequence:
+    // 1. Initial preflight validation (checkRepositoryPromotion) succeeds for every repository.
+    // 2. The first repository patch is applied (promoteRepositoryChanges succeeds for repo1).
+    // 3. A later repository promotion fails (onBeforePromote triggers on repo2).
+    // 4. Rolling back the first repository also fails (reversePatch throws).
+    // 5. promote() throws an error beginning with PROMOTION_ROLLBACK_INCOMPLETE.
+    // 6. The error identifies repo1 as having failed rollback and preserves the original repo2 promotion error.
+    const manager = new ContainerAgentManager(
+      containerConfig(),
+      join(root, 'state'),
+      new ContainerRuntime('docker', async () => ({ exitCode: 0, stdout: '', stderr: '' })),
+      {
+        onBeforePromote: async (repositoryName, appliedCount) => {
+          if (repositoryName === 'repo2' && appliedCount === 1) {
+            throw new Error('SIMULATED_PROMOTION_FAILURE_REPO2');
+          }
+        },
+        reversePatch: async () => {
+          throw new Error('SIMULATED_ROLLBACK_FAILURE_REPO1');
+        },
+      },
+    );
+
+    const resources = await manager.prepare('agt_rollback', worker(), [
+      { name: 'repo1', parentPath: parent1, containerPath: '/workspace/repo1', access: 'read-write' },
+      { name: 'repo2', parentPath: parent2, containerPath: '/workspace/repo2', access: 'read-write' },
+    ]);
+
+    const patch1 =
+      'diff --git a/file1.txt b/file1.txt\nindex b16e026..b024467 100644\n--- a/file1.txt\n+++ b/file1.txt\n@@ -1 +1 @@\n-base1\n+mod1\n';
+    const patch2 =
+      'diff --git a/file2.txt b/file2.txt\nindex 235aef2..6c498ae 100644\n--- a/file2.txt\n+++ b/file2.txt\n@@ -1 +1 @@\n-base2\n+mod2\n';
+
+    const repo1Rev = resources.repositories.get('repo1')!;
+    repo1Rev.changes = {
+      patch: patch1,
+      patchDigest: 'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+      changedPaths: ['file1.txt'],
+      additions: 1,
+      deletions: 1,
+    };
+    const repo2Rev = resources.repositories.get('repo2')!;
+    repo2Rev.changes = {
+      patch: patch2,
+      patchDigest: 'sha256:2222222222222222222222222222222222222222222222222222222222222222',
+      changedPaths: ['file2.txt'],
+      additions: 1,
+      deletions: 1,
+    };
+    resources.revision = 1;
+
+    const summaries = [
+      ['repo1', repo1Rev.changes.patchDigest],
+      ['repo2', repo2Rev.changes.patchDigest],
+    ];
+    const { createHash } = await import('node:crypto');
+    const digest = `sha256:${createHash('sha256').update(JSON.stringify(summaries)).digest('hex')}`;
+
+    await expect(manager.promote(resources.agentId, 1, digest)).rejects.toThrow(
+      /^PROMOTION_ROLLBACK_INCOMPLETE: Promotion failed and rollback could not be completed cleanly for repository: repo1: SIMULATED_ROLLBACK_FAILURE_REPO1\. Original error: SIMULATED_PROMOTION_FAILURE_REPO2/,
+    );
+  });
 });
 
 function containerConfig(): ContainerConfig {
   return {
     command: 'docker',
+    platform: 'linux',
     context: 'default',
     image: 'local-engineer/worker:test',
     base_image: 'node:24-bookworm-slim',
@@ -278,6 +578,20 @@ function containerConfig(): ContainerConfig {
       read_only_domains: [],
       allow_private_model_endpoint: false,
     },
+  };
+}
+
+function windowsContainerConfig(): ContainerConfig {
+  return {
+    ...containerConfig(),
+    platform: 'windows',
+    context: 'desktop-windows',
+    image: 'local-engineer/worker:windows',
+    base_image: 'mcr.microsoft.com/windows/servercore:ltsc2025',
+    workspace_path: 'C:/workspace',
+    worker_user: 'ContainerUser',
+    windows_memory_limit: '4g',
+    windows_cpu_count: 2,
   };
 }
 

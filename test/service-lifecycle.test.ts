@@ -284,6 +284,27 @@ describe('agent lifecycle history', () => {
       retained_history_run_ids: [first.runId, promoted.runId],
     });
   });
+
+  it('deletes an agent even when restoring the container agent throws (dead/stopped container)', async () => {
+    const stateDirectory = mkdtempSync(join(testTemporaryDirectory(), 'service-delete-dead-'));
+    const store = new RunStore(stateDirectory);
+    const engine = new LocalEngineer(config(stateDirectory), store, 'owner_test');
+    const failedRun = run('run_stopped', 'failed', 0);
+    store.add(failedRun);
+
+    Object.defineProperty(engine, 'restoreContainerAgent', {
+      value: async () => {
+        throw new Error('CONTAINER_PROXY_ADDRESS_CHANGED');
+      },
+    });
+
+    const deleted = await engine.deleteAgent(failedRun.agentId);
+    expect(deleted).toMatchObject({
+      agent_id: failedRun.agentId,
+      deleted: true,
+      resources_removed: true,
+    });
+  });
 });
 
 function run(runId: string, status: Run['status'], continuationIndex: number): Run {
@@ -333,6 +354,7 @@ function config(stateDirectory: string): Config {
     },
     container: {
       command: 'docker',
+      platform: 'linux',
       image: 'local-engineer/worker:test',
       base_image: 'node:24-bookworm-slim',
       codex_version: '0.144.6',

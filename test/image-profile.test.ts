@@ -76,6 +76,25 @@ describe('project image profiles', () => {
     await expect(manager.build(plan, plan.plan_digest)).rejects.toThrow('IMAGE_PLAN_UNSUPPORTED');
   });
 
+  it('fails closed instead of building Linux profiles in Windows mode', async () => {
+    const root = project();
+    const plan = new ImageProfileManager(config(root, []), join(root, '.linux-state')).plan(root, 'project-tools');
+    const windowsConfig = config(root, []);
+    windowsConfig.container = {
+      ...windowsConfig.container,
+      platform: 'windows',
+      image: 'local-engineer/codex-worker-windows:0.144.6',
+      base_image: 'mcr.microsoft.com/windows/servercore:ltsc2025',
+      workspace_path: 'C:/workspace',
+      worker_user: 'ContainerUser',
+    };
+    const manager = new ImageProfileManager(windowsConfig, join(root, '.state'));
+
+    expect(() => manager.plan(root, 'project-tools')).toThrow('IMAGE_PROFILE_WINDOWS_UNSUPPORTED');
+    expect(() => manager.resolve(root, 'project-tools')).toThrow('IMAGE_PROFILE_WINDOWS_UNSUPPORTED');
+    await expect(manager.build(plan, plan.plan_digest)).rejects.toThrow('IMAGE_PROFILE_WINDOWS_UNSUPPORTED');
+  });
+
   it('discovers one direct child project deterministically when the workspace root has no manifest', () => {
     const root = mkdtempSync(join(testTemporaryDirectory(), 'nested-profile-'));
     const frontend = join(root, 'frontend');
@@ -177,6 +196,7 @@ function config(root: string, allowedDomains: string[]): Config {
     },
     container: {
       command: 'docker',
+      platform: 'linux',
       image: 'local-engineer/codex-worker:0.144.6',
       base_image: 'node:24-bookworm-slim',
       codex_version: '0.144.6',

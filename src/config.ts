@@ -55,6 +55,7 @@ const workerSchema = z
 const containerSchema = z
   .object({
     command: z.string().trim().min(1),
+    platform: z.enum(['linux', 'windows']).default('linux'),
     context: z
       .string()
       .trim()
@@ -81,10 +82,17 @@ const containerSchema = z
       .default('0.144.6'),
     workspace_path: z
       .string()
-      .regex(/^\/[^\0]*$/)
+      .refine((value) => isSafeWorkspaceMountPath(value), {
+        message: 'Container workspace path must be absolute for the selected platform',
+      })
       .default('/workspace'),
     worker_user: z.string().trim().min(1).default('codex'),
     codex_command: z.string().trim().min(1).default('codex'),
+    windows_memory_limit: z
+      .string()
+      .regex(/^[1-9][0-9]*(?:[kKmMgG])?[bB]?$/)
+      .default('4g'),
+    windows_cpu_count: z.number().int().positive().max(64).default(2),
     network: z
       .object({
         model_domains: z.array(networkDomainSchema).min(1),
@@ -93,7 +101,30 @@ const containerSchema = z
       })
       .strict(),
   })
-  .strict();
+  .strict()
+  .superRefine((container, context) => {
+    const windowsPath = /^[A-Za-z]:[\\/]/.test(container.workspace_path);
+    if (container.platform === 'windows') {
+      if (!windowsPath)
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['workspace_path'],
+          message: 'Windows workspace path required',
+        });
+      if (container.worker_user.toLowerCase() !== 'containeruser')
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['worker_user'],
+          message: 'Windows workers must use ContainerUser',
+        });
+    } else if (windowsPath) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['workspace_path'],
+        message: 'Linux workspace path required',
+      });
+    }
+  });
 const workspaceSchema = z
   .object({
     name: z.string().regex(/^[a-z0-9-]+$/),
@@ -184,6 +215,12 @@ export function loadConfig(path = configPath()): Config {
       'PIP_CERT',
       'BUNDLE_SSL_CA_CERT',
       'NPM_CONFIG_CAFILE',
+      'LOCAL_ENGINEER_DEPENDENCY_ROOT',
+      'PIP_CACHE_DIR',
+      'NPM_CONFIG_CACHE',
+      'YARN_CACHE_FOLDER',
+      'CARGO_HOME',
+      'RUSTUP_HOME',
     ]);
     if (
       [...Object.keys(worker.environment ?? {}), ...worker.environment_from_host].some((name) =>
@@ -249,6 +286,14 @@ function isPrivateModelHost(host: string): boolean {
     (first === 172 && second >= 16 && second <= 31) ||
     (first === 192 && second === 168)
   );
+}
+
+function isSafeWorkspaceMountPath(value: string): boolean {
+  const normalized = value.replaceAll('\\', '/');
+  if (!normalized || /[\r\n\0,]/.test(normalized) || normalized.split('/').includes('..')) return false;
+  if (/^\/(?!$)/.test(normalized)) return true;
+  if (!/^[A-Za-z]:\/.+/.test(normalized)) return false;
+  return !/[<>:"|?*]/.test(normalized.slice(3));
 }
 export function defaultWorker(config: Config): Worker {
   return config.workers.find((w) => w.name === config.default_worker) ?? config.workers.find((w) => w.enabled)!;

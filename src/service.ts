@@ -16,9 +16,27 @@ import { CodexAppServer, type ContainerAppServerWorker } from './codex.js';
 import { ContainerAgentManager } from './container-agent.js';
 import type { RepositoryAccess, RunRepository } from './domain.js';
 import { ImageProfileManager, type ImagePlan } from './image-profile.js';
+import { joinContainerPath } from './container-platform.js';
+
+/**
+ * Local Engineer MCP Service Layer
+ *
+ * Core orchestrator implementing the Model Context Protocol (MCP) tool endpoints:
+ * - State machine management: tracks and persists task runs in SQLite (RunStore) across
+ *   `queued`, `starting`, `running`, `ready_for_review`, `promoted`, `rejected`, and `cancelled`.
+ * - Worker queue & concurrency control: enforces global and per-worker concurrency limits.
+ * - Non-blocking asynchronous waiting: clean timeout management and event listener unregistration.
+ * - Review & promotion protocol: extracts clean unified diffs, verifies patch digests and parent
+ *   index integrity before atomic promotion.
+ * - Resource reclamation: tears down container agents, deletes volume allocations, and stops adapters.
+ */
 
 const handle = (prefix: string) => `${prefix}_${randomBytes(12).toString('base64url')}`;
 const now = () => new Date().toISOString();
+
+/**
+ * Primary MCP service implementation coordinating agent runs, reviews, diffs, and promotion.
+ */
 export class LocalEngineer {
   private readonly adapters = new Map<string, CodexAppServer>();
   private readonly containerManager: ContainerAgentManager;
@@ -36,6 +54,10 @@ export class LocalEngineer {
     this.containerManager = new ContainerAgentManager(config.container, config.server.state_dir);
     this.imageProfileManager = new ImageProfileManager(config, config.server.state_dir);
   }
+
+  /**
+   * Schedules a new task run in a disposable container agent workspace.
+   */
   start(input: {
     title: string;
     task: string;
@@ -87,6 +109,10 @@ export class LocalEngineer {
     this.queue(run.runId, timeout);
     return safe(run);
   }
+  /**
+   * Dispatches a follow-up prompt to an existing settled container agent,
+   * reusing its existing thread session and workspace container state.
+   */
   async reply(input: {
     agentId: string;
     title: string;
@@ -171,6 +197,10 @@ export class LocalEngineer {
       .slice(0, Math.min(filter.limit ?? 20, 100))
       .map(safe);
   }
+
+  /**
+   * Requests cancellation of a queued or running task run, interrupting active turns.
+   */
   async cancel(runId: string): Promise<SafeRun> {
     const run = this.requireRunCapability(runId);
     if (['failed', 'cancelled', 'timed_out', 'promoted', 'rejected', 'superseded'].includes(run.status))
@@ -212,6 +242,10 @@ export class LocalEngineer {
       recommended_agents_md: plan.recommended_agents_md,
     };
   }
+  /**
+   * Non-blocking wait for one or multiple runs to reach a settled state
+   * (ready_for_review, failed, timed_out, cancelled), cleaning up event listeners on timeout.
+   */
   async wait(
     runIds: string[],
     waitFor: 'all' | 'any',
@@ -228,7 +262,6 @@ export class LocalEngineer {
     const done = () => (waitFor === 'all' ? settled().length === runIds.length : settled().length > 0);
     if (!done())
       await new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, timeout * 1000);
         const handler = () => {
           if (done()) {
             clearTimeout(timer);
@@ -236,6 +269,10 @@ export class LocalEngineer {
             resolve();
           }
         };
+        const timer = setTimeout(() => {
+          this.store.off('change', handler);
+          resolve();
+        }, timeout * 1000);
         this.store.on('change', handler);
       });
     const all = runIds.map((id) => this.requireRunCapability(id));
@@ -245,6 +282,11 @@ export class LocalEngineer {
       pending: await Promise.all(all.filter((r) => !isSettled(r.status)).map((run) => this.waitProjection(run))),
     };
   }
+
+  /**
+   * Retrieves the high-level change set (changed files, additions, deletions, patch digest)
+   * for an agent that has reached ready_for_review.
+   */
   getChanges(agentId: string): {
     schema_version: 1;
     agent_id: string;
@@ -264,6 +306,11 @@ export class LocalEngineer {
     this.recordParentDelivery(run.runId, 'changes', response);
     return response;
   }
+
+  /**
+   * Retrieves a focused unified git diff for a repository revision:
+   * Supports `since_last_check` incremental pagination or `full` diffs.
+   */
   async getDiff(
     agentId: string,
     repository: string,
@@ -306,6 +353,10 @@ export class LocalEngineer {
     this.recordParentDelivery(run.runId, 'diff', response);
     return response;
   }
+
+  /**
+   * Retrieves the contents of an individual file within the container agent workspace.
+   */
   async getFile(agentId: string, repository: string, path: string, maximumBytes = 20000) {
     const run = this.requireAgentCapability(agentId);
     if (run.status !== 'ready_for_review') throw new Error('AGENT_NOT_READY_FOR_REVIEW');
@@ -320,6 +371,12 @@ export class LocalEngineer {
     this.recordParentDelivery(run.runId, 'file', response);
     return response;
   }
+
+  /**
+   * Promotes the reviewed container change set into the host repository:
+   * Validates matching revision and patch digest, confirms pristine working tree,
+   * and atomically applies the changes.
+   */
   async keepChanges(agentId: string, revision: number, digest: string): Promise<SafeRun> {
     const run = this.requireAgentCapability(agentId);
     if (run.status !== 'ready_for_review' || !run.changeSet) throw new Error('AGENT_NOT_READY_FOR_REVIEW');
@@ -331,6 +388,11 @@ export class LocalEngineer {
       }),
     );
   }
+
+  /**
+   * Deletes an agent, releasing all Docker containers, networks, volumes,
+   * active adapter child processes, and discarding any unpromoted changes.
+   */
   async deleteAgent(agentId: string): Promise<{
     schema_version: 1;
     agent_id: string;
@@ -345,9 +407,13 @@ export class LocalEngineer {
     // A fresh STDIO process has no in-memory container registry. Rehydrate the
     // exact retained resources before cleanup so deletion works after a Codex
     // or MCP restart instead of merely removing the local state record.
-    await this.restoreContainerAgent(this.requireAgentCapability(agentId));
+    await this.restoreContainerAgent(this.requireAgentCapability(agentId)).catch(() => undefined);
     await this.containerManager.delete(agentId);
-    this.adapters.delete(agentId);
+    const adapter = this.adapters.get(agentId);
+    if (adapter) {
+      await adapter.stop().catch(() => undefined);
+      this.adapters.delete(agentId);
+    }
     for (const key of this.diffCheckpoints.keys()) if (key.startsWith(`${agentId}\0`)) this.diffCheckpoints.delete(key);
     const deletedAt = now();
     const discardedRunIds: string[] = [];
@@ -385,6 +451,17 @@ export class LocalEngineer {
       retained_history_run_ids: retainedHistoryRunIds,
       history_retained: true,
     };
+  }
+
+  /**
+   * Gracefully shuts down all active Codex adapters and closes SQLite connections.
+   */
+  async close(): Promise<void> {
+    for (const adapter of this.adapters.values()) {
+      await adapter.stop().catch(() => undefined);
+    }
+    this.adapters.clear();
+    this.store.close();
   }
   private queue(runId: string, timeoutSeconds: number): void {
     const run = this.requireRunCapability(runId);
@@ -720,7 +797,7 @@ export class LocalEngineer {
         {
           name,
           parentPath,
-          containerPath: `${this.config.container.workspace_path}/${name}`,
+          containerPath: joinContainerPath(this.config.container.platform, this.config.container.workspace_path, name),
           access: accessOverrides[name] ?? 'read-write',
         },
       ];
@@ -735,7 +812,11 @@ export class LocalEngineer {
     return workspace.repositories.map((repository) => ({
       name: repository.name,
       parentPath: canonicalWorkspace(repository.path, this.config),
-      containerPath: `${this.config.container.workspace_path}/${repository.name}`,
+      containerPath: joinContainerPath(
+        this.config.container.platform,
+        this.config.container.workspace_path,
+        repository.name,
+      ),
       access: accessOverrides[repository.name] ?? repository.default_access,
     }));
   }
@@ -753,12 +834,19 @@ export class LocalEngineer {
     // Legacy/in-memory test runs have no retained container state. Real
     // container-backed runs always persist repositories before review.
     if (!run.repositories?.length) return;
-    await this.containerManager.recover({
-      agentId: run.agentId,
-      image: run.imageReference ?? this.config.container.image,
-      repositories: run.repositories,
-      changeSet: run.changeSet,
-    });
+    try {
+      await this.containerManager.recover({
+        agentId: run.agentId,
+        image: run.imageReference ?? this.config.container.image,
+        repositories: run.repositories,
+        changeSet: run.changeSet,
+      });
+    } catch (cause) {
+      if (cause instanceof Error && cause.message === 'CONTAINER_AGENT_RETAINED_STATE_NOT_FOUND') {
+        return;
+      }
+      throw cause;
+    }
   }
   private worker(name?: string): Worker {
     const worker = name ? this.config.workers.find((w) => w.name === name && w.enabled) : defaultWorker(this.config);

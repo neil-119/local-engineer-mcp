@@ -72,10 +72,16 @@ export class ImageProfileManager {
     private readonly stateDirectory: string,
     runtime?: ContainerRuntime,
   ) {
-    this.runtime = runtime ?? new ContainerRuntime(config.container.command, undefined, config.container.context);
+    this.runtime =
+      runtime ??
+      new ContainerRuntime(config.container.command, undefined, config.container.context, config.container.platform, {
+        memoryLimit: config.container.windows_memory_limit ?? '4g',
+        cpuCount: config.container.windows_cpu_count ?? 2,
+      });
   }
 
   plan(workingDirectory: string, profile: string, additionalDomains: string[] = []): ImagePlan {
+    if (this.config.container.platform === 'windows') throw new Error('IMAGE_PROFILE_WINDOWS_UNSUPPORTED');
     validateProfile(profile);
     for (const domain of additionalDomains) validateDomain(domain);
     const detected: ImagePlan['detected'] = {};
@@ -204,6 +210,7 @@ export class ImageProfileManager {
   }
 
   async build(plan: ImagePlan, expectedPlanDigest: string): Promise<ImageProfileRecord> {
+    if (this.config.container.platform === 'windows') throw new Error('IMAGE_PROFILE_WINDOWS_UNSUPPORTED');
     if (!plan.supported)
       throw new ImageProfileError('IMAGE_PLAN_UNSUPPORTED', {
         error_code: 'IMAGE_PLAN_UNSUPPORTED',
@@ -273,6 +280,7 @@ export class ImageProfileManager {
   }
 
   resolve(workingDirectory: string, profile: string): ImageProfileRecord {
+    if (this.config.container.platform === 'windows') throw new Error('IMAGE_PROFILE_WINDOWS_UNSUPPORTED');
     validateProfile(profile);
     const path = this.recordPath(workingDirectory, profile);
     if (!existsSync(path))

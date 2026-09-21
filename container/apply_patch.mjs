@@ -1,27 +1,71 @@
-import { existsSync, lstatSync, readFileSync, writeFileSync } from 'node:fs';
+/**
+ * In-Container Structured Patch Application Helper
+ *
+ * Replays structured patch formats emitted by LLM workers within the container:
+ * - Parses `*** Begin Patch` blocks, chunk headers, context lines, insertions, and deletions.
+ * - Supports dry-run validation via `--check`.
+ * - Handles string escapes (`\n`) for CLI invocations and stdin pipes.
+ * - Prevents directory traversal attacks via `safePath` boundary checks.
+ */
+
+import { existsSync, lstatSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { resolve, relative, isAbsolute, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 
 const args = process.argv.slice(2);
-const checkOnly = args.length === 1 && args[0] === '--check';
-if ((!checkOnly && args.length !== 0) || args.length > 1) fail('usage: apply_patch [--check] < structured-patch', 64);
+const checkOnly = args[0] === '--check' || args.includes('--check');
+const positional = args.filter((arg) => arg !== '--check');
+if (positional.length > 1) fail('usage: apply_patch [--check] [patch-file | patch-content | < structured-patch]', 64);
+
+let rawPatch;
+if (positional.length === 1) {
+  const arg = positional[0];
+  if (arg.trim().startsWith('*** Begin Patch')) {
+    rawPatch = arg;
+  } else if (existsSync(arg)) {
+    try {
+      rawPatch = readFileSync(arg, 'utf8');
+    } catch {
+      fail(`unable to read patch file: ${arg}`, 64);
+    }
+  } else {
+    fail(`patch file not found: ${arg}`, 64);
+  }
+} else {
+  if (process.stdin.isTTY) {
+    fail('usage: apply_patch [--check] [patch-file | patch-content | < structured-patch]', 64);
+  }
+  try {
+    rawPatch = readFileSync(0, 'utf8');
+  } catch {
+    fail('usage: apply_patch [--check] [patch-file | patch-content | < structured-patch]', 64);
+  }
+}
 
 const worktree = spawnSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' });
 if (worktree.status !== 0) fail('apply_patch must run inside a Git worktree', 65);
-const root = resolve(worktree.stdout.trim());
-const patch = readFileSync(0, 'utf8').replace(/^\uFEFF/, '');
+const nativeRealpath = realpathSync.native ?? realpathSync;
+const root = nativeRealpath(resolve(worktree.stdout.trim()));
+let patch = rawPatch.replace(/^\uFEFF/, '');
+if (!patch.includes('\n') && patch.includes('\\n')) {
+  patch = patch.replace(/\\r\\n/g, '\n').replace(/\\n/g, '\n');
+}
 const operations = parsePatch(patch);
 
 const planned = new Map();
 for (const operation of operations) {
   const target = safePath(root, operation.path);
+  const existing = lstatSync(target, { throwIfNoEntry: false });
   if (operation.kind === 'add') {
-    if (existsSync(target)) fail(`cannot add ${operation.path}: file already exists`);
+    if (existing) {
+      if (existing.isSymbolicLink()) fail(`refusing to overwrite symbolic link: ${operation.path}`);
+      fail(`cannot add ${operation.path}: file already exists`);
+    }
     planned.set(target, { content: operation.lines.join('\n') + (operation.lines.length ? '\n' : ''), remove: false });
     continue;
   }
-  if (!existsSync(target)) fail(`cannot ${operation.kind} ${operation.path}: file does not exist`);
-  if (lstatSync(target).isSymbolicLink()) fail(`refusing to modify symbolic link: ${operation.path}`);
+  if (!existing) fail(`cannot ${operation.kind} ${operation.path}: file does not exist`);
+  if (existing.isSymbolicLink()) fail(`refusing to modify symbolic link: ${operation.path}`);
   const source = planned.get(target)?.content ?? readFileSync(target, 'utf8');
   if (operation.kind === 'delete') {
     planned.set(target, { remove: true });
@@ -33,8 +77,11 @@ for (const operation of operations) {
 if (!checkOnly) {
   for (const [target, change] of planned) {
     if (change.remove) {
-      const remove = spawnSync('rm', ['--', target]);
-      if (remove.status !== 0) fail(`unable to delete ${relative(root, target)}`);
+      try {
+        rmSync(target, { force: true });
+      } catch {
+        fail(`unable to delete ${relative(root, target)}`);
+      }
     } else {
       writeFileSync(target, change.content, 'utf8');
     }
@@ -116,12 +163,31 @@ function findExact(lines, expected, start) {
 }
 
 function safePath(root, requested) {
-  if (!requested || isAbsolute(requested) || requested.includes('\\')) fail(`invalid relative path: ${requested}`);
+  if (!requested || isAbsolute(requested) || requested.includes('\\') || requested.includes(':')) {
+    fail(`invalid relative path: ${requested}`);
+  }
   const target = resolve(root, requested);
-  if (relative(root, target).startsWith('..') || relative(root, target) === '' || target.includes('/.git/')) {
+  const relativeTarget = relative(root, target);
+  if (
+    relativeTarget === '..' ||
+    relativeTarget.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`) ||
+    isAbsolute(relativeTarget) ||
+    relativeTarget === '' ||
+    /(?:^|[\\/])(?:\.git|git~\d+)(?:[\\/]|$)/i.test(relativeTarget)
+  ) {
     fail(`path escapes worktree: ${requested}`);
   }
   if (!existsSync(dirname(target))) fail(`parent directory does not exist: ${dirname(requested)}`);
+  const actualParent = nativeRealpath(dirname(target));
+  const relativeParent = relative(root, actualParent);
+  if (
+    relativeParent === '..' ||
+    relativeParent.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`) ||
+    isAbsolute(relativeParent) ||
+    /(?:^|[\\/])(?:\.git|git~\d+)(?:[\\/]|$)/i.test(relativeParent)
+  ) {
+    fail(`path escapes worktree through symbolic link: ${requested}`);
+  }
   return target;
 }
 

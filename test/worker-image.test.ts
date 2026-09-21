@@ -32,6 +32,34 @@ describe('shared worker image contract', () => {
     expect(dockerfile).toContain('COPY rust-path.sh /etc/profile.d/local-engineer-rust.sh');
   });
 
+  it('builds the Windows image from verified inputs and defaults to ContainerUser', () => {
+    const dockerfile = readContainerFile('worker.windows.Dockerfile');
+
+    expect(dockerfile).toContain('ARG BASE_IMAGE=mcr.microsoft.com/windows/servercore:ltsc2025');
+    expect(dockerfile).toContain('ARG NODE_SHA256=');
+    expect(dockerfile).toContain('ARG RUSTUP_SHA256=');
+    expect(dockerfile).toContain('ARG RUST_TOOLCHAIN_VERSION=1.98.1');
+    expect(dockerfile).toContain('ARG GIT_SHA256=');
+    expect(dockerfile).toContain('ARG CODEX_SOURCE_SHA256=');
+    expect(dockerfile).toContain('Codex source archive checksum mismatch');
+    expect(dockerfile).toContain("$env:RUSTUP_TOOLCHAIN = 'stable'");
+    expect(dockerfile).toContain('Get-AuthenticodeSignature C:\\vs_BuildTools.exe');
+    expect(dockerfile).toContain('COPY configure-worker-network.ps1');
+    expect(dockerfile).toContain('USER ContainerUser');
+    expect(dockerfile).not.toContain('node:24-windowsservercore');
+  });
+
+  it('makes Windows worker egress deny-by-default with only a proxy host route', () => {
+    const network = readContainerFile('configure-worker-network.ps1');
+
+    expect(network).toContain("'ADD', $ProxyAddress, 'MASK', '255.255.255.255'");
+    expect(network).toContain("'DELETE', $subnet.Destination, 'MASK', $subnet.Mask");
+    expect(network).toContain("'delete', 'route', '0.0.0.0/0'");
+    expect(network).toContain("'delete', 'route', 'fe80::/64'");
+    expect(network).toContain("'delete', 'route', 'ff00::/8'");
+    expect(network).toContain("Write-Output 'LOCAL_ENGINEER_NETWORK_OK'");
+  });
+
   it('tells workers to use the provided helper, not an unavailable host tool', () => {
     expect(DEFAULT_WORKER_POLICY).toContain('`apply_patch` command');
     expect(DEFAULT_WORKER_POLICY).toContain('`*** Begin Patch`');

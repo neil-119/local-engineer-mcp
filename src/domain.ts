@@ -20,6 +20,7 @@ export type RunStatus =
   | 'superseded'
   | 'recovery_required';
 export type RepositoryAccess = 'read-only' | 'read-write';
+export type ContainerPlatform = 'linux' | 'windows';
 export interface ContainerNetworkConfig {
   /** Exact model endpoint hosts reachable only through the fixed-target relay. */
   model_domains: string[];
@@ -29,6 +30,7 @@ export interface ContainerNetworkConfig {
 }
 export interface ContainerConfig {
   command: string;
+  platform: ContainerPlatform;
   /** Optional Docker-compatible CLI context (for example Rancher Desktop's default Moby context). */
   context?: string;
   /** Reserved /16 from which Local Engineer allocates isolated per-agent /24 networks. */
@@ -40,6 +42,9 @@ export interface ContainerConfig {
   workspace_path: string;
   worker_user: string;
   codex_command: string;
+  /** Mandatory resource ceilings for every Hyper-V isolated Windows container. */
+  windows_memory_limit?: string;
+  windows_cpu_count?: number;
   network: ContainerNetworkConfig;
 }
 export interface ContainerModelProvider {

@@ -6,11 +6,16 @@ import { join } from 'node:path';
 
 const relayEnabled = process.env.LOCAL_ENGINEER_MODEL_RELAY_ENABLED !== 'false';
 const upstream = relayEnabled ? new URL(requiredEnvironment('LOCAL_ENGINEER_MODEL_UPSTREAM')) : undefined;
-const proxyHome = process.env.CODEX_HOME ?? '/home/codex/.codex';
-const sharedDirectory = '/proxy-shared';
+const windows = process.platform === 'win32';
+const proxyHome = process.env.CODEX_HOME ?? (windows ? 'C:/local-engineer/codex-home' : '/home/codex/.codex');
+const sharedDirectory =
+  process.env.LOCAL_ENGINEER_PROXY_SHARED ?? (windows ? 'C:/local-engineer/proxy-shared' : '/proxy-shared');
+const proxyExecutable =
+  process.env.LOCAL_ENGINEER_PROXY_EXECUTABLE ??
+  (windows ? 'C:/local-engineer/codex-network-proxy.exe' : '/usr/local/bin/codex-network-proxy');
 const relayPort = 8090;
 
-const proxy = spawn('/usr/local/bin/codex-network-proxy', [], {
+const proxy = spawn(proxyExecutable, [], {
   env: process.env,
   stdio: 'inherit',
 });

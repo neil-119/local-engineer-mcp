@@ -336,6 +336,11 @@ async function main(): Promise<void> {
       config.container.command,
       undefined,
       config.container.context,
+      config.container.platform,
+      {
+        memoryLimit: config.container.windows_memory_limit ?? '4g',
+        cpuCount: config.container.windows_cpu_count ?? 2,
+      },
     ).probe(config.container.image);
     console.log(
       JSON.stringify(
@@ -358,10 +363,24 @@ async function main(): Promise<void> {
       const index = arguments_.indexOf(name);
       return index >= 0 ? arguments_[index + 1] : undefined;
     };
-    const bundledDockerfile = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'container', 'worker.Dockerfile');
+    const bundledDockerfile = resolve(
+      dirname(fileURLToPath(import.meta.url)),
+      '..',
+      'container',
+      config.container.platform === 'windows' ? 'worker.windows.Dockerfile' : 'worker.Dockerfile',
+    );
     const dockerfile = option('--dockerfile') ?? config.container.dockerfile ?? bundledDockerfile;
     if (!existsSync(dockerfile)) throw new Error('CONTAINER_DOCKERFILE_NOT_FOUND');
-    const runtime = new ContainerRuntime(config.container.command, undefined, config.container.context);
+    const runtime = new ContainerRuntime(
+      config.container.command,
+      undefined,
+      config.container.context,
+      config.container.platform,
+      {
+        memoryLimit: config.container.windows_memory_limit ?? '4g',
+        cpuCount: config.container.windows_cpu_count ?? 2,
+      },
+    );
     await runtime.buildImage({
       dockerfile,
       context: resolve(dirname(dockerfile)),
