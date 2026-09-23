@@ -45,6 +45,9 @@ describe('shared worker image contract', () => {
     expect(dockerfile).toContain("$env:RUSTUP_TOOLCHAIN = 'stable'");
     expect(dockerfile).toContain('Get-AuthenticodeSignature C:\\vs_BuildTools.exe');
     expect(dockerfile).toContain('COPY configure-worker-network.ps1');
+    expect(dockerfile).toContain(
+      "& 'C:\\npm\\node_modules\\@openai\\codex\\node_modules\\@openai\\codex-win32-x64\\vendor\\x86_64-pc-windows-msvc\\bin\\codex.exe' --version",
+    );
     expect(dockerfile).toContain('USER ContainerUser');
     expect(dockerfile).not.toContain('node:24-windowsservercore');
   });

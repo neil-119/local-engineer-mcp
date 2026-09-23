@@ -301,10 +301,15 @@ export function createServer(engine: LocalEngineer): McpServer {
       agent_id: z.string(),
       expected_revision: z.number().int().positive(),
       expected_digest: z.string().regex(/^sha256:[0-9a-f]{64}$/),
+      allow_stale_dependencies: z.boolean().optional().default(false),
     },
     async (input) => {
       try {
-        return asText(await engine.keepChanges(input.agent_id, input.expected_revision, input.expected_digest));
+        return asText(
+          await engine.keepChanges(input.agent_id, input.expected_revision, input.expected_digest, {
+            allowStaleDependencies: input.allow_stale_dependencies,
+          }),
+        );
       } catch (cause) {
         return error(cause);
       }

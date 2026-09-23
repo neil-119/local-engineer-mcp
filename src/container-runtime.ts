@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { createReadStream, statSync, type Stats } from 'node:fs';
 import { isIP } from 'node:net';
-import { basename, posix } from 'node:path';
+import { basename, normalize, posix } from 'node:path';
 import { isAbsoluteContainerPath } from './container-platform.js';
 import type { ContainerPlatform } from './domain.js';
 import { streamDirectoryToTar } from './tar-stream.js';
@@ -407,6 +407,26 @@ export class ContainerRuntime {
     return this.run(['stop', '--time', String(timeoutSeconds), name]);
   }
 
+  async isContainerRunning(name: string): Promise<boolean> {
+    validateResourceName(name);
+    const result = await this.run(['container', 'inspect', '--format', '{{.State.Running}}', name]);
+    const trimmed = result.stdout.trim().toLowerCase();
+    if (trimmed !== 'true' && trimmed !== 'false') {
+      throw new Error(`CONTAINER_STATE_INVALID:${name}:${boundedEnd(trimmed, 100)}`);
+    }
+    return trimmed === 'true';
+  }
+
+  pauseContainer(name: string): Promise<RuntimeCommandResult> {
+    validateResourceName(name);
+    return this.run(['pause', name]);
+  }
+
+  unpauseContainer(name: string): Promise<RuntimeCommandResult> {
+    validateResourceName(name);
+    return this.run(['unpause', name]);
+  }
+
   containerLogs(name: string, tail = 100): Promise<RuntimeCommandResult> {
     validateResourceName(name);
     if (!Number.isInteger(tail) || tail < 1 || tail > 1000) throw new Error('CONTAINER_LOG_TAIL_INVALID');
@@ -474,7 +494,7 @@ export class ContainerRuntime {
         ['node', '--eval', "require('node:fs').mkdirSync(process.argv[1],{recursive:true})", targetDir],
         { user: 'ContainerAdministrator' },
       );
-      return new Promise<RuntimeCommandResult>((resolve, reject) => {
+      const result = await new Promise<RuntimeCommandResult>((resolve, reject) => {
         const contextArguments = this.context ? ['--context', this.context] : [];
         const containerTar = spawn(
           this.executable,
@@ -528,6 +548,7 @@ export class ContainerRuntime {
           reject(new Error(`CONTAINER_RUNTIME_TAR_FAILED:${err.message}`));
         });
       });
+      return result;
     }
 
     const script =
@@ -776,6 +797,72 @@ export class ContainerRuntime {
     for (const name of names) validateResourceName(name);
     return names;
   }
+
+  /**
+   * Constructs and validates a structured Docker `--mount type=bind,...` argument.
+   */
+  buildBindMount(options: BindMountOptions): string {
+    return buildStructuredBindMount(options);
+  }
+}
+
+export interface BindMountOptions {
+  source: string;
+  target: string;
+  readOnly?: boolean;
+  permittedSourceRoots?: string[];
+}
+
+function hasControlCharacters(value: string): boolean {
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if ((code >= 0 && code <= 31) || code === 127) return true;
+  }
+  return false;
+}
+
+export function buildStructuredBindMount(options: BindMountOptions): string {
+  const { source, target, readOnly, permittedSourceRoots } = options;
+  if (!source || !target) throw new Error('CONTAINER_BIND_MOUNT_INVALID:empty_path');
+  if (hasControlCharacters(source) || hasControlCharacters(target)) {
+    throw new Error('CONTAINER_BIND_MOUNT_INVALID:control_characters');
+  }
+  if (source.includes(',') || target.includes(',')) {
+    throw new Error('CONTAINER_BIND_MOUNT_INVALID:comma_not_supported');
+  }
+  if (/^(?:\\\\|\/\/)/.test(source) || /^(?:\\\\|\/\/)/.test(target)) {
+    throw new Error('CONTAINER_BIND_MOUNT_INVALID:unc_path');
+  }
+  if (/^[\\/]{2,}\.?[\\/]/.test(source) || /^[\\/]{2,}\.?[\\/]/.test(target)) {
+    throw new Error('CONTAINER_BIND_MOUNT_INVALID:device_path');
+  }
+  if (source.slice(2).includes(':') || target.slice(2).includes(':')) {
+    throw new Error('CONTAINER_BIND_MOUNT_INVALID:alternate_data_stream');
+  }
+  if (!/^[cC]:[\\/]/.test(source) || !/^[cC]:[\\/]/.test(target)) {
+    throw new Error('CONTAINER_BIND_MOUNT_INVALID:unsupported_drive');
+  }
+  const normalizedSource = normalize(source).replace(/\\/g, '/');
+  const normalizedTarget = normalize(target).replace(/\\/g, '/');
+  if (
+    normalizedSource.includes('/../') ||
+    normalizedSource.endsWith('/..') ||
+    normalizedTarget.includes('/../') ||
+    normalizedTarget.endsWith('/..')
+  ) {
+    throw new Error('CONTAINER_BIND_MOUNT_INVALID:traversal');
+  }
+  if (permittedSourceRoots && permittedSourceRoots.length > 0) {
+    const allowed = permittedSourceRoots.some((root) => {
+      const normRoot = normalize(root).replace(/\\/g, '/').replace(/\/+$/, '');
+      return (
+        normalizedSource.toLowerCase() === normRoot.toLowerCase() ||
+        normalizedSource.toLowerCase().startsWith(`${normRoot.toLowerCase()}/`)
+      );
+    });
+    if (!allowed) throw new Error(`CONTAINER_BIND_MOUNT_SOURCE_UNPERMITTED:${source}`);
+  }
+  return `type=bind,src=${normalizedSource},dst=${normalizedTarget}${readOnly ? ',readonly' : ''}`;
 }
 
 export function executeRuntimeCommand(
@@ -934,6 +1021,8 @@ function runtimeErrorSummary(cause: unknown, executable: string): string {
 function isNetworkPoolOverlap(cause: unknown): boolean {
   return (
     cause instanceof Error &&
-    /pool overlaps with other one|overlaps with other one on this address space/i.test(cause.message)
+    /pool overlaps with other one|overlaps with other one on this address space|hnsCallRawResponse:.*(?:object already exists|0x1392)/i.test(
+      cause.message,
+    )
   );
 }

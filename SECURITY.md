@@ -11,7 +11,9 @@ Security in Local Engineer does not rely on model obedience or prompt-based guar
 Local Engineer enforces five core security invariants:
 
 1. **No Ambient Host Credential Exposure**: Containers never receive the host Docker socket (`docker.sock` / named pipe), SSH agents, host `HOME` or `USERPROFILE`, browser cookies, or parent MCP credentials. A worker can receive only environment variables explicitly allowed by configuration; this can include a model-provider API key when the operator chooses to expose one.
-2. **Zero Direct Host Mounts**: Host Git repositories are **never bind-mounted** into worker containers. Repositories are copied into private, ephemeral Docker named volumes.
+2. **Zero Direct Parent Repository Mounts**: The user's active host Git repository is **never mounted directly** into any worker container. Depending on workspace mode:
+   - In `volume-copy` mode, repositories are copied into private, ephemeral Docker named volumes (`le-<suffix>-repo-...`).
+   - In `isolated-bind` mode, an immutable baseline clone is kept offline under private agent state, a disposable working clone is bind-mounted read/write, and verified dependency directories (`node_modules`) are bind-mounted read-only over the working clone. The parent repository working tree is never exposed to the worker container.
 3. **No Direct Egress**: The worker container cannot route traffic directly to the Internet, local area networks (LANs), or cloud metadata endpoints (`169.254.169.254`). All outbound traffic must pass through a policy proxy sidecar.
 4. **Least-Privilege Container Identity**: Untrusted code executes exclusively as an unprivileged user (`ContainerUser` on Windows, non-root `codex` on Linux). Initial filesystem provisioning runs in a short-lived setup container destroyed before the worker boots, while trusted control-plane operations running inside the live worker container (initial network routing configuration and post-run read-only repository integrity checks) execute as `ContainerAdministrator` under strictly enforced safe working directories and fully qualified system paths.
 5. **Independently Verified Promotion**: Code written by a local worker reaches the parent repository only through an exact, cryptographic Git patch revision that the parent supervisor explicitly reviews and promotes.
@@ -29,7 +31,7 @@ Local Engineer supports both Linux and Windows container runtimes with platform-
 | **Resource Limits** | `--pids-limit 512`<br>`--tmpfs /tmp:rw,nosuid,nodev,size=1g` | **Hyper-V Partition Ceilings**<br>`--cpu-count 2` and `--memory 4g` enforced directly by the Hyper-V hypervisor. |
 | **Capability Dropping** | `--cap-drop ALL`<br>`--security-opt no-new-privileges` | Windows NT security descriptor model with unprivileged token. |
 | **User Identity** | Unprivileged `codex` (`1000:1000`) | **`ContainerUser` (`*S-1-5-93-2-2`)**<br>Verified at runtime via `whoami /groups` to confirm non-membership in `BUILTIN\Administrators` (`S-1-5-32-544`). |
-| **Root Filesystem** | `--read-only` (ephemeral tmpfs for `/tmp`) | Windows container writable layer. Critical installed tooling is protected from `ContainerUser` by NTFS ACLs and checked by `doctor`; workspace and state use named volumes. |
+| **Root Filesystem** | `--read-only` (ephemeral tmpfs for `/tmp`) | Windows container writable layer. Critical installed tooling is protected from `ContainerUser` by NTFS ACLs and checked by `doctor`; workspace and state use named volumes (in `volume-copy` mode) or disposable working clone bind mounts (in `isolated-bind` mode). |
 
 > [!IMPORTANT]
 > **Hyper-V Kernel Boundary**: Hyper-V isolation gives Windows workers a stronger kernel boundary than process-isolated Windows containers. It does not make escape impossible: Docker Desktop, Hyper-V, the host OS, and their vulnerability/patch state remain trusted parts of the boundary.
@@ -111,23 +113,38 @@ All outbound communication from the worker must pass through the proxy sidecar:
 
 ### Setup Container vs. Worker Container Separation
 
-1. **Volume Seeding**: Short-lived setup containers mount empty named volumes, copy private host Git snapshots, overlay ignored dependency data, and initialize configuration and caches.
-2. **Administrative Lockdown**: The setup container sets file system ownership and strict permissions:
-   - On Linux: `chown -R 1000:1000 /workspace` and `0:0` on read-only repositories.
-   - On Windows: applies NTFS security descriptors to writable directories, provisions dedicated repository named volumes, and configures read-only repositories.
+1. **Volume Seeding & Baseline Initialization**: In `volume-copy` mode, short-lived setup containers mount empty named volumes, copy private host Git snapshots, overlay ignored dependency data, and initialize configuration and caches. In `isolated-bind` mode, repositories are prepared offline on the host without volume copying: an immutable baseline clone and a disposable working clone are initialized in agent state, while setup containers seed only configuration and cache volumes.
+2. **Administrative Lockdown**: In `volume-copy` mode, the setup container sets filesystem ownership and strict permissions: on Linux `chown -R 1000:1000 /workspace` and `0:0` on read-only repositories; on Windows applies NTFS security descriptors to writable directories, provisions dedicated repository named volumes, and configures read-only repositories. In `isolated-bind` mode, NTFS ACLs are applied to the disposable working clone on the host prior to container execution.
 3. **Setup Container Destruction & Live Worker Execution**: The setup container is deleted before the worker container runs. However, administrative work does not occur exclusively in disposable setup containers: trusted control-plane operations also run as `ContainerAdministrator` inside the live worker container for initial network routing configuration and post-run read-only integrity checks. Because privileged commands execute inside the live worker container, working directory lockdown and binary path qualification are strictly enforced.
 
-### Windows Filesystem Security: Volume Mounts and NTFS ACLs
+### Windows Filesystem Security: Workspace Modes and NTFS ACLs
 
+Local Engineer supports two workspace architectures on Windows:
+
+#### Mode 1: `volume-copy` (Legacy Named-Volume Mode)
 - **Dedicated Repository Named Volumes**:
-  On Windows, each repository is allocated an independent Docker named volume (`le-<suffix>-repo-<slug>-<hash>`). This volume separation allows Docker to enforce volume mount flags individually per repository.
+  Each repository is allocated an independent Docker named volume (`le-<suffix>-repo-<slug>-<hash>`).
 - **Read-Only Repositories (Docker `,readonly` Volume Mounts)**:
-  Windows named-volume mount semantics do not reliably enforce in-container NTFS ACL modifications at the volume root. Therefore, Local Engineer enforces read-only repositories using Docker's native read-only volume mount:
+  Enforced using Docker's native read-only volume mount:
   ```cmd
   --mount "type=volume,src=le-<suffix>-repo-<name>-<hash>,dst=C:/workspace/<name>,readonly"
   ```
-  This is enforced at the Hyper-V VHD / filesystem driver level. In addition, `ContainerAgentManager.assertWindowsRepositoryMounts()` executes a write probe (`.local-engineer-read-only-probe-*`) as `ContainerUser` immediately after container launch and fails closed if the write is not rejected (`EACCES`, `EPERM`, or `EROFS`).
+  Enforced at the Hyper-V VHD / filesystem driver level. In addition, `ContainerAgentManager.assertWindowsRepositoryMounts()` executes a write probe (`.local-engineer-read-only-probe-*`) as `ContainerUser` immediately after container launch and fails closed if the write is not rejected (`EACCES`, `EPERM`, or `EROFS`).
   After the worker turn completes, `ContainerAgentManager.capture()` verifies repository integrity using `git status --porcelain=v1` as `ContainerAdministrator` to ensure no changes were introduced.
+
+#### Mode 2: `isolated-bind` (Fast, Hardened Clone & Bind Mode)
+- **Three-Tier Filesystem Architecture**:
+  1. **Immutable Baseline Clone**: A standalone `git clone --no-hardlinks` maintained on the host under the agent's private state directory. It is never mounted into any container.
+  2. **Disposable Working Clone**: Cloned from the baseline via `git clone --no-hardlinks` and bind-mounted read/write into the Hyper-V worker container at a mirrored drive `C:` path (e.g., `C:/repos/<name>`). The host checkout is never mounted.
+  3. **Read-Only Dependency Mounts**: Discovered dependency directories (`node_modules`) are validated on the host and bind-mounted `,readonly` over the working clone.
+- **Host Escape Prevention & Reparse-Point Hardening**:
+  - **Worker Freeze During Review**: `ContainerAgentManager.capture()` inspects the worker container's running state (`isContainerRunning`). On Windows, where Hyper-V Utility VMs do not support `docker pause` (returning `0x32`), running containers are strictly stopped via `stopContainer()` and verified stopped (`isContainerRunning === false`) before host Git inspection, eliminating TOCTOU races where untrusted worker code might alter junctions or files mid-diff. If stopping fails or the container remains running, `capture()` fails closed immediately with `CONTAINER_STOP_FAILED`. On Linux, running containers are strictly paused via `pauseContainer()` before host inspection; if pausing fails, `capture()` fails closed immediately. If the container was already verified stopped, execution is already completely frozen. Once host inspection completes and review commits are recorded in the immutable baseline Git object store, `unpauseContainer()` safely unfreezes the worker if it was paused on Linux.
+  - **Recursive Reparse-Point Rejection**: Before host Git touches the working clone, `assertNoReparsePoints()` recursively inspects the entire directory tree. Any symbolic link, junction, or unreadable directory/file fails closed immediately with `CONTAINER_PATCH_INVALID:reparse_point_detected` or `unreadable_directory`/`unreadable_path`.
+  - **Immutable Git Object Database `getFile`**: File retrieval via `getFile()` extracts content directly from the immutable review commit object in the host Git object database using `git cat-file -p` (verifying `blob` type via `cat-file -t`) against `baselineGitDir` in `isolated-bind` mode (and in-container `git cat-file` in `volume-copy` mode). The host never reads working clone files directly from the filesystem during review, ensuring that post-capture mutations or directory tampering cannot alter file contents returned to the supervisor.
+  - **Permitted Source Root Confinement**: `ContainerRuntime.buildBindMount()` strictly verifies that every bind mount source path originates within authorized directories (`agentState/workspaces` for working clones; parent repository roots for dependency mounts).
+- **Stale Dependency Manifest Enforcement**:
+  Modifying dependency manifests (`package.json`, `pnpm-lock.yaml`, `yarn.lock`, etc.) marks the change set with `dependency_manifest_stale: true`. Stale status is persisted in `dependency-manifest-stale.json` and verified during agent recovery against tampering. Promotion via `keepChanges()` fails closed with `PROMOTION_DEPENDENCY_MANIFEST_STALE` unless the operator explicitly passes `allow_stale_dependencies: true`.
+
 - **Workspace Root & Writable Repositories**:
   ```cmd
   icacls.exe C:\workspace /grant:r *S-1-5-93-2-2:(OI)(CI)M /T /C
@@ -205,5 +222,19 @@ The probe verifies:
 - Windows does not use Docker's read-only-root option here. The container has a writable sandbox layer; installed Local Engineer tooling is protected with NTFS ACLs and verified by the capability probe.
 - The proxy sidecar is trusted. A vulnerability that compromises it could reach its egress network, although it has no workspace volume.
 - The configured model endpoint receives task prompts, tool output, and repository content needed for the task. Treat it as trusted for that data.
-- Ignored files inside selected repositories are copied into the worker. Keep secrets outside selected repositories.
+- In `volume-copy` mode, ignored files inside selected repositories are copied into the worker volume. In `isolated-bind` mode, ignored dependency trees (`node_modules`) are excluded from the baseline and mounted read-only, while other ignored files (like `.env`) are excluded from Git tracking in the baseline clone. Regardless of mode, operators should keep secrets outside selected repositories.
 - Explicitly allowed environment variables are exposed to untrusted worker code. Use narrowly scoped, short-lived credentials where possible.
+
+---
+
+## 9. Multi-Process Concurrency, Leases, and Fencing
+
+When multiple Local Engineer processes share the same host state directory:
+
+1. **Process Isolation & Mutual Exclusion**: Each Local Engineer server instance operates under a distinct, ephemeral `ownerId`. Live server instances cannot claim an active run whose owner lease remains valid.
+2. **Lease-Based Liveness & Heartbeats**: Active runs and in-flight agent operations are leased for a bounded duration (`leaseExpiresAt`, 30 seconds default). A live server issues periodic heartbeats inside SQLite transactions (`BEGIN IMMEDIATE`). When a server process terminates or crashes, heartbeats cease.
+3. **Cleanup-Before-Release Recovery**: `reconcileStaleRuns()` moves an expired worker-backed run to `recovery_required` and increments its `fenceToken` inside an immediate transaction. That state continues to consume global and worker concurrency capacity. The adopting server awaits adapter shutdown and container-agent cleanup before changing the run to `failed` or `cancelled`; only then is capacity released. A cleanup error remains `recovery_required`, sets `requiresUserAction`, records a bounded diagnostic, and continues blocking capacity. An expired queued run has no worker resources and can be cancelled directly.
+4. **Transactional Event Fencing**: Worker raw-event capture, completed-message insertion, token accounting, and activity updates are fence-validated under one `BEGIN IMMEDIATE` transaction. Reconciliation cannot interleave with that check, so a stale event writes none of those artifacts. SQLite writes are atomic; raw-event and metadata files written during ingestion are not part of the SQLite transaction and cannot be rolled back with it.
+5. **Agent Operation Claims**: Reply, promotion, and deletion first claim the latest agent run inside an immediate transaction. A claim assigns the new owner, increments the fencing token, and durably names the operation before retained-container recovery, host promotion, or deletion begins. Competing processes fail before those external side effects. Failure or lease expiry after a claim moves the run to `recovery_required` with explicit user action. All further operation claims, including deletion, are rejected while a settled operation remains ambiguous: lease expiry does not prove the previous external side effect has stopped.
+6. **Split-Brain Fencing**: Reclamation and operation claims increment a monotonic `fenceToken`. Mutations from a delayed, paused, or revived process using an obsolete token are rejected. Recovery state also requires an explicit token, and ordinary mutation of terminal states remains forbidden.
+7. **Cancellable Startup Attempt Boundaries**: Startup attempts validate attempt validity at every asynchronous step (`probe`, `prepare`, `update`, `adapter`, session start). If an attempt times out or is cancelled, any late-resolving container preparation immediately triggers container cleanup (`cleanup(agentId)`), preventing orphaned containers and unhandled background promise rejections.

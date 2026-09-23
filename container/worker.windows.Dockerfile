@@ -93,7 +93,7 @@ ENV CODEX_HOME=C:\local-engineer\codex-home `
 RUN python --version; `
     node --version; `
     git --version; `
-    codex --version; `
+    & 'C:\npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe' --version; `
     rustc --version; `
     $toolRoots = @('C:\local-engineer','C:\npm','C:\Rust','C:\Node','C:\Python','C:\MinGit','C:\BuildTools','C:\src'); `
     foreach ($toolRoot in $toolRoots) { `

@@ -319,9 +319,15 @@ function assertNoNestedRepository(root: string, path: string): void {
   }
 }
 
-function git(cwd: string, arguments_: string[], input?: string): Promise<string> {
+export function git(cwd: string, arguments_: string[], input?: string, env?: Record<string, string>): Promise<string> {
   return new Promise((resolvePromise, reject) => {
-    const child = spawn('git', arguments_, { cwd, stdio: 'pipe', windowsHide: true, shell: false });
+    const child = spawn('git', arguments_, {
+      cwd,
+      stdio: 'pipe',
+      windowsHide: true,
+      shell: false,
+      env: env ? { ...process.env, ...env } : process.env,
+    });
     child.stdin.on('error', () => undefined);
     let stdout = '';
     let stderr = '';

@@ -108,6 +108,35 @@ describe('container runtime adapter', () => {
     expect(calls.filter((call) => call.includes('--subnet') && call.includes(fallback.egress))).toHaveLength(1);
   });
 
+  it('treats the Windows HNS object-exists response as a retryable subnet collision', async () => {
+    const calls: string[][] = [];
+    const preferred = agentNetworkSubnetCandidates('agt_hns_collision', '10.240.0.0/16')[0]!;
+    const fallback = agentNetworkSubnetCandidates('agt_hns_collision', '10.240.0.0/16')[1]!;
+    const runtime = new ContainerRuntime('docker', async (_executable, arguments_) => {
+      calls.push([...arguments_]);
+      const subnet = arguments_[arguments_.indexOf('--subnet') + 1];
+      if (arguments_.includes('network') && arguments_.includes('create') && subnet === preferred.internal)
+        return {
+          exitCode: 1,
+          stdout: '',
+          stderr:
+            'Error response from daemon: failed during hnsCallRawResponse: hnsCall failed in Win32: The object already exists. (0x1392)',
+        };
+      return { exitCode: 0, stdout: '', stderr: '' };
+    });
+
+    await expect(
+      runtime.createNetworkPair({
+        internalName: 'le-hns-collision-internal',
+        egressName: 'le-hns-collision-egress',
+        labels: { 'local-engineer.agent-id': 'agt_hns_collision', 'local-engineer.managed': 'true' },
+        candidates: [preferred, fallback],
+      }),
+    ).resolves.toEqual(fallback);
+    expect(calls.filter((call) => call.includes('--subnet') && call.includes(fallback.internal))).toHaveLength(1);
+    expect(calls.filter((call) => call.includes('--subnet') && call.includes(fallback.egress))).toHaveLength(1);
+  });
+
   it('permits only the narrowly scoped setup capability', async () => {
     const calls: string[][] = [];
     const runtime = new ContainerRuntime('docker', async (_executable, arguments_) => {
@@ -471,5 +500,76 @@ describe('container runtime adapter', () => {
       await runtime.execContainer('test-container', ['git', 'status'], { user });
       expect(calls[0]).not.toContain('--workdir');
     }
+  });
+
+  it('fails closed on pause/unpause command failures and passes arguments correctly', async () => {
+    const executed: string[][] = [];
+    const runtime = new ContainerRuntime(
+      'docker',
+      async (_exe, args) => {
+        executed.push([...args]);
+        return { exitCode: 0, stdout: 'ok', stderr: '' };
+      },
+      undefined,
+      'windows',
+    );
+
+    const pauseResult = await runtime.pauseContainer('test-container');
+    expect(pauseResult.exitCode).toBe(0);
+    expect(executed).toEqual([['pause', 'test-container']]);
+
+    const unpauseResult = await runtime.unpauseContainer('test-container');
+    expect(unpauseResult.exitCode).toBe(0);
+    expect(executed).toEqual([
+      ['pause', 'test-container'],
+      ['unpause', 'test-container'],
+    ]);
+
+    // Windows & Linux: failure fails closed (throws)
+    for (const platform of ['windows', 'linux'] as const) {
+      const failRuntime = new ContainerRuntime(
+        'docker',
+        async () => ({ exitCode: 1, stdout: '', stderr: 'daemon down or pause unsupported' }),
+        undefined,
+        platform,
+      );
+      await expect(failRuntime.pauseContainer('test-container')).rejects.toThrow('CONTAINER_RUNTIME_COMMAND_FAILED');
+      await expect(failRuntime.unpauseContainer('test-container')).rejects.toThrow('CONTAINER_RUNTIME_COMMAND_FAILED');
+    }
+
+    // Invalid resource name fails closed
+    expect(() => runtime.pauseContainer('bad/name')).toThrow('CONTAINER_RESOURCE_NAME_INVALID');
+    expect(() => runtime.unpauseContainer('bad/name')).toThrow('CONTAINER_RESOURCE_NAME_INVALID');
+  });
+
+  it('checks container running state and validates resource name', async () => {
+    const executed: string[][] = [];
+    const runtime = new ContainerRuntime(
+      'docker',
+      async (_exe, args) => {
+        executed.push([...args]);
+        if (args.at(-1) === 'running-c') return { exitCode: 0, stdout: 'true\n', stderr: '' };
+        if (args.at(-1) === 'stopped-c') return { exitCode: 0, stdout: 'false\n', stderr: '' };
+        if (args.at(-1) === 'malformed-c') return { exitCode: 0, stdout: 'unknown\n', stderr: '' };
+        if (args.at(-1) === 'empty-c') return { exitCode: 0, stdout: '   \n', stderr: '' };
+        return { exitCode: 0, stdout: 'false\n', stderr: '' };
+      },
+      undefined,
+      'windows',
+    );
+
+    expect(await runtime.isContainerRunning('running-c')).toBe(true);
+    expect(await runtime.isContainerRunning('stopped-c')).toBe(false);
+    await expect(runtime.isContainerRunning('malformed-c')).rejects.toThrow(
+      'CONTAINER_STATE_INVALID:malformed-c:unknown',
+    );
+    await expect(runtime.isContainerRunning('empty-c')).rejects.toThrow('CONTAINER_STATE_INVALID:empty-c:');
+    expect(executed).toEqual([
+      ['container', 'inspect', '--format', '{{.State.Running}}', 'running-c'],
+      ['container', 'inspect', '--format', '{{.State.Running}}', 'stopped-c'],
+      ['container', 'inspect', '--format', '{{.State.Running}}', 'malformed-c'],
+      ['container', 'inspect', '--format', '{{.State.Running}}', 'empty-c'],
+    ]);
+    await expect(runtime.isContainerRunning('bad/name')).rejects.toThrow('CONTAINER_RESOURCE_NAME_INVALID');
   });
 });

@@ -9,7 +9,7 @@
  * - Safely terminates processes (`stop()`) to release handles and prevent event loop hanging.
  */
 
-import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
+import { type ChildProcess, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 
 export type Rpc = {
@@ -53,7 +53,7 @@ export const appServerInheritedEnvironmentNames = [
  * Manages a stateful connection to the Codex app server running inside the container.
  */
 export class CodexAppServer {
-  private process?: ChildProcessWithoutNullStreams;
+  private process?: ChildProcess;
   private nextId = 1;
   private pending = new Map<
     number | string,
@@ -79,25 +79,41 @@ export class CodexAppServer {
     const environment: NodeJS.ProcessEnv = {};
     for (const name of appServerInheritedEnvironmentNames) if (process.env[name]) environment[name] = process.env[name];
     Object.assign(environment, this.worker.environment);
-    this.process = spawn(this.worker.command, this.worker.args, {
+    const child = spawn(this.worker.command, this.worker.args, {
       env: environment,
       stdio: 'pipe',
       windowsHide: true,
     });
-    this.process.stdin.on('error', () => undefined);
-    this.process.stderr.on('data', (data) =>
+    this.setupProcess(child);
+    await this.request('initialize', {
+      clientInfo: { name: 'local-engineer-mcp', version: '0.1.0' },
+      capabilities: {},
+    });
+    this.notify('initialized', {});
+  }
+
+  setupProcess(child: ChildProcess): void {
+    this.process = child;
+    child.stdin?.on('error', () => undefined);
+    child.stderr?.on('data', (data: Buffer | string) =>
       this.onEvent({ jsonrpc: '2.0', method: 'stderr', params: { text: String(data) } }),
     );
-    this.process.on('exit', (code) => {
+    child.on('exit', (code: number | null) => {
       const error = new Error(`CODEX_APP_SERVER_EXIT:${code ?? 'unknown'}`);
       for (const pending of this.pending.values()) pending.reject(error);
       this.pending.clear();
       this.failActiveTurns(error);
       this.process = undefined;
     });
-    this.process.on('error', (cause) => this.failActiveTurns(new Error(`CODEX_APP_SERVER_ERROR:${cause.message}`)));
+    child.on('error', (cause: Error) => {
+      const error = new Error(`CODEX_APP_SERVER_ERROR:${cause.message}`);
+      for (const pending of this.pending.values()) pending.reject(error);
+      this.pending.clear();
+      this.failActiveTurns(error);
+      this.process = undefined;
+    });
     let buffer = '';
-    this.process.stdout.on('data', (chunk: Buffer) => {
+    child.stdout?.on('data', (chunk: Buffer) => {
       buffer += chunk.toString('utf8');
       let index;
       while ((index = buffer.indexOf('\n')) >= 0) {
@@ -110,11 +126,6 @@ export class CodexAppServer {
         }
       }
     });
-    await this.request('initialize', {
-      clientInfo: { name: 'local-engineer-mcp', version: '0.1.0' },
-      capabilities: {},
-    });
-    this.notify('initialized', {});
   }
 
   private receive(message: Rpc): void {
@@ -177,14 +188,35 @@ export class CodexAppServer {
   }
 
   private write(value: Rpc): void {
-    if (!this.process?.stdin.writable) throw new Error('CODEX_APP_SERVER_UNAVAILABLE');
-    this.process.stdin.write(JSON.stringify(value) + '\n');
+    const stdin = this.process?.stdin;
+    if (!stdin?.writable) throw new Error('CODEX_APP_SERVER_UNAVAILABLE');
+    stdin.write(JSON.stringify(value) + '\n');
   }
 
-  private request(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+  private request(
+    method: string,
+    params: Record<string, unknown>,
+    timeoutMs = 45_000,
+  ): Promise<Record<string, unknown>> {
     const id = this.nextId++;
     this.write({ jsonrpc: '2.0', id, method, params });
-    return new Promise((resolve, reject) => this.pending.set(id, { resolve, reject }));
+    return new Promise((resolve, reject) => {
+      let timer: NodeJS.Timeout | undefined = setTimeout(() => {
+        timer = undefined;
+        this.pending.delete(id);
+        reject(new Error(`CODEX_RPC_TIMEOUT:${method}`));
+      }, timeoutMs);
+      this.pending.set(id, {
+        resolve: (value) => {
+          if (timer) clearTimeout(timer);
+          resolve(value);
+        },
+        reject: (error) => {
+          if (timer) clearTimeout(timer);
+          reject(error);
+        },
+      });
+    });
   }
 
   private notify(method: string, params: Record<string, unknown>): void {
@@ -266,9 +298,13 @@ export class CodexAppServer {
    * Shuts down the process, closes stdio streams, and terminates child processes.
    */
   async stop(): Promise<void> {
-    if (!this.process) return;
     const proc = this.process;
     this.process = undefined;
+    const error = new Error('CODEX_APP_SERVER_STOPPED');
+    for (const pending of this.pending.values()) pending.reject(error);
+    this.pending.clear();
+    this.failActiveTurns(error);
+    if (!proc) return;
     try {
       proc.stdin?.end();
     } catch {

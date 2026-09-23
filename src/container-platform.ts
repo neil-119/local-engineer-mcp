@@ -22,6 +22,7 @@ export interface ContainerLayout {
   networkScript?: string;
   keepAliveCommand: string[];
   administratorUser: string;
+  codexExecutable: string;
   gitExecutable: string;
   powershellExecutable: string;
   whoamiExecutable: string;
@@ -54,6 +55,8 @@ export function containerLayout(config: ContainerConfig): ContainerLayout {
         'while ($true) { Start-Sleep -Seconds 3600 }',
       ],
       administratorUser: 'ContainerAdministrator',
+      codexExecutable:
+        'C:/npm/node_modules/@openai/codex/node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe',
       gitExecutable: 'C:/MinGit/cmd/git.exe',
       powershellExecutable: 'C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe',
       whoamiExecutable: 'C:/Windows/System32/whoami.exe',
@@ -72,6 +75,7 @@ export function containerLayout(config: ContainerConfig): ContainerLayout {
     proxySidecar: '/usr/local/lib/local-engineer/proxy-sidecar.mjs',
     keepAliveCommand: ['sleep', 'infinity'],
     administratorUser: '0',
+    codexExecutable: '/usr/local/bin/codex',
     gitExecutable: 'git',
     powershellExecutable: 'powershell',
     whoamiExecutable: 'whoami',
@@ -87,6 +91,35 @@ export function containerLayout(config: ContainerConfig): ContainerLayout {
 export function joinContainerPath(platform: ContainerPlatform, ...parts: string[]): string {
   const joined = posix.join(...parts.map((part) => part.replaceAll('\\', '/')));
   return platform === 'windows' ? joined.replace(/^([A-Za-z]):\//, '$1:/') : joined;
+}
+
+/**
+ * Resolves the container path for a repository based on the container platform and workspace mode:
+ * - On Windows in `isolated-bind` mode, mirrors the parent repository path on C: drive so that
+ *   package managers like pnpm create valid absolute junctions.
+ * - In other configurations, places repositories under the configured `workspace_path`.
+ */
+export function resolveRepositoryContainerPath(
+  container: ContainerConfig,
+  parentPath: string,
+  repositoryName: string,
+): string {
+  if (container.platform === 'windows' && container.windows_workspace_mode === 'isolated-bind') {
+    const normalized = parentPath.replaceAll('\\', '/');
+    if (!/^[cC]:\//.test(normalized)) {
+      throw new Error(
+        `CONTAINER_BIND_UNSUPPORTED_DRIVE: Windows isolated-bind mode requires repositories on C: drive, got ${parentPath}`,
+      );
+    }
+    if (normalized.slice(2).includes(':')) {
+      throw new Error(
+        `CONTAINER_BIND_INVALID_PATH: alternate data stream not permitted in repository path: ${parentPath}`,
+      );
+    }
+    const trimmed = normalized.length > 3 ? normalized.replace(/\/+$/, '') : normalized;
+    return trimmed.charAt(0).toUpperCase() + ':' + trimmed.slice(2);
+  }
+  return joinContainerPath(container.platform, container.workspace_path, repositoryName);
 }
 
 /**

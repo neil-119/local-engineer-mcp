@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
+import { EventEmitter } from 'node:events';
+import type { ChildProcess } from 'node:child_process';
 import { appServerInheritedEnvironmentNames, CodexAppServer } from '../src/codex.js';
 
 const worker = {
@@ -135,5 +137,94 @@ describe('container Codex app-server bridge', () => {
       params: { turn: { id: 'turn-interrupted', status: 'interrupted' } },
     });
     await expect(waiting).rejects.toThrow('CODEX_TURN_FAILED:model relay error: connect EHOSTUNREACH model-host:8888');
+  });
+
+  it('times out pending JSON-RPC request when app-server does not respond within timeout', async () => {
+    const { adapter } = writableAdapter();
+    const request = (
+      adapter as unknown as {
+        request: (
+          method: string,
+          params: Record<string, unknown>,
+          timeoutMs?: number,
+        ) => Promise<Record<string, unknown>>;
+      }
+    ).request('thread/start', { cwd: '/workspace' }, 50);
+
+    await expect(request).rejects.toThrow('CODEX_RPC_TIMEOUT:thread/start');
+  });
+
+  it('rejects pending requests and active turns when stop is called', async () => {
+    const { adapter } = writableAdapter();
+    const request = (
+      adapter as unknown as {
+        request: (
+          method: string,
+          params: Record<string, unknown>,
+          timeoutMs?: number,
+        ) => Promise<Record<string, unknown>>;
+      }
+    ).request('turn/start', { threadId: 'thread-1' }, 10_000);
+
+    let rejectTurn!: (error: Error) => void;
+    const turnOutcome = new Promise<Record<string, unknown>>((_resolve, reject) => {
+      rejectTurn = reject;
+    });
+    const internals = adapter as unknown as {
+      turnDone: Map<string, Promise<Record<string, unknown>>>;
+      turnResolvers: Map<string, { resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void }>;
+    };
+    internals.turnDone.set('turn-stop-test', turnOutcome);
+    internals.turnResolvers.set('turn-stop-test', { resolve: vi.fn(), reject: rejectTurn });
+    const waitingTurn = adapter.wait('turn-stop-test');
+
+    await adapter.stop();
+
+    await expect(request).rejects.toThrow('CODEX_APP_SERVER_STOPPED');
+    await expect(waitingTurn).rejects.toThrow('CODEX_APP_SERVER_STOPPED');
+  });
+
+  it('rejects pending requests and active turns on process error event', async () => {
+    const adapter = new CodexAppServer(worker, () => undefined);
+    const mockProcess = new EventEmitter() as EventEmitter & {
+      stdin: EventEmitter & { writable: boolean; write: (value: string) => void };
+      stdout: EventEmitter;
+      stderr: EventEmitter;
+    };
+    mockProcess.stdin = Object.assign(new EventEmitter(), {
+      writable: true,
+      write: () => undefined,
+    });
+    mockProcess.stdout = new EventEmitter();
+    mockProcess.stderr = new EventEmitter();
+
+    adapter.setupProcess(mockProcess as unknown as ChildProcess);
+
+    const request = (
+      adapter as unknown as {
+        request: (
+          method: string,
+          params: Record<string, unknown>,
+          timeoutMs?: number,
+        ) => Promise<Record<string, unknown>>;
+      }
+    ).request('initialize', {}, 10_000);
+
+    let rejectTurn!: (error: Error) => void;
+    const turnOutcome = new Promise<Record<string, unknown>>((_resolve, reject) => {
+      rejectTurn = reject;
+    });
+    const internals = adapter as unknown as {
+      turnDone: Map<string, Promise<Record<string, unknown>>>;
+      turnResolvers: Map<string, { resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void }>;
+    };
+    internals.turnDone.set('turn-err-test', turnOutcome);
+    internals.turnResolvers.set('turn-err-test', { resolve: vi.fn(), reject: rejectTurn });
+    const waitingTurn = adapter.wait('turn-err-test');
+
+    mockProcess.emit('error', new Error('spawn EACCES'));
+
+    await expect(request).rejects.toThrow('CODEX_APP_SERVER_ERROR:spawn EACCES');
+    await expect(waitingTurn).rejects.toThrow('CODEX_APP_SERVER_ERROR:spawn EACCES');
   });
 });

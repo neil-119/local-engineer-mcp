@@ -179,3 +179,132 @@ describe('assistant message capture and pagination', () => {
     store.close();
   });
 });
+
+describe('stale-run reconciliation', () => {
+  it('holds expired worker runs in recovery until cleanup while terminalizing queued runs', () => {
+    const stateDirectory = mkdtempSync(join(tmpdir(), 'local-engineer-reconcile-'));
+    const store = new RunStore(stateDirectory);
+    const createRun = (runId: string, status: Run['status']): Run => ({
+      runId,
+      agentId: `agt_${runId}`,
+      ownerId: 'owner',
+      title: runId,
+      task: 'Reconciliation test',
+      workingDirectory: 'C:/work/example',
+      worker: 'codex-local',
+      status,
+      continuationIndex: 0,
+      createdAt: '2026-07-22T00:00:00.000Z',
+      leaseExpiresAt: '2020-01-01T00:00:00.000Z',
+      requiresUserAction: false,
+    });
+
+    store.add(createRun('run_starting', 'starting'));
+    store.add(createRun('run_running', 'running'));
+    store.add(createRun('run_cancelling', 'cancel_requested'));
+    store.add(createRun('run_queued', 'queued'));
+    store.add(createRun('run_reviewed', 'ready_for_review'));
+
+    const result = store.reconcileStaleRuns();
+    expect(result.reconciledCount).toBe(4);
+    expect(result.reconciledRunIds).toEqual(
+      expect.arrayContaining(['run_starting', 'run_running', 'run_cancelling', 'run_queued']),
+    );
+
+    const starting = store.get('run_starting')!;
+    expect(starting.status).toBe('recovery_required');
+    expect(starting.errorCode).toBe('SERVER_PROCESS_RESTARTED');
+    expect(starting.requiresUserAction).toBe(false);
+    expect(starting.recovery).toEqual({ kind: 'container_cleanup', targetStatus: 'failed' });
+    expect(starting.diagnostics?.commands_active_count).toBe(0);
+    expect(starting.completedAt).toBeUndefined();
+    expect(starting.diagnostics?.exit_reason).toContain('Local Engineer server restarted');
+
+    const running = store.get('run_running')!;
+    expect(running.status).toBe('recovery_required');
+    expect(running.errorCode).toBe('SERVER_PROCESS_RESTARTED');
+    expect(running.requiresUserAction).toBe(false);
+    expect(running.diagnostics?.commands_active_count).toBe(0);
+    expect(running.completedAt).toBeUndefined();
+
+    const cancelling = store.get('run_cancelling')!;
+    expect(cancelling.status).toBe('recovery_required');
+    expect(cancelling.requiresUserAction).toBe(false);
+    expect(cancelling.recovery).toEqual({ kind: 'container_cleanup', targetStatus: 'cancelled' });
+    expect(cancelling.diagnostics?.commands_active_count).toBe(0);
+    expect(cancelling.completedAt).toBeUndefined();
+    expect(cancelling.diagnostics?.exit_reason).toContain('during cancellation');
+
+    const queued = store.get('run_queued')!;
+    expect(queued.status).toBe('cancelled');
+    expect(queued.errorCode).toBe('SERVER_PROCESS_RESTARTED');
+    expect(queued.requiresUserAction).toBe(false);
+    expect(queued.diagnostics?.commands_active_count).toBe(0);
+    expect(queued.completedAt).toBeTruthy();
+    expect(queued.diagnostics?.exit_reason).toContain('while this run was queued');
+
+    const reviewed = store.get('run_reviewed')!;
+    expect(reviewed.status).toBe('ready_for_review');
+
+    // Idempotency: subsequent call reconciles nothing
+    const secondCall = store.reconcileStaleRuns();
+    expect(secondCall.reconciledCount).toBe(0);
+    expect(secondCall.reconciledRunIds).toEqual([]);
+
+    store.close();
+  });
+
+  it('preserves legacy runs without lease metadata and runs with active leases', () => {
+    const stateDirectory = mkdtempSync(join(tmpdir(), 'local-engineer-legacy-'));
+    const store = new RunStore(stateDirectory);
+
+    const legacyRun: Run = {
+      runId: 'run_legacy_running',
+      agentId: 'agt_legacy',
+      ownerId: 'owner_old',
+      title: 'Legacy running run',
+      task: 'Legacy test',
+      workingDirectory: 'C:/work/example',
+      worker: 'codex-local',
+      status: 'running',
+      continuationIndex: 0,
+      createdAt: '2026-07-22T00:00:00.000Z',
+      requiresUserAction: false,
+    };
+    store.add(legacyRun);
+
+    // Strip lease metadata to simulate a legacy pre-lease DB record
+    const rawLegacy = { ...legacyRun };
+    delete rawLegacy.leaseExpiresAt;
+    delete rawLegacy.leaseHeartbeatAt;
+    delete rawLegacy.fenceToken;
+    (store as unknown as { db: { prepare: (sql: string) => { run: (...args: unknown[]) => void } } }).db
+      .prepare('UPDATE runs SET json = ? WHERE run_id = ?')
+      .run(JSON.stringify(rawLegacy), 'run_legacy_running');
+
+    // Also add an active run whose lease is fresh
+    store.add({
+      runId: 'run_active',
+      agentId: 'agt_active',
+      ownerId: 'owner_live',
+      title: 'Active run',
+      task: 'Active test',
+      workingDirectory: 'C:/work/example',
+      worker: 'codex-local',
+      status: 'running',
+      continuationIndex: 0,
+      createdAt: new Date().toISOString(),
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+      requiresUserAction: false,
+    });
+
+    const result = store.reconcileStaleRuns();
+    expect(result.reconciledCount).toBe(0);
+    expect(result.reconciledRunIds).toEqual([]);
+
+    expect(store.get('run_legacy_running')?.status).toBe('running');
+    expect(store.get('run_active')?.status).toBe('running');
+
+    store.close();
+  });
+});

@@ -19,6 +19,16 @@ export type RunStatus =
   | 'rejected'
   | 'superseded'
   | 'recovery_required';
+export type AgentOperation = 'reply' | 'promote' | 'delete';
+export interface AgentOperationClaim {
+  operation: AgentOperation;
+  claimedAt: string;
+}
+export interface RunRecovery {
+  kind: 'container_cleanup' | 'settled_operation';
+  targetStatus?: 'failed' | 'cancelled';
+  operation?: AgentOperation;
+}
 export type RepositoryAccess = 'read-only' | 'read-write';
 export type ContainerPlatform = 'linux' | 'windows';
 export interface ContainerNetworkConfig {
@@ -45,7 +55,32 @@ export interface ContainerConfig {
   /** Mandatory resource ceilings for every Hyper-V isolated Windows container. */
   windows_memory_limit?: string;
   windows_cpu_count?: number;
+  windows_workspace_mode?: 'volume-copy' | 'isolated-bind';
   network: ContainerNetworkConfig;
+}
+export interface WindowsDependencyMount {
+  relativePath: string;
+  hostPath: string;
+  containerPath: string;
+  fingerprint: string;
+}
+export interface WindowsRepositoryMount {
+  repository: string;
+  baselineSnapshotPath: string;
+  workingClonePath: string;
+  containerPath: string;
+  access: 'read-write' | 'read-only';
+  dependencyMounts: WindowsDependencyMount[];
+}
+export interface ContainerPreparationTimings {
+  baselineCreationMs?: number;
+  workingCloneCreationMs?: number;
+  dependencyValidationMs?: number;
+  networkAllocationMs?: number;
+  setupContainerExecutionMs?: number;
+  workerStartupMs?: number;
+  appServerReadinessMs?: number;
+  totalPreparationMs?: number;
 }
 export interface ContainerModelProvider {
   base_url: string;
@@ -81,12 +116,14 @@ export interface RepositoryChangeSummary {
   delta_additions: number;
   delta_deletions: number;
   delta_patch_digest: string;
+  dependency_manifest_stale?: boolean;
 }
 export interface ContainerChangeSet {
   revision: number;
   previous_revision: number;
   digest: string;
   repositories: RepositoryChangeSummary[];
+  dependency_manifest_stale?: boolean;
 }
 export interface GroundingPacket {
   objective?: string;
@@ -190,6 +227,16 @@ export interface Run {
   agentId: string;
   /** Internal connection-scoped owner; never project this through MCP. */
   ownerId: string;
+  /** Monotonically increasing fencing token for write operations on this run. */
+  fenceToken?: number;
+  /** ISO timestamp when the current owner lease expires. */
+  leaseExpiresAt?: string;
+  /** ISO timestamp of the most recent owner heartbeat. */
+  leaseHeartbeatAt?: string;
+  /** Internal durable claim that serializes side-effecting operations for an agent. */
+  operationClaim?: AgentOperationClaim;
+  /** Internal recovery state. Container cleanup recovery consumes concurrency capacity. */
+  recovery?: RunRecovery;
   title: string;
   task: string;
   grounding?: GroundingPacket;
@@ -261,6 +308,7 @@ export interface RunDiagnostics {
   turn_completed_at?: string;
   exit_reason?: string;
   resources_deleted_at?: string;
+  recovery_error_excerpt?: string;
 }
 export interface Result {
   reportStatus: 'valid' | 'missing' | 'invalid';
@@ -276,13 +324,13 @@ export const isSettled = (status: RunStatus) => terminalStatuses.has(status as n
 export const transition = (from: RunStatus, to: RunStatus): void => {
   const allowed: Record<RunStatus, RunStatus[]> = {
     queued: ['starting', 'cancelled'],
-    starting: ['running', 'failed', 'cancel_requested', 'timed_out'],
-    running: ['ready_for_review', 'failed', 'timed_out', 'cancel_requested'],
+    starting: ['running', 'failed', 'cancel_requested', 'timed_out', 'recovery_required'],
+    running: ['ready_for_review', 'failed', 'timed_out', 'cancel_requested', 'recovery_required'],
     failed: [],
     timed_out: [],
-    cancel_requested: ['cancelled', 'failed'],
+    cancel_requested: ['cancelled', 'failed', 'recovery_required'],
     cancelled: [],
-    ready_for_review: ['queued', 'promoted', 'rejected', 'superseded', 'cancel_requested'],
+    ready_for_review: ['queued', 'promoted', 'rejected', 'superseded', 'cancel_requested', 'recovery_required'],
     promoted: [],
     rejected: [],
     superseded: [],

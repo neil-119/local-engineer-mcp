@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import {
   parentToWorkerPayload,
+  type AgentOperation,
   type Config,
   type GroundingPacket,
   type Result,
@@ -9,24 +10,25 @@ import {
   type RunStatus,
   type Worker,
 } from './domain.js';
-import { emptyResult, RunStore } from './store.js';
+import { emptyResult, RunStore, type Clock, systemClock } from './store.js';
 import { buildPrompt } from './prompt.js';
 import { canonicalWorkspace, defaultWorker } from './config.js';
 import { CodexAppServer, type ContainerAppServerWorker } from './codex.js';
 import { ContainerAgentManager } from './container-agent.js';
 import type { RepositoryAccess, RunRepository } from './domain.js';
 import { ImageProfileManager, type ImagePlan } from './image-profile.js';
-import { joinContainerPath } from './container-platform.js';
+import { resolveRepositoryContainerPath } from './container-platform.js';
 
 /**
  * Local Engineer MCP Service Layer
  *
  * Core orchestrator implementing the Model Context Protocol (MCP) tool endpoints:
  * - State machine management: tracks and persists task runs in SQLite (RunStore) across
- *   `queued`, `starting`, `running`, `ready_for_review`, `promoted`, `rejected`, and `cancelled`.
- * - Worker queue & concurrency control: enforces global and per-worker concurrency limits.
- * - Non-blocking asynchronous waiting: clean timeout management and event listener unregistration.
- * - Review & promotion protocol: extracts clean unified diffs, verifies patch digests and parent
+ *   worker lifecycles (queued -> starting -> running -> ready_for_review -> promoted/rejected).
+ * - Multi-process fencing: leases and generation tokens prevent split-brain state mutations.
+ * - Dynamic container management: coordinates isolated Hyper-V/Linux sandboxes, network routing
+ *   surgery, and setup/worker/proxy lifecycles via ContainerAgentManager.
+ * - Review and promotion: captures independent cryptographic patch revisions and verifies Git
  *   index integrity before atomic promotion.
  * - Resource reclamation: tears down container agents, deletes volume allocations, and stops adapters.
  */
@@ -45,14 +47,128 @@ export class LocalEngineer {
   private readonly commandItemStartedAt = new Map<string, Map<string, string>>();
   private readonly completedCommandItems = new Map<string, Set<string>>();
   private readonly diffCheckpoints = new Map<string, number>();
+  private readonly activeStartupAttempts = new Map<
+    string,
+    { attemptId: string; cancelled: boolean; timedOut: boolean; agentId: string; adapter?: CodexAppServer }
+  >();
+  private heartbeatTimer?: NodeJS.Timeout;
+  private maintenanceTask?: Promise<void>;
+
   constructor(
     readonly config: Config,
     readonly store: RunStore,
     /** Internal identifier for the current MCP stdio connection. */
     readonly ownerId = handle('owner'),
+    private readonly clock: Clock = systemClock,
+    private readonly leaseDurationMs = 30_000,
+    private readonly heartbeatIntervalMs = 5_000,
   ) {
     this.containerManager = new ContainerAgentManager(config.container, config.server.state_dir);
     this.imageProfileManager = new ImageProfileManager(config, config.server.state_dir);
+    this.startHeartbeat();
+    void this.runMaintenance().catch(() => undefined);
+  }
+
+  private startHeartbeat(): void {
+    if (this.heartbeatIntervalMs <= 0) return;
+    this.heartbeatTimer = setInterval(() => {
+      void this.runMaintenance().catch(() => undefined);
+    }, this.heartbeatIntervalMs);
+    if (typeof this.heartbeatTimer === 'object' && 'unref' in this.heartbeatTimer) {
+      this.heartbeatTimer.unref();
+    }
+  }
+  private runMaintenance(): Promise<void> {
+    if (this.maintenanceTask) return this.maintenanceTask;
+    const task = this.performMaintenance().finally(() => {
+      if (this.maintenanceTask === task) this.maintenanceTask = undefined;
+    });
+    this.maintenanceTask = task;
+    return task;
+  }
+  private async performMaintenance(): Promise<void> {
+    this.store.heartbeat(this.ownerId, this.leaseDurationMs);
+    const { recoveryRunIds } = this.store.reconcileStaleRuns({
+      ownerId: this.ownerId,
+      leaseDurationMs: this.leaseDurationMs,
+    });
+    for (const runId of recoveryRunIds) await this.recoverContainerCleanup(runId);
+  }
+  private async recoverContainerCleanup(runId: string): Promise<void> {
+    const run = this.store.get(runId);
+    if (
+      !run ||
+      !this.owns(run) ||
+      run.status !== 'recovery_required' ||
+      run.recovery?.kind !== 'container_cleanup' ||
+      run.requiresUserAction
+    )
+      return;
+    const failures: string[] = [];
+    const adapter = this.adapters.get(run.agentId);
+    if (adapter) {
+      try {
+        await adapter.stop();
+        this.adapters.delete(run.agentId);
+      } catch (cause) {
+        failures.push(`adapter:${safeRecoveryFailure(cause)}`);
+      }
+    }
+    try {
+      await this.containerManager.cleanup(run.agentId);
+    } catch (cause) {
+      failures.push(`container:${safeRecoveryFailure(cause)}`);
+    }
+    const current = this.store.get(runId);
+    if (
+      !current ||
+      !this.owns(current) ||
+      current.status !== 'recovery_required' ||
+      current.recovery?.kind !== 'container_cleanup' ||
+      current.fenceToken !== run.fenceToken
+    )
+      return;
+    if (failures.length > 0) {
+      this.store.update(
+        runId,
+        {
+          requiresUserAction: true,
+          errorCode: 'CONTAINER_AGENT_CLEANUP_FAILED',
+          leaseExpiresAt: undefined,
+          diagnostics: activity('recovery_required', current.diagnostics, {
+            exit_reason: 'Container-agent cleanup did not complete; concurrency remains blocked.',
+            recovery_error_excerpt: failures.join('; ').slice(0, 500),
+          }),
+        },
+        'run.recovery_failed',
+        { ownerId: this.ownerId, expectedFenceToken: current.fenceToken },
+      );
+      return;
+    }
+    const targetStatus = current.recovery.targetStatus ?? 'failed';
+    const exitReason =
+      targetStatus === 'cancelled'
+        ? 'The expired run was cancelled after its container resources were removed.'
+        : 'The expired run failed and its container resources were removed.';
+    this.store.setStatus(
+      runId,
+      targetStatus,
+      {
+        completedAt: now(),
+        recovery: undefined,
+        requiresUserAction: false,
+        diagnostics: activity(targetStatus, current.diagnostics, {
+          commands_active_count: 0,
+          exit_reason: exitReason,
+        }),
+        result: current.result ?? {
+          ...emptyResult(),
+          summary: exitReason,
+          unresolvedRisks: [],
+        },
+      },
+      { ownerId: this.ownerId, expectedFenceToken: current.fenceToken },
+    );
   }
 
   /**
@@ -85,10 +201,14 @@ export class LocalEngineer {
       : undefined;
     const timeout = this.timeout(input.timeoutSeconds, worker);
     const agentId = handle('agt');
+    const nowIso = now();
     const run: Run = {
       runId: handle('run'),
       agentId,
       ownerId: this.ownerId,
+      fenceToken: 1,
+      leaseHeartbeatAt: this.clock.now().toISOString(),
+      leaseExpiresAt: new Date(this.clock.now().getTime() + this.leaseDurationMs).toISOString(),
       title: input.title,
       task: input.task,
       grounding: input.grounding,
@@ -100,12 +220,12 @@ export class LocalEngineer {
       worker: worker.name,
       status: 'queued',
       continuationIndex: 0,
-      createdAt: now(),
+      createdAt: nowIso,
       diagnostics: activity('queued'),
       stats: parentToWorkerStats(input.title, input.task, input.grounding, 'assignment'),
       requiresUserAction: false,
     };
-    this.store.add(run);
+    this.store.add(run, this.leaseDurationMs);
     this.queue(run.runId, timeout);
     return safe(run);
   }
@@ -132,38 +252,61 @@ export class LocalEngineer {
           candidate.status === 'ready_for_review' || (candidate.status === 'superseded' && candidate.changeSet),
       );
     if (!prior?.workerThreadId) throw new Error('AGENT_UNAVAILABLE');
-    const worker = this.worker(prior.worker);
-    await this.restoreContainerAgent(prior);
-    const run: Run = {
-      runId: handle('run'),
-      agentId: prior.agentId,
-      ownerId: this.ownerId,
-      title: input.title,
-      task: input.message,
-      grounding: input.grounding,
-      workingDirectory: prior.workingDirectory,
-      workspaceName: prior.workspaceName,
-      repositories: prior.repositories,
-      containerWorkingDirectory: prior.containerWorkingDirectory,
-      imageProfile: prior.imageProfile,
-      imageReference: prior.imageReference,
-      worker: worker.name,
-      status: 'queued',
-      continuationIndex: latest.continuationIndex + 1,
-      continuationOfRunId: latest.runId,
-      createdAt: now(),
-      workerThreadId: prior.workerThreadId,
-      diagnostics: activity('queued'),
-      stats: parentToWorkerStats(input.title, input.message, input.grounding, 'follow_up'),
-      requiresUserAction: false,
-    };
-    this.store.add(run);
-    this.store.setStatus(prior.runId, 'superseded', {
-      completedAt: now(),
-      diagnostics: activity('superseded', prior.diagnostics, { exit_reason: 'continued_by_parent' }),
-    });
-    this.queue(run.runId, this.timeout(input.timeoutSeconds, worker));
-    return safe(run);
+    const claimed = this.store.claimAgentOperation(
+      input.agentId,
+      latest.runId,
+      ['ready_for_review', 'failed', 'timed_out', 'cancelled', 'promoted', 'rejected', 'superseded'],
+      this.ownerId,
+      'reply',
+      this.leaseDurationMs,
+    );
+    try {
+      const worker = this.worker(prior.worker);
+      await this.restoreContainerAgent(prior);
+      const nowIso = now();
+      const run: Run = {
+        runId: handle('run'),
+        agentId: prior.agentId,
+        ownerId: this.ownerId,
+        fenceToken: 1,
+        leaseHeartbeatAt: this.clock.now().toISOString(),
+        leaseExpiresAt: new Date(this.clock.now().getTime() + this.leaseDurationMs).toISOString(),
+        title: input.title,
+        task: input.message,
+        grounding: input.grounding,
+        workingDirectory: prior.workingDirectory,
+        workspaceName: prior.workspaceName,
+        repositories: prior.repositories,
+        containerWorkingDirectory: prior.containerWorkingDirectory,
+        imageProfile: prior.imageProfile,
+        imageReference: prior.imageReference,
+        worker: worker.name,
+        status: 'queued',
+        continuationIndex: latest.continuationIndex + 1,
+        continuationOfRunId: latest.runId,
+        createdAt: nowIso,
+        workerThreadId: prior.workerThreadId,
+        diagnostics: activity('queued'),
+        stats: parentToWorkerStats(input.title, input.message, input.grounding, 'follow_up'),
+        requiresUserAction: false,
+      };
+      const queued = this.store.addClaimedContinuation(
+        claimed.runId,
+        prior.runId,
+        run,
+        {
+          completedAt: nowIso,
+          diagnostics: activity('superseded', prior.diagnostics, { exit_reason: 'continued_by_parent' }),
+        },
+        { ownerId: this.ownerId, expectedFenceToken: claimed.fenceToken! },
+        this.leaseDurationMs,
+      );
+      this.queue(queued.runId, this.timeout(input.timeoutSeconds, worker));
+      return safe(queued);
+    } catch (cause) {
+      this.markClaimRecovery(claimed, 'reply', cause);
+      throw cause;
+    }
   }
   status(runIds?: string[], agentIds?: string[]): SafeRun[] {
     if (!!runIds === !!agentIds) throw new Error('STATUS_REQUIRES_EXACTLY_ONE_HANDLE_TYPE');
@@ -205,25 +348,56 @@ export class LocalEngineer {
     const run = this.requireRunCapability(runId);
     if (['failed', 'cancelled', 'timed_out', 'promoted', 'rejected', 'superseded'].includes(run.status))
       return safe(run);
-    this.store.setStatus(runId, 'cancel_requested');
-    if (run.workerThreadId && run.workerTurnId)
-      await this.adapters
-        .get(run.agentId)
-        ?.interrupt(run.workerThreadId, run.workerTurnId)
-        .catch(() => undefined);
+    if (run.status === 'recovery_required') throw new Error('RUN_RECOVERY_REQUIRED');
+    if (run.operationClaim) throw new Error('AGENT_BUSY');
+    const attempt = this.activeStartupAttempts.get(runId);
+    if (attempt) {
+      attempt.cancelled = true;
+      if (attempt.adapter) {
+        void attempt.adapter.stop().catch(() => undefined);
+        this.adapters.delete(attempt.agentId);
+      }
+    }
+    // A queued run has no active worker: skip the cancel_requested intermediate
+    // state (invalid per the domain state machine for queued) and settle directly
+    // to cancelled. For starting/running/cancel_requested runs, signal via
+    // cancel_requested first so the active worker can interrupt cleanly.
+    if (run.status !== 'queued') {
+      this.store.setStatus(
+        runId,
+        'cancel_requested',
+        {},
+        { ownerId: this.ownerId, expectedFenceToken: run.fenceToken },
+      );
+    }
+    const existingAdapter = this.adapters.get(run.agentId);
+    if (existingAdapter) {
+      if (run.workerThreadId && run.workerTurnId) {
+        await existingAdapter.interrupt(run.workerThreadId, run.workerTurnId).catch(() => undefined);
+      }
+      if (!run.workerTurnId || run.status === 'starting' || run.status === 'queued') {
+        await existingAdapter.stop().catch(() => undefined);
+        this.adapters.delete(run.agentId);
+      }
+    }
     const current = this.requireRunCapability(runId);
     this.commandItemStartedAt.delete(runId);
     this.completedCommandItems.delete(runId);
     return safe(
-      this.store.setStatus(runId, 'cancelled', {
-        completedAt: now(),
-        requiresUserAction: false,
-        result: emptyResult(),
-        diagnostics: activity('cancelled', current.diagnostics, {
-          commands_active_count: 0,
-          exit_reason: 'parent_cancelled',
-        }),
-      }),
+      this.store.setStatus(
+        runId,
+        'cancelled',
+        {
+          completedAt: now(),
+          requiresUserAction: false,
+          result: emptyResult(),
+          diagnostics: activity('cancelled', current.diagnostics, {
+            commands_active_count: 0,
+            exit_reason: 'parent_cancelled',
+          }),
+        },
+        { ownerId: this.ownerId, expectedFenceToken: current.fenceToken },
+      ),
     );
   }
   planImage(workingDirectory: string, profile: string, additionalDomains: string[] = []): ImagePlan {
@@ -377,16 +551,41 @@ export class LocalEngineer {
    * Validates matching revision and patch digest, confirms pristine working tree,
    * and atomically applies the changes.
    */
-  async keepChanges(agentId: string, revision: number, digest: string): Promise<SafeRun> {
+  async keepChanges(
+    agentId: string,
+    revision: number,
+    digest: string,
+    options?: { allowStaleDependencies?: boolean },
+  ): Promise<SafeRun> {
     const run = this.requireAgentCapability(agentId);
     if (run.status !== 'ready_for_review' || !run.changeSet) throw new Error('AGENT_NOT_READY_FOR_REVIEW');
-    await this.restoreContainerAgent(run);
-    await this.containerManager.promote(agentId, revision, digest);
-    return safe(
-      this.store.setStatus(run.runId, 'promoted', {
-        diagnostics: activity('promoted', run.diagnostics),
-      }),
+    const claimed = this.store.claimAgentOperation(
+      agentId,
+      run.runId,
+      ['ready_for_review'],
+      this.ownerId,
+      'promote',
+      this.leaseDurationMs,
     );
+    try {
+      await this.restoreContainerAgent(claimed);
+      await this.containerManager.promote(agentId, revision, digest, options);
+      return safe(
+        this.store.setStatus(
+          claimed.runId,
+          'promoted',
+          {
+            operationClaim: undefined,
+            leaseExpiresAt: undefined,
+            diagnostics: activity('promoted', claimed.diagnostics),
+          },
+          { ownerId: this.ownerId, expectedFenceToken: claimed.fenceToken },
+        ),
+      );
+    } catch (cause) {
+      this.markClaimRecovery(claimed, 'promote', cause);
+      throw cause;
+    }
   }
 
   /**
@@ -402,61 +601,74 @@ export class LocalEngineer {
     retained_history_run_ids: string[];
     history_retained: true;
   }> {
-    const run = this.requireAgentCapability(agentId);
-    if (['queued', 'starting', 'running', 'cancel_requested'].includes(run.status)) await this.cancel(run.runId);
-    // A fresh STDIO process has no in-memory container registry. Rehydrate the
-    // exact retained resources before cleanup so deletion works after a Codex
-    // or MCP restart instead of merely removing the local state record.
-    await this.restoreContainerAgent(this.requireAgentCapability(agentId)).catch(() => undefined);
-    await this.containerManager.delete(agentId);
-    const adapter = this.adapters.get(agentId);
-    if (adapter) {
-      await adapter.stop().catch(() => undefined);
-      this.adapters.delete(agentId);
+    let run = this.requireAgentCapability(agentId);
+    if (['queued', 'starting', 'running', 'cancel_requested'].includes(run.status)) {
+      await this.cancel(run.runId);
+      run = this.requireAgentCapability(agentId);
     }
-    for (const key of this.diffCheckpoints.keys()) if (key.startsWith(`${agentId}\0`)) this.diffCheckpoints.delete(key);
-    const deletedAt = now();
-    const discardedRunIds: string[] = [];
-    const retainedHistoryRunIds: string[] = [];
-    for (const candidate of this.store.getByAgent(agentId)) {
-      if (candidate.status === 'ready_for_review') {
-        this.store.setStatus(candidate.runId, 'rejected', {
-          completedAt: candidate.completedAt ?? deletedAt,
-          diagnostics: activity('deleted', candidate.diagnostics, {
-            exit_reason: 'agent_deleted',
-            resources_deleted_at: deletedAt,
-          }),
-        });
-        discardedRunIds.push(candidate.runId);
-        continue;
+    const claimable: RunStatus[] = [
+      'ready_for_review',
+      'failed',
+      'timed_out',
+      'cancelled',
+      'promoted',
+      'rejected',
+      'superseded',
+      'recovery_required',
+    ];
+    const claimed = this.store.claimAgentOperation(
+      agentId,
+      run.runId,
+      claimable,
+      this.ownerId,
+      'delete',
+      this.leaseDurationMs,
+    );
+    const history = this.store.getByAgent(agentId);
+    try {
+      // A fresh process may not have in-memory retained state. delete() also
+      // resolves deterministic names and ownership labels, so recovery failure
+      // does not prevent a direct cleanup attempt.
+      await this.restoreContainerAgent(claimed).catch(() => undefined);
+      await this.containerManager.delete(agentId);
+      const adapter = this.adapters.get(agentId);
+      if (adapter) {
+        await adapter.stop();
+        this.adapters.delete(agentId);
       }
-      this.store.update(
-        candidate.runId,
-        {
-          diagnostics: {
-            ...(candidate.diagnostics ?? activity(candidate.status)),
-            resources_deleted_at: deletedAt,
-          },
-        },
-        'run.resources_deleted',
-      );
-      retainedHistoryRunIds.push(candidate.runId);
+      for (const key of this.diffCheckpoints.keys())
+        if (key.startsWith(`${agentId}\0`)) this.diffCheckpoints.delete(key);
+      const deletedAt = now();
+      this.store.finalizeAgentDeletion(agentId, claimed.runId, deletedAt, {
+        ownerId: this.ownerId,
+        expectedFenceToken: claimed.fenceToken!,
+      });
+      return {
+        schema_version: 1,
+        agent_id: agentId,
+        deleted: true,
+        resources_removed: true,
+        discarded_run_ids: history.filter((candidate) => candidate.status === 'ready_for_review').map((r) => r.runId),
+        retained_history_run_ids: history
+          .filter((candidate) => candidate.status !== 'ready_for_review')
+          .map((r) => r.runId),
+        history_retained: true,
+      };
+    } catch (cause) {
+      this.markClaimRecovery(claimed, 'delete', cause);
+      throw cause;
     }
-    return {
-      schema_version: 1,
-      agent_id: agentId,
-      deleted: true,
-      resources_removed: true,
-      discarded_run_ids: discardedRunIds,
-      retained_history_run_ids: retainedHistoryRunIds,
-      history_retained: true,
-    };
   }
 
   /**
    * Gracefully shuts down all active Codex adapters and closes SQLite connections.
    */
   async close(): Promise<void> {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = undefined;
+    }
+    await this.maintenanceTask?.catch(() => undefined);
     for (const adapter of this.adapters.values()) {
       await adapter.stop().catch(() => undefined);
     }
@@ -471,101 +683,270 @@ export class LocalEngineer {
     void task.catch(() => undefined);
   }
   private async execute(runId: string, timeoutSeconds: number): Promise<void> {
+    await this.runMaintenance();
     let run = this.requireOwned(runId);
     if (run.status !== 'queued') return;
     const worker = this.worker(run.worker);
-    const claimed = this.store.tryStart(runId, this.config.server.max_concurrency, worker.max_concurrency, {
-      startedAt: now(),
-      diagnostics: activity('starting', run.diagnostics),
-    });
+    const claimed = this.store.tryStart(
+      runId,
+      this.config.server.max_concurrency,
+      worker.max_concurrency,
+      this.ownerId,
+      {
+        startedAt: now(),
+        diagnostics: activity('starting', run.diagnostics),
+      },
+      run.fenceToken,
+      this.leaseDurationMs,
+    );
     if (!claimed) {
       setTimeout(() => this.queue(runId, timeoutSeconds), 250);
       return;
     }
     run = claimed;
-    try {
-      if (this.requireOwned(runId).status !== 'starting') return;
-      const imageReference = run.imageReference ?? this.config.container.image;
-      const probe = await this.containerManager.probe(imageReference);
-      if (!probe.supported) {
+
+    const startupAttemptId = `${runId}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+    const attempt = {
+      attemptId: startupAttemptId,
+      cancelled: false,
+      timedOut: false,
+      agentId: run.agentId,
+      adapter: undefined as CodexAppServer | undefined,
+    };
+    this.activeStartupAttempts.set(runId, attempt);
+
+    const isAttemptValid = () => {
+      if (attempt.cancelled || attempt.timedOut) return false;
+      const current = this.store.get(runId);
+      return (
+        !!current &&
+        current.status === 'starting' &&
+        this.owns(current) &&
+        (current.fenceToken ?? 1) === (run.fenceToken ?? 1)
+      );
+    };
+
+    const assertValidAttempt = () => {
+      if (!isAttemptValid()) {
         throw new Error(
-          `CONTAINER_RUNTIME_UNAVAILABLE:${probe.errorCode ?? 'unknown'}:${probe.errorSummary ?? 'Container runtime probe failed.'}`,
+          attempt.timedOut ? 'STARTUP_TIMEOUT' : attempt.cancelled ? 'STARTUP_CANCELLED' : 'STARTUP_INVALIDATED',
         );
       }
-      const profileRepository = run.imageProfile
-        ? (run.repositories ?? []).find((repository) => repository.containerPath === run.containerWorkingDirectory)
-            ?.name
-        : undefined;
-      const containerResources = await this.containerManager.prepare(
-        run.agentId,
-        worker,
-        run.repositories ?? [],
-        imageReference,
-        profileRepository,
-      );
-      run = this.store.update(
-        runId,
-        { repositories: [...containerResources.repositories.values()].map((value) => value.runRepository) },
-        'run.container_prepared',
-      );
-      const adapter = this.adapter(
-        run.agentId,
-        this.containerManager.appServerWorker(worker, containerResources),
-        worker.name,
-      );
-      const basePrompt = buildPrompt(
-        run.title,
-        run.runId,
-        run.task,
-        run.grounding,
-        worker.worker_prompt ?? this.config.server.default_worker_prompt,
-      );
-      const prompt = `${basePrompt}\n\nContainer workspace:\n${(run.repositories ?? [])
-        .map((repository) => `- ${repository.name}: ${repository.containerPath} (${repository.access})`)
-        .join(
-          '\n',
-        )}\nThis worker is one-way: do not ask the parent questions or attempt to access parent tools. Complete the bounded task with available context, report unresolved ambiguity in the final JSON, and stop.`;
-      const workingDirectory = run.containerWorkingDirectory!;
-      let started: { threadId: string; turnId: string };
-      if (!run.workerThreadId) {
-        started = await adapter.createAndStart(workingDirectory, prompt);
-      } else {
-        try {
-          started = {
-            threadId: run.workerThreadId,
-            turnId: await adapter.continue(run.workerThreadId, workingDirectory, prompt),
-          };
-        } catch (cause) {
-          if (!isMissingRecoveredThread(cause)) throw cause;
-          this.store.appendRaw(
-            runId,
-            'stderr',
-            `${new Date().toISOString()} recovered worker thread unavailable; starting a new Codex thread in the retained container\n`,
-          );
-          started = await adapter.createAndStart(
-            workingDirectory,
-            `${prompt}\n\nRecovery context: a previous Local Engineer app-server process no longer has its in-memory thread. ` +
-              'The private container workspace already contains the prior reviewed revision. Inspect that existing work first; do not discard or recreate it. Continue only the requested correction, run the required validation, and return the structured final JSON.',
+    };
+
+    try {
+      assertValidAttempt();
+      const imageReference = run.imageReference ?? this.config.container.image;
+      const startupTimeoutMs = timeoutSeconds * 1000;
+      let timer: NodeJS.Timeout | undefined;
+
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          attempt.timedOut = true;
+          reject(new Error('STARTUP_TIMEOUT'));
+        }, startupTimeoutMs);
+      });
+
+      const innerStartup = (async () => {
+        assertValidAttempt();
+        const probe = await this.containerManager.probe(imageReference);
+        assertValidAttempt();
+        if (!probe.supported) {
+          throw new Error(
+            `CONTAINER_RUNTIME_UNAVAILABLE:${probe.errorCode ?? 'unknown'}:${probe.errorSummary ?? 'Container runtime probe failed.'}`,
           );
         }
+        const profileRepository = run.imageProfile
+          ? (run.repositories ?? []).find((repository) => repository.containerPath === run.containerWorkingDirectory)
+              ?.name
+          : undefined;
+        const containerResources = await this.containerManager.prepare(
+          run.agentId,
+          worker,
+          run.repositories ?? [],
+          imageReference,
+          profileRepository,
+        );
+
+        if (!isAttemptValid()) {
+          await this.containerManager.cleanup(run.agentId).catch(() => undefined);
+          throw new Error(
+            attempt.timedOut ? 'STARTUP_TIMEOUT' : attempt.cancelled ? 'STARTUP_CANCELLED' : 'STARTUP_INVALIDATED',
+          );
+        }
+
+        run = this.store.update(
+          runId,
+          { repositories: [...containerResources.repositories.values()].map((value) => value.runRepository) },
+          'run.container_prepared',
+          { ownerId: this.ownerId, expectedFenceToken: run.fenceToken },
+        );
+
+        if (!isAttemptValid()) {
+          await this.containerManager.cleanup(run.agentId).catch(() => undefined);
+          throw new Error(
+            attempt.timedOut ? 'STARTUP_TIMEOUT' : attempt.cancelled ? 'STARTUP_CANCELLED' : 'STARTUP_INVALIDATED',
+          );
+        }
+
+        const adapter = await this.adapter(
+          run.agentId,
+          this.containerManager.appServerWorker(worker, containerResources),
+          worker.name,
+        );
+        attempt.adapter = adapter;
+
+        if (!isAttemptValid()) {
+          await adapter.stop().catch(() => undefined);
+          this.adapters.delete(run.agentId);
+          await this.containerManager.cleanup(run.agentId).catch(() => undefined);
+          throw new Error(
+            attempt.timedOut ? 'STARTUP_TIMEOUT' : attempt.cancelled ? 'STARTUP_CANCELLED' : 'STARTUP_INVALIDATED',
+          );
+        }
+
+        const basePrompt = buildPrompt(
+          run.title,
+          run.runId,
+          run.task,
+          run.grounding,
+          worker.worker_prompt ?? this.config.server.default_worker_prompt,
+        );
+        const prompt = `${basePrompt}\n\nContainer workspace:\n${(run.repositories ?? [])
+          .map((repository) => `- ${repository.name}: ${repository.containerPath} (${repository.access})`)
+          .join(
+            '\n',
+          )}\nThis worker is one-way: do not ask the parent questions or attempt to access parent tools. Complete the bounded task with available context, report unresolved ambiguity in the final JSON, and stop.`;
+        const workingDirectory = run.containerWorkingDirectory!;
+
+        if (!isAttemptValid()) {
+          await adapter.stop().catch(() => undefined);
+          this.adapters.delete(run.agentId);
+          await this.containerManager.cleanup(run.agentId).catch(() => undefined);
+          throw new Error(
+            attempt.timedOut ? 'STARTUP_TIMEOUT' : attempt.cancelled ? 'STARTUP_CANCELLED' : 'STARTUP_INVALIDATED',
+          );
+        }
+
+        let session: { threadId: string; turnId: string };
+        if (!run.workerThreadId) {
+          session = await adapter.createAndStart(workingDirectory, prompt);
+        } else {
+          try {
+            session = {
+              threadId: run.workerThreadId,
+              turnId: await adapter.continue(run.workerThreadId, workingDirectory, prompt),
+            };
+          } catch (cause) {
+            if (!isMissingRecoveredThread(cause)) throw cause;
+            this.store.appendRaw(
+              runId,
+              'stderr',
+              `${new Date().toISOString()} recovered worker thread unavailable; starting a new Codex thread in the retained container\n`,
+            );
+            session = await adapter.createAndStart(
+              workingDirectory,
+              `${prompt}\n\nRecovery context: a previous Local Engineer app-server process no longer has its in-memory thread. ` +
+                'The private container workspace already contains the prior reviewed revision. Inspect that existing work first; do not discard or recreate it. Continue only the requested correction, run the required validation, and return the structured final JSON.',
+            );
+          }
+        }
+
+        if (!isAttemptValid()) {
+          await adapter.stop().catch(() => undefined);
+          this.adapters.delete(run.agentId);
+          await this.containerManager.cleanup(run.agentId).catch(() => undefined);
+          throw new Error(
+            attempt.timedOut ? 'STARTUP_TIMEOUT' : attempt.cancelled ? 'STARTUP_CANCELLED' : 'STARTUP_INVALIDATED',
+          );
+        }
+
+        return { adapter, session };
+      })();
+
+      innerStartup.catch(() => undefined);
+
+      let started: { adapter: CodexAppServer; session: { threadId: string; turnId: string } };
+      try {
+        started = await Promise.race([innerStartup, timeoutPromise]);
+      } catch (cause) {
+        attempt.cancelled = true;
+        if (attempt.adapter) {
+          await attempt.adapter.stop().catch(() => undefined);
+          this.adapters.delete(run.agentId);
+        }
+        throw cause;
+      } finally {
+        if (timer) clearTimeout(timer);
+        this.activeStartupAttempts.delete(runId);
       }
-      if (this.requireOwned(runId).status !== 'starting') return;
-      run = this.store.setStatus(runId, 'running', {
-        workerThreadId: started.threadId,
-        workerTurnId: started.turnId,
-        diagnostics: activity('turn_started', run.diagnostics),
+
+      const postStartup = this.store.get(runId);
+      if (!postStartup || !this.owns(postStartup) || postStartup.status !== 'starting') {
+        await started.adapter.stop().catch(() => undefined);
+        this.adapters.delete(run.agentId);
+        return;
+      }
+      run = this.store.setStatus(
+        runId,
+        'running',
+        {
+          workerThreadId: started.session.threadId,
+          workerTurnId: started.session.turnId,
+          diagnostics: activity('turn_started', run.diagnostics),
+        },
+        { ownerId: this.ownerId, expectedFenceToken: run.fenceToken },
+      );
+      const outcome = await this.waitForOutcome(
+        started.adapter,
+        runId,
+        started.session,
+        timeoutSeconds,
+        worker.idle_timeout_seconds,
+      );
+      const postOutcome = this.store.get(runId);
+      if (!postOutcome || !this.owns(postOutcome) || postOutcome.status !== 'running') {
+        await started.adapter.stop().catch(() => undefined);
+        this.adapters.delete(run.agentId);
+        return;
+      }
+      // Claim exclusive capture rights with a fenced touch before the irreversible
+      // capture() side-effect. Any concurrent fence advancement throws here so the
+      // catch block can clean up without a stale capture having been performed.
+      run = this.store.update(runId, { diagnostics: activity('capturing', postOutcome.diagnostics) }, 'run.capturing', {
+        ownerId: this.ownerId,
+        expectedFenceToken: postOutcome.fenceToken,
       });
-      const outcome = await this.waitForOutcome(adapter, runId, started, timeoutSeconds, worker.idle_timeout_seconds);
-      if (this.requireOwned(runId).status !== 'running') return;
       const result = normalize(outcome, this.config.server.final_result_max_characters_per_run);
       const changeSet = await this.containerManager.capture(run.agentId);
-      this.store.setStatus(runId, 'ready_for_review', {
-        completedAt: now(),
-        result,
-        changeSet,
-        diagnostics: activity('ready_for_review', this.requireOwned(runId).diagnostics),
-      });
+      if (this.config.container.platform === 'windows') {
+        await started.adapter.stop().catch(() => undefined);
+        this.adapters.delete(run.agentId);
+      }
+      this.store.setStatus(
+        runId,
+        'ready_for_review',
+        {
+          completedAt: now(),
+          result,
+          changeSet,
+          diagnostics: activity('ready_for_review', run.diagnostics),
+        },
+        { ownerId: this.ownerId, expectedFenceToken: run.fenceToken },
+      );
     } catch (error) {
+      this.activeStartupAttempts.delete(runId);
+      await this.adapters
+        .get(run.agentId)
+        ?.stop()
+        .catch(() => undefined);
+      this.adapters.delete(run.agentId);
+      if (
+        error instanceof Error &&
+        (error.message === 'STARTUP_CANCELLED' || error.message === 'STARTUP_INVALIDATED')
+      ) {
+        return;
+      }
       const turnFailure = codexTurnFailure(error);
       if (turnFailure) {
         const proxyDiagnostic = await this.containerManager.proxyDiagnostic(run.agentId);
@@ -577,61 +958,114 @@ export class LocalEngineer {
         'stderr',
         `${new Date().toISOString()} ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`,
       );
-      const current = this.requireOwned(runId);
-      if (current.status === 'cancelled') return;
+      const current = this.store.get(runId);
+      // If the run is gone or has already been settled by another process
+      // (cancelled, timed_out, etc.), there is nothing to update.
+      if (
+        !current ||
+        [
+          'cancelled',
+          'failed',
+          'timed_out',
+          'ready_for_review',
+          'promoted',
+          'rejected',
+          'superseded',
+          'recovery_required',
+        ].includes(current.status)
+      )
+        return;
       const timedOut = error instanceof Error && error.message === 'RUN_TIMEOUT';
+      const startupTimedOut = error instanceof Error && error.message === 'STARTUP_TIMEOUT';
       const idleTimedOut = error instanceof Error && error.message === 'RUN_IDLE_TIMEOUT';
-      const appServerExit = error instanceof Error && /^CODEX_APP_SERVER_(EXIT|ERROR)/.test(error.message);
+      const appServerExit = error instanceof Error && /^CODEX_APP_SERVER_(EXIT|ERROR|STOPPED)/.test(error.message);
+      const appServerRpcTimeout = error instanceof Error && error.message.startsWith('CODEX_RPC_TIMEOUT:');
       const runtimeUnavailable = error instanceof Error && error.message.startsWith('CONTAINER_RUNTIME_UNAVAILABLE:');
       const repositoryHeadRequired = error instanceof Error && error.message === 'REPOSITORY_HEAD_REQUIRED';
-      const harnessFailure = !timedOut && !idleTimedOut && !turnFailure && !appServerExit && !runtimeUnavailable;
-      this.store.setStatus(runId, timedOut ? 'timed_out' : 'failed', {
-        completedAt: now(),
-        errorCode: timedOut
-          ? 'RUN_TIMEOUT'
-          : idleTimedOut
-            ? 'RUN_IDLE_TIMEOUT'
-            : turnFailure
-              ? turnFailure.errorCode
-              : appServerExit
-                ? 'CODEX_APP_SERVER_EXIT'
-                : runtimeUnavailable
-                  ? 'CONTAINER_RUNTIME_UNAVAILABLE'
-                  : repositoryHeadRequired
-                    ? 'REPOSITORY_HEAD_REQUIRED'
-                    : 'HARNESS_FAILURE',
-        diagnostics: activity(
-          appServerExit ? 'app_server_exited' : timedOut ? 'timed_out' : idleTimedOut ? 'idle_timed_out' : 'failed',
-          current.diagnostics,
-          {
-            ...(turnFailure ||
-            appServerExit ||
-            idleTimedOut ||
-            runtimeUnavailable ||
-            repositoryHeadRequired ||
-            harnessFailure
-              ? {
-                  exit_reason: repositoryHeadRequired
-                    ? 'A Local Engineer repository needs at least one Git commit (a valid HEAD) before a worker can start.'
-                    : turnFailure
-                      ? turnFailure.exitReason
-                      : error instanceof Error
-                        ? safeHarnessFailureDetail(error)
-                        : String(error),
-                }
-              : {}),
-          },
-        ),
-        result: emptyResult(),
-      });
+      const harnessFailure =
+        !timedOut &&
+        !startupTimedOut &&
+        !idleTimedOut &&
+        !turnFailure &&
+        !appServerExit &&
+        !appServerRpcTimeout &&
+        !runtimeUnavailable;
+      this.store.setStatus(
+        runId,
+        timedOut ? 'timed_out' : 'failed',
+        {
+          completedAt: now(),
+          errorCode: timedOut
+            ? 'RUN_TIMEOUT'
+            : startupTimedOut
+              ? 'STARTUP_TIMEOUT'
+              : idleTimedOut
+                ? 'RUN_IDLE_TIMEOUT'
+                : turnFailure
+                  ? turnFailure.errorCode
+                  : appServerExit
+                    ? 'CODEX_APP_SERVER_EXIT'
+                    : appServerRpcTimeout
+                      ? 'CODEX_RPC_TIMEOUT'
+                      : runtimeUnavailable
+                        ? 'CONTAINER_RUNTIME_UNAVAILABLE'
+                        : repositoryHeadRequired
+                          ? 'REPOSITORY_HEAD_REQUIRED'
+                          : 'HARNESS_FAILURE',
+          diagnostics: activity(
+            appServerExit
+              ? 'app_server_exited'
+              : timedOut
+                ? 'timed_out'
+                : startupTimedOut
+                  ? 'startup_timed_out'
+                  : idleTimedOut
+                    ? 'idle_timed_out'
+                    : 'failed',
+            current.diagnostics,
+            {
+              ...(turnFailure ||
+              appServerExit ||
+              startupTimedOut ||
+              appServerRpcTimeout ||
+              idleTimedOut ||
+              runtimeUnavailable ||
+              repositoryHeadRequired ||
+              harnessFailure
+                ? {
+                    exit_reason: repositoryHeadRequired
+                      ? 'A Local Engineer repository needs at least one Git commit (a valid HEAD) before a worker can start.'
+                      : startupTimedOut
+                        ? 'Worker startup or container preparation timed out.'
+                        : appServerRpcTimeout
+                          ? `Codex app-server RPC timed out: ${error instanceof Error ? error.message : String(error)}`
+                          : turnFailure
+                            ? turnFailure.exitReason
+                            : error instanceof Error
+                              ? safeHarnessFailureDetail(error)
+                              : String(error),
+                  }
+                : {}),
+            },
+          ),
+          result: emptyResult(),
+        },
+        { ownerId: this.ownerId, expectedFenceToken: current.fenceToken },
+      );
     }
   }
-  private adapter(agentId: string, launchWorker: ContainerAppServerWorker, workerName: string): CodexAppServer {
-    let adapter = this.adapters.get(agentId);
-    if (!adapter) {
-      adapter = new CodexAppServer(launchWorker, (event) => this.onEvent(workerName, event));
-      this.adapters.set(agentId, adapter);
+  private async adapter(
+    agentId: string,
+    launchWorker: ContainerAppServerWorker,
+    workerName: string,
+  ): Promise<CodexAppServer> {
+    const existing = this.adapters.get(agentId);
+    if (existing) {
+      await existing.stop().catch(() => undefined);
+      this.adapters.delete(agentId);
     }
+    const adapter = new CodexAppServer(launchWorker, (event) => this.onEvent(workerName, event));
+    this.adapters.set(agentId, adapter);
     return adapter;
   }
   private waitForOutcome(
@@ -653,8 +1087,8 @@ export class LocalEngineer {
       const timeout = setTimeout(() => finish(() => reject(new Error('RUN_TIMEOUT'))), timeoutSeconds * 1000);
       const idleCheck = setInterval(
         () => {
-          const current = this.requireOwned(runId);
-          if (current.status !== 'running') return;
+          const current = this.store.get(runId);
+          if (!current || current.status !== 'running') return;
           const activityAt = Date.parse(
             current.diagnostics?.last_activity_at ?? current.startedAt ?? current.createdAt,
           );
@@ -674,22 +1108,56 @@ export class LocalEngineer {
   private onEvent(worker: string, event: { method?: string; params?: Record<string, unknown> }): void {
     const raw = JSON.stringify(event);
     for (const run of this.store.list().filter((r) => this.owns(r) && eventMatchesRun(r, worker, event))) {
-      this.store.appendRaw(run.runId, 'raw-events', raw + '\n');
-      this.captureAgentMessage(run, event);
+      const completed = completedAgentMessage(event);
       const tokenUsage = tokenUsageFromEvent(event);
-      if (tokenUsage) this.recordWorkerTokens(run, tokenUsage);
       const commandTracking = this.trackCommandItem(run, event);
-      if (shouldPersistActivity(run, event))
-        this.store.update(run.runId, { diagnostics: eventActivity(run, event, commandTracking) }, 'run.activity');
+      const update: Partial<Run> = {};
+      if (tokenUsage) {
+        const current = run.stats ?? emptyStats();
+        const usage = current.worker_tokens ?? {
+          total: 0,
+          input: 0,
+          cached_input: 0,
+          output: 0,
+          reasoning_output: 0,
+          source: 'app_server' as const,
+        };
+        update.stats = {
+          ...current,
+          worker_tokens: {
+            total: usage.total + tokenUsage.total,
+            input: usage.input + tokenUsage.input,
+            cached_input: usage.cached_input + tokenUsage.cachedInput,
+            output: usage.output + tokenUsage.output,
+            reasoning_output: usage.reasoning_output + tokenUsage.reasoningOutput,
+            source: 'app_server',
+          },
+        };
+      }
+      if (shouldPersistActivity(run, event)) update.diagnostics = eventActivity(run, event, commandTracking);
+      try {
+        const ingested = this.store.ingestEvent(
+          run.runId,
+          {
+            raw: raw + '\n',
+            ...(completed ? { message: { itemId: completed.itemId, ts: now(), text: completed.text } } : {}),
+            ...(Object.keys(update).length > 0 ? { update, event: 'run.activity' } : {}),
+          },
+          {
+            ownerId: this.ownerId,
+            expectedFenceToken: run.fenceToken ?? 1,
+          },
+        );
+        if (!ingested) continue;
+      } catch {
+        // A stale/fenced event or failed auxiliary write is safely ignored.
+        continue;
+      }
       if (/turn\/(completed|failed)|turn\/complete/i.test(event.method ?? '')) {
         this.commandItemStartedAt.delete(run.runId);
         this.completedCommandItems.delete(run.runId);
       }
     }
-  }
-  private captureAgentMessage(run: Run, event: { method?: string; params?: Record<string, unknown> }): void {
-    const completed = completedAgentMessage(event);
-    if (completed) this.store.captureMessage(run.runId, completed.itemId, now(), completed.text);
   }
   private trackCommandItem(
     run: Run,
@@ -716,37 +1184,6 @@ export class LocalEngineer {
     }
     return undefined;
   }
-  private recordWorkerTokens(
-    run: Run,
-    usage: { total: number; input: number; cachedInput: number; output: number; reasoningOutput: number },
-  ): void {
-    const current = run.stats ?? emptyStats();
-    const worker = current.worker_tokens ?? {
-      total: 0,
-      input: 0,
-      cached_input: 0,
-      output: 0,
-      reasoning_output: 0,
-      source: 'app_server' as const,
-    };
-    this.store.update(
-      run.runId,
-      {
-        stats: {
-          ...current,
-          worker_tokens: {
-            total: worker.total + usage.total,
-            input: worker.input + usage.input,
-            cached_input: worker.cached_input + usage.cachedInput,
-            output: worker.output + usage.output,
-            reasoning_output: worker.reasoning_output + usage.reasoningOutput,
-            source: 'app_server',
-          },
-        },
-      },
-      'run.token_usage',
-    );
-  }
   private recordParentDelivery(
     runId: string,
     category: 'changes' | 'diff' | 'file' | 'lifecycle',
@@ -757,28 +1194,33 @@ export class LocalEngineer {
     const characters = JSON.stringify(payload).length;
     const parent = current.parent_visible;
     const reviews = current.review_requests;
-    this.store.update(
-      runId,
-      {
-        stats: {
-          ...current,
-          parent_visible: {
-            characters: parent.characters + characters,
-            estimated_tokens: Math.ceil((parent.characters + characters) / 4),
-            changes_characters: parent.changes_characters + (category === 'changes' ? characters : 0),
-            diff_characters: parent.diff_characters + (category === 'diff' ? characters : 0),
-            file_characters: parent.file_characters + (category === 'file' ? characters : 0),
-            lifecycle_characters: parent.lifecycle_characters + (category === 'lifecycle' ? characters : 0),
-          },
-          review_requests: {
-            changes: reviews.changes + (category === 'changes' ? 1 : 0),
-            diffs: reviews.diffs + (category === 'diff' ? 1 : 0),
-            files: reviews.files + (category === 'file' ? 1 : 0),
+    try {
+      this.store.update(
+        runId,
+        {
+          stats: {
+            ...current,
+            parent_visible: {
+              characters: parent.characters + characters,
+              estimated_tokens: Math.ceil((parent.characters + characters) / 4),
+              changes_characters: parent.changes_characters + (category === 'changes' ? characters : 0),
+              diff_characters: parent.diff_characters + (category === 'diff' ? characters : 0),
+              file_characters: parent.file_characters + (category === 'file' ? characters : 0),
+              lifecycle_characters: parent.lifecycle_characters + (category === 'lifecycle' ? characters : 0),
+            },
+            review_requests: {
+              changes: reviews.changes + (category === 'changes' ? 1 : 0),
+              diffs: reviews.diffs + (category === 'diff' ? 1 : 0),
+              files: reviews.files + (category === 'file' ? 1 : 0),
+            },
           },
         },
-      },
-      'run.parent_delivery',
-    );
+        'run.parent_delivery',
+        { expectedFenceToken: run.fenceToken, allowTerminalMutation: true },
+      );
+    } catch {
+      // Stale or fenced-out delivery update safely ignored
+    }
   }
   private resolveRepositories(
     workingDirectory?: string,
@@ -797,7 +1239,7 @@ export class LocalEngineer {
         {
           name,
           parentPath,
-          containerPath: joinContainerPath(this.config.container.platform, this.config.container.workspace_path, name),
+          containerPath: resolveRepositoryContainerPath(this.config.container, parentPath, name),
           access: accessOverrides[name] ?? 'read-write',
         },
       ];
@@ -809,16 +1251,15 @@ export class LocalEngineer {
         throw new Error('WORKSPACE_REPOSITORY_NOT_FOUND');
     if (workingRepository && !workspace.repositories.some((repository) => repository.name === workingRepository))
       throw new Error('WORKING_REPOSITORY_NOT_FOUND');
-    return workspace.repositories.map((repository) => ({
-      name: repository.name,
-      parentPath: canonicalWorkspace(repository.path, this.config),
-      containerPath: joinContainerPath(
-        this.config.container.platform,
-        this.config.container.workspace_path,
-        repository.name,
-      ),
-      access: accessOverrides[repository.name] ?? repository.default_access,
-    }));
+    return workspace.repositories.map((repository) => {
+      const parentPath = canonicalWorkspace(repository.path, this.config);
+      return {
+        name: repository.name,
+        parentPath,
+        containerPath: resolveRepositoryContainerPath(this.config.container, parentPath, repository.name),
+        access: accessOverrides[repository.name] ?? repository.default_access,
+      };
+    });
   }
   private requireAgentCapability(agentId: string): Run {
     const run = this.store.getByAgent(agentId).at(-1);
@@ -886,6 +1327,16 @@ export class LocalEngineer {
   private owns(run: Run): boolean {
     return run.ownerId === this.ownerId;
   }
+  private markClaimRecovery(run: Run, operation: AgentOperation, cause: unknown): void {
+    try {
+      this.store.markOperationRecovery(run.runId, operation, safeRecoveryFailure(cause), {
+        ownerId: this.ownerId,
+        expectedFenceToken: run.fenceToken!,
+      });
+    } catch {
+      // A competing fence may already have placed the agent into recovery.
+    }
+  }
   private requireOwned(id: string): Run {
     const run = this.store.get(id);
     if (!run || !this.owns(run)) throw new Error('RUN_NOT_FOUND');
@@ -918,8 +1369,29 @@ export function safeHarnessFailureDetail(error: Error): string {
     : 'Worker setup or harness failed before the first command. Inspect the retained Local Engineer run logs.';
 }
 
+function safeRecoveryFailure(cause: unknown): string {
+  const raw = cause instanceof Error ? cause.message : String(cause);
+  return raw
+    .replace(/[A-Za-z]:\\[^\r\n]*/g, '<local-path>')
+    .replace(/\/[^\s:]+(?:\/[^\s:]*)*/g, '<path>')
+    .replace(/[\r\n\t]+/g, ' ')
+    .trim()
+    .slice(0, 500);
+}
+
 export function isMissingRecoveredThread(cause: unknown): boolean {
-  return cause instanceof Error && /^CODEX_RPC_ERROR:thread not found:/i.test(cause.message);
+  if (!(cause instanceof Error)) return false;
+  const msg = cause.message;
+  return (
+    /^CODEX_RPC_ERROR:.*thread.*not found/i.test(msg) ||
+    /thread.*not found/i.test(msg) ||
+    /unknown thread/i.test(msg) ||
+    /invalid thread/i.test(msg) ||
+    /^CODEX_APP_SERVER_EXIT/i.test(msg) ||
+    /^CODEX_APP_SERVER_STOPPED/i.test(msg) ||
+    /^CODEX_APP_SERVER_ERROR/i.test(msg) ||
+    /^CODEX_RPC_TIMEOUT:(?:turn\/start|thread\/resume)/i.test(msg)
+  );
 }
 
 export function codexTurnFailure(

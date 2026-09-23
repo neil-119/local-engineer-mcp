@@ -1,21 +1,37 @@
 import { createHash } from 'node:crypto';
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
-import { join, posix, resolve } from 'node:path';
+import fs, {
+  appendFileSync,
+  closeSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { dirname, join, normalize, posix, relative, resolve } from 'node:path';
 import type {
   ContainerChangeSet,
   ContainerConfig,
   ContainerPlatform,
+  ContainerPreparationTimings,
   RepositoryChangeSummary,
   RunRepository,
+  WindowsDependencyMount,
+  WindowsRepositoryMount,
   Worker,
 } from './domain.js';
 import type { ContainerAppServerWorker } from './codex.js';
 import { relayedModelBaseUrl, writeContainerCodexConfigs } from './container-codex-config.js';
 import { containerLayout, joinContainerPath, nodeMkdirCommand, nodeRemoveCommand } from './container-platform.js';
 import { agentNetworkSubnetCandidates, ContainerRuntime } from './container-runtime.js';
+import { discoverDependencyMounts, isDependencyManifestChanged } from './dependency-mount.js';
 import {
   checkRepositoryPromotion,
   createRepositorySnapshot,
+  git,
   promoteRepositoryChanges,
   recoverRepositorySnapshot,
   type RepositoryChanges,
@@ -42,6 +58,9 @@ interface RepositoryRevision {
   changes?: RepositoryChanges;
   patchPath?: string;
   reviewCommits: Map<number, string>;
+  workingClonePath?: string;
+  dependencyMounts?: WindowsDependencyMount[];
+  dependencyManifestStale?: boolean;
 }
 
 /** Dependencies managed outside Git tracking within isolated volumes. */
@@ -64,6 +83,8 @@ export interface ContainerAgentResources {
   egressNetwork: string;
   workspaceVolume: string;
   repositoryVolumes: Map<string, string>;
+  windowsRepositoryMounts?: Map<string, WindowsRepositoryMount>;
+  windowsWorkspaceMode?: 'volume-copy' | 'isolated-bind';
   workerConfigVolume: string;
   proxyConfigVolume: string;
   proxySharedVolume: string;
@@ -71,6 +92,7 @@ export interface ContainerAgentResources {
   proxyAddress?: string;
   repositories: Map<string, RepositoryRevision>;
   revision: number;
+  timings?: ContainerPreparationTimings;
 }
 
 interface RecoveryInput {
@@ -166,7 +188,31 @@ export class ContainerAgentManager {
     const layout = containerLayout(this.config);
     if (this.config.platform === 'windows' && profileRepository) throw new Error('IMAGE_PROFILE_WINDOWS_UNSUPPORTED');
     const existing = this.agents.get(agentId);
-    if (existing) return existing;
+    if (existing) {
+      const isExistingIsolatedBind =
+        existing.windowsWorkspaceMode === 'isolated-bind' || existing.windowsRepositoryMounts !== undefined;
+      if (isExistingIsolatedBind && this.config.platform === 'windows') {
+        const running = await this.runtime.isContainerRunning(existing.workerContainer);
+        if (!running) {
+          await this.runtime.startContainer(existing.workerContainer);
+          await this.configureWindowsWorkerNetwork(existing);
+          await this.assertWindowsRepositoryMounts(existing);
+        }
+      }
+      return existing;
+    }
+
+    const isIsolatedBind = this.config.platform === 'windows' && this.config.windows_workspace_mode === 'isolated-bind';
+    if (isIsolatedBind) {
+      for (const repository of repositories) {
+        if (!/^[cC]:[\\/]/.test(repository.parentPath) || !/^[cC]:[\\/]/.test(repository.containerPath)) {
+          throw new Error('CONTAINER_WORKSPACE_DRIVE_UNSUPPORTED');
+        }
+      }
+    }
+
+    const timings: ContainerPreparationTimings = {};
+    const startPreparation = Date.now();
     const suffix = createHash('sha256').update(agentId).digest('hex').slice(0, 20);
     const prefix = `le-${suffix}`;
     const resources: ContainerAgentResources = {
@@ -179,7 +225,7 @@ export class ContainerAgentManager {
       egressNetwork: `${prefix}-egress`,
       workspaceVolume: `${prefix}-workspace`,
       repositoryVolumes: new Map(
-        this.config.platform === 'windows'
+        this.config.platform === 'windows' && !isIsolatedBind
           ? repositories.map((repository) => [repository.name, repositoryVolumeName(prefix, repository)])
           : [],
       ),
@@ -187,8 +233,10 @@ export class ContainerAgentManager {
       proxyConfigVolume: `${prefix}-proxy-config`,
       proxySharedVolume: `${prefix}-proxy-shared`,
       dependencyVolume: `${prefix}-dependencies`,
+      windowsWorkspaceMode: isIsolatedBind ? 'isolated-bind' : 'volume-copy',
       repositories: new Map(),
       revision: 0,
+      timings,
     };
     const labels = {
       'local-engineer.agent-id': agentId,
@@ -197,6 +245,7 @@ export class ContainerAgentManager {
     const agentState = join(this.stateDir, 'container-agents', agentId);
     mkdirSync(agentState, { recursive: true });
     try {
+      const startBaseline = Date.now();
       for (const repository of repositories) {
         const snapshot = await createRepositorySnapshot(
           repository.parentPath,
@@ -211,6 +260,61 @@ export class ContainerAgentManager {
           reviewCommits: new Map([[0, snapshot.baselineCommit]]),
         });
       }
+      timings.baselineCreationMs = Date.now() - startBaseline;
+
+      if (isIsolatedBind) {
+        const startWorkingClone = Date.now();
+        const workspacesDir = join(agentState, 'workspaces');
+        mkdirSync(workspacesDir, { recursive: true });
+        const windowsMounts = new Map<string, WindowsRepositoryMount>();
+
+        for (const repository of repositories) {
+          const rev = resources.repositories.get(repository.name)!;
+          const workingClonePath = join(workspacesDir, repository.name);
+          await git(agentState, [
+            'clone',
+            '--no-hardlinks',
+            '--no-checkout',
+            rev.snapshot.snapshotPath,
+            workingClonePath,
+          ]);
+          const autoCrlf = await git(rev.snapshot.snapshotPath, ['config', '--get', 'core.autocrlf']).catch(() => '');
+          const coreEol = await git(rev.snapshot.snapshotPath, ['config', '--get', 'core.eol']).catch(() => '');
+          if (autoCrlf.trim()) await git(workingClonePath, ['config', 'core.autocrlf', autoCrlf.trim()]);
+          if (coreEol.trim()) await git(workingClonePath, ['config', 'core.eol', coreEol.trim()]);
+          await git(workingClonePath, ['checkout', '--quiet', '--detach', rev.snapshot.baselineCommit]);
+
+          const excludePath = join(workingClonePath, '.git', 'info', 'exclude');
+          mkdirSync(dirname(excludePath), { recursive: true });
+          appendFileSync(excludePath, '\n' + MANAGED_DEPENDENCY_PATHS.map((p) => `/${p}/`).join('\n') + '\n');
+
+          const baselineExcludePath = join(rev.snapshot.snapshotPath, '.git', 'info', 'exclude');
+          mkdirSync(dirname(baselineExcludePath), { recursive: true });
+          appendFileSync(baselineExcludePath, '\n' + MANAGED_DEPENDENCY_PATHS.map((p) => `/${p}/`).join('\n') + '\n');
+
+          rev.workingClonePath = workingClonePath;
+        }
+        timings.workingCloneCreationMs = Date.now() - startWorkingClone;
+
+        const startDepVal = Date.now();
+        for (const repository of repositories) {
+          const rev = resources.repositories.get(repository.name)!;
+          const depMounts = discoverDependencyMounts(repository.parentPath, repository.containerPath);
+          rev.dependencyMounts = depMounts;
+
+          windowsMounts.set(repository.name, {
+            repository: repository.name,
+            baselineSnapshotPath: rev.snapshot.snapshotPath,
+            workingClonePath: rev.workingClonePath!,
+            containerPath: repository.containerPath,
+            access: repository.access ?? 'read-write',
+            dependencyMounts: depMounts,
+          });
+        }
+        timings.dependencyValidationMs = Date.now() - startDepVal;
+        resources.windowsRepositoryMounts = windowsMounts;
+      }
+
       writeFileSync(
         join(agentState, 'snapshots.json'),
         JSON.stringify(
@@ -224,14 +328,19 @@ export class ContainerAgentManager {
       const proxyConfigPath = join(agentState, 'proxy-config.toml');
       writeContainerCodexConfigs(worker, this.config, workerConfigPath, proxyConfigPath);
 
+      const startNetwork = Date.now();
       await this.runtime.createNetworkPair({
         internalName: resources.internalNetwork,
         egressName: resources.egressNetwork,
         labels,
         candidates: agentNetworkSubnetCandidates(agentId, this.config.agent_network_pool),
       });
+      timings.networkAllocationMs = Date.now() - startNetwork;
+
       if (this.config.platform === 'windows') {
-        for (const volume of resources.repositoryVolumes.values()) await this.runtime.createVolume(volume, labels);
+        if (!isIsolatedBind) {
+          for (const volume of resources.repositoryVolumes.values()) await this.runtime.createVolume(volume, labels);
+        }
       } else {
         await this.runtime.createVolume(resources.workspaceVolume, labels);
       }
@@ -239,43 +348,57 @@ export class ContainerAgentManager {
       await this.runtime.createVolume(resources.proxyConfigVolume, labels);
       await this.runtime.createVolume(resources.proxySharedVolume, labels);
       await this.runtime.createVolume(resources.dependencyVolume, labels);
-      await this.seedWritableVolume(
-        `${prefix}-proxy-shared-seed`,
-        resources.image,
-        resources.proxySharedVolume,
-        layout.proxyShared,
-        resources.internalNetwork,
-        labels,
-      );
-      await this.seedConfigVolume(
-        `${prefix}-worker-config-seed`,
-        resources.image,
-        resources.workerConfigVolume,
-        workerConfigPath,
-        resources.internalNetwork,
-        labels,
-        true,
-      );
-      await this.seedDependencyVolume(
-        `${prefix}-dependency-seed`,
-        resources.image,
-        resources.dependencyVolume,
-        resources.internalNetwork,
-        labels,
-      );
-      await this.seedConfigVolume(
-        `${prefix}-proxy-config-seed`,
-        resources.image,
-        resources.proxyConfigVolume,
-        proxyConfigPath,
-        resources.internalNetwork,
-        labels,
-        true,
-      );
+
+      const startSetup = Date.now();
+      if (isIsolatedBind) {
+        await this.seedConsolidatedWindowsSetup(
+          `${prefix}-consolidated-setup`,
+          resources,
+          workerConfigPath,
+          proxyConfigPath,
+          labels,
+        );
+      } else {
+        await this.seedWritableVolume(
+          `${prefix}-proxy-shared-seed`,
+          resources.image,
+          resources.proxySharedVolume,
+          layout.proxyShared,
+          resources.internalNetwork,
+          labels,
+        );
+        await this.seedConfigVolume(
+          `${prefix}-worker-config-seed`,
+          resources.image,
+          resources.workerConfigVolume,
+          workerConfigPath,
+          resources.internalNetwork,
+          labels,
+          true,
+        );
+        await this.seedDependencyVolume(
+          `${prefix}-dependency-seed`,
+          resources.image,
+          resources.dependencyVolume,
+          resources.internalNetwork,
+          labels,
+        );
+        await this.seedConfigVolume(
+          `${prefix}-proxy-config-seed`,
+          resources.image,
+          resources.proxyConfigVolume,
+          proxyConfigPath,
+          resources.internalNetwork,
+          labels,
+          true,
+        );
+      }
+      timings.setupContainerExecutionMs = Date.now() - startSetup;
+
       await this.runtime.createContainer({
         name: resources.proxyContainer,
         image: resources.image,
-        network: resources.internalNetwork,
+        network: this.config.platform === 'windows' ? resources.egressNetwork : resources.internalNetwork,
         networkAliases: ['local-engineer-proxy'],
         user: this.config.worker_user,
         labels,
@@ -294,7 +417,10 @@ export class ContainerAgentManager {
         command: ['node', layout.proxySidecar],
       });
       if (this.config.platform === 'windows') await this.runtime.assertWindowsHyperVIsolation(resources.proxyContainer);
-      await this.runtime.connectNetwork(resources.egressNetwork, resources.proxyContainer);
+      await this.runtime.connectNetwork(
+        this.config.platform === 'windows' ? resources.internalNetwork : resources.egressNetwork,
+        resources.proxyContainer,
+      );
       await this.runtime.startContainer(resources.proxyContainer);
       if (this.config.platform === 'windows')
         resources.proxyAddress = await this.runtime.containerNetworkAddress(
@@ -302,9 +428,13 @@ export class ContainerAgentManager {
           resources.internalNetwork,
         );
 
-      await this.seedWorkspaceVolume(`${prefix}-workspace-seed`, resources, labels);
+      if (!isIsolatedBind) {
+        await this.seedWorkspaceVolume(`${prefix}-workspace-seed`, resources, labels);
+      }
       const proxyHost = this.config.platform === 'windows' ? resources.proxyAddress : resources.proxyContainer;
       if (!proxyHost) throw new Error('CONTAINER_PROXY_ADDRESS_MISSING');
+
+      const startWorker = Date.now();
       await this.runtime.createContainer({
         name: resources.workerContainer,
         image: resources.image,
@@ -353,6 +483,9 @@ export class ContainerAgentManager {
       await this.runtime.startContainer(resources.workerContainer);
       if (this.config.platform === 'windows') await this.configureWindowsWorkerNetwork(resources);
       if (this.config.platform === 'windows') await this.assertWindowsRepositoryMounts(resources);
+      timings.workerStartupMs = Date.now() - startWorker;
+
+      const startAppServer = Date.now();
       try {
         await this.runtime.execContainer(resources.workerContainer, [
           'node',
@@ -370,23 +503,44 @@ export class ContainerAgentManager {
         const excerpt = `${logs?.stdout ?? ''}\n${logs?.stderr ?? ''}`.trim().slice(-4000);
         throw new Error(`CONTAINER_PROXY_NOT_READY:${excerpt || 'no proxy logs'}`);
       }
+      timings.appServerReadinessMs = Date.now() - startAppServer;
+      timings.totalPreparationMs = Date.now() - startPreparation;
+      resources.timings = timings;
+
       writeFileSync(
         join(agentState, 'resources.json'),
         JSON.stringify(
           {
-            schema_version: 2,
+            schema_version: 3,
             agent_id: agentId,
+            windows_workspace_mode: this.config.windows_workspace_mode ?? 'volume-copy',
             worker_container: resources.workerContainer,
             proxy_container: resources.proxyContainer,
             internal_network: resources.internalNetwork,
             egress_network: resources.egressNetwork,
             workspace_volume: resources.workspaceVolume,
             repository_volumes: Object.fromEntries(resources.repositoryVolumes),
+            windows_repository_mounts: resources.windowsRepositoryMounts
+              ? [...resources.windowsRepositoryMounts.values()].map((m) => ({
+                  repository: m.repository,
+                  baseline_snapshot_path: m.baselineSnapshotPath,
+                  working_clone_path: m.workingClonePath,
+                  container_path: m.containerPath,
+                  access: m.access,
+                  dependency_mounts: m.dependencyMounts.map((d) => ({
+                    relative_path: d.relativePath,
+                    host_path: d.hostPath,
+                    container_path: d.containerPath,
+                    fingerprint: d.fingerprint,
+                  })),
+                }))
+              : undefined,
             worker_config_volume: resources.workerConfigVolume,
             proxy_config_volume: resources.proxyConfigVolume,
             proxy_shared_volume: resources.proxySharedVolume,
             dependency_volume: resources.dependencyVolume,
             proxy_address: resources.proxyAddress,
+            timings: resources.timings,
           },
           null,
           2,
@@ -397,7 +551,11 @@ export class ContainerAgentManager {
       return resources;
     } catch (cause) {
       await this.cleanupResources(resources);
-      rmSync(agentState, { recursive: true, force: true });
+      const agentDir = resolve(agentState);
+      const expectedParent = resolve(this.stateDir, 'container-agents');
+      if (agentDir.startsWith(expectedParent) && agentDir !== expectedParent) {
+        rmSync(agentDir, { recursive: true, force: true });
+      }
       throw cause;
     }
   }
@@ -412,6 +570,9 @@ export class ContainerAgentManager {
     const resourcePath = join(state, 'resources.json');
     if (!existsSync(resourcePath)) throw new Error('CONTAINER_AGENT_RETAINED_STATE_NOT_FOUND');
     const persisted = JSON.parse(readFileSync(resourcePath, 'utf8')) as Record<string, unknown>;
+    if (persisted.schema_version !== 2 && persisted.schema_version !== 3)
+      throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+
     const expected = {
       worker_container: `${prefix}-worker`,
       proxy_container: `${prefix}-proxy`,
@@ -423,8 +584,13 @@ export class ContainerAgentManager {
       proxy_shared_volume: `${prefix}-proxy-shared`,
       dependency_volume: `${prefix}-dependencies`,
     };
+    const isIsolatedBind =
+      this.config.platform === 'windows' &&
+      persisted.schema_version === 3 &&
+      persisted.windows_workspace_mode === 'isolated-bind';
+
     const expectedRepositoryVolumes = Object.fromEntries(
-      this.config.platform === 'windows'
+      this.config.platform === 'windows' && !isIsolatedBind
         ? input.repositories.map((repository) => [repository.name, repositoryVolumeName(prefix, repository)])
         : [],
     );
@@ -432,9 +598,67 @@ export class ContainerAgentManager {
       persisted.agent_id !== input.agentId ||
       Object.entries(expected).some(([key, value]) => persisted[key] !== value) ||
       (this.config.platform === 'windows' &&
+        !isIsolatedBind &&
         JSON.stringify(persisted.repository_volumes) !== JSON.stringify(expectedRepositoryVolumes))
     )
       throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+
+    const windowsRepositoryMounts = new Map<string, WindowsRepositoryMount>();
+    if (isIsolatedBind) {
+      const persistedMounts = persisted.windows_repository_mounts as Array<{
+        repository: string;
+        baseline_snapshot_path: string;
+        working_clone_path: string;
+        container_path: string;
+        access: string;
+        dependency_mounts: Array<{
+          relative_path: string;
+          host_path: string;
+          container_path: string;
+          fingerprint: string;
+        }>;
+      }>;
+      if (!Array.isArray(persistedMounts) || persistedMounts.length !== input.repositories.length)
+        throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+
+      for (const repo of input.repositories) {
+        const derivedBaseline = join(state, 'snapshots', repo.name);
+        const derivedWorkingClone = join(state, 'workspaces', repo.name);
+        const derivedContainerPath = repo.containerPath;
+        const matching = persistedMounts.find((m) => m.repository === repo.name);
+        if (!matching) throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+
+        if (
+          matching.baseline_snapshot_path !== derivedBaseline ||
+          matching.working_clone_path !== derivedWorkingClone ||
+          matching.container_path !== derivedContainerPath ||
+          matching.access !== (repo.access ?? 'read-write')
+        )
+          throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+
+        for (const dep of matching.dependency_mounts ?? []) {
+          const expectedHostPath = normalize(join(repo.parentPath, dep.relative_path)).replace(/\\/g, '/');
+          const expectedContainerPath = join(derivedContainerPath, dep.relative_path).replace(/\\/g, '/');
+          if (dep.host_path !== expectedHostPath || dep.container_path !== expectedContainerPath)
+            throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+        }
+
+        windowsRepositoryMounts.set(repo.name, {
+          repository: repo.name,
+          baselineSnapshotPath: matching.baseline_snapshot_path,
+          workingClonePath: matching.working_clone_path,
+          containerPath: matching.container_path,
+          access: matching.access as 'read-write' | 'read-only',
+          dependencyMounts: (matching.dependency_mounts ?? []).map((d) => ({
+            relativePath: d.relative_path,
+            hostPath: d.host_path,
+            containerPath: d.container_path,
+            fingerprint: d.fingerprint,
+          })),
+        });
+      }
+    }
+
     const snapshotsPath = join(state, 'snapshots.json');
     const savedSnapshots = existsSync(snapshotsPath)
       ? (JSON.parse(readFileSync(snapshotsPath, 'utf8')) as Array<{
@@ -452,6 +676,8 @@ export class ContainerAgentManager {
       egressNetwork: expected.egress_network,
       workspaceVolume: expected.workspace_volume,
       repositoryVolumes: new Map(Object.entries(expectedRepositoryVolumes)),
+      windowsRepositoryMounts: isIsolatedBind ? windowsRepositoryMounts : undefined,
+      windowsWorkspaceMode: isIsolatedBind ? 'isolated-bind' : 'volume-copy',
       workerConfigVolume: expected.worker_config_volume,
       proxyConfigVolume: expected.proxy_config_volume,
       proxySharedVolume: expected.proxy_shared_volume,
@@ -459,6 +685,7 @@ export class ContainerAgentManager {
       ...(typeof persisted.proxy_address === 'string' ? { proxyAddress: persisted.proxy_address } : {}),
       repositories: new Map(),
       revision: input.changeSet?.revision ?? 0,
+      timings: persisted.timings as ContainerPreparationTimings | undefined,
     };
     if (this.config.platform === 'windows') {
       if (!resources.proxyAddress) throw new Error('CONTAINER_PROXY_ADDRESS_MISSING');
@@ -469,8 +696,20 @@ export class ContainerAgentManager {
         resources.internalNetwork,
       );
       if (liveProxyAddress !== resources.proxyAddress) throw new Error('CONTAINER_PROXY_ADDRESS_CHANGED');
-      await this.configureWindowsWorkerNetwork(resources);
+      const running = await this.runtime.isContainerRunning(resources.workerContainer);
+      if (running) {
+        await this.configureWindowsWorkerNetwork(resources);
+      }
     }
+    const reviewCommitsPath = join(state, 'review-commits.json');
+    const savedReviewCommits = existsSync(reviewCommitsPath)
+      ? (JSON.parse(readFileSync(reviewCommitsPath, 'utf8')) as Record<string, Record<string, string>>)
+      : undefined;
+    const staleManifestsPath = join(state, 'dependency-manifest-stale.json');
+    const savedStaleManifests = existsSync(staleManifestsPath)
+      ? (JSON.parse(readFileSync(staleManifestsPath, 'utf8')) as Record<string, boolean>)
+      : undefined;
+
     for (const repository of input.repositories) {
       const saved = savedSnapshots.find((entry) => entry.runRepository.name === repository.name);
       const snapshotPath = saved?.snapshot.snapshotPath ?? join(state, 'snapshots', repository.name);
@@ -486,7 +725,22 @@ export class ContainerAgentManager {
           repository.baselineKind ?? 'clean_head',
         ));
       const reviewCommits = new Map<number, string>([[0, snapshot.baselineCommit]]);
-      if (resources.revision > 0) {
+      if (savedReviewCommits && savedReviewCommits[repository.name]) {
+        for (const [revStr, commit] of Object.entries(savedReviewCommits[repository.name]!)) {
+          if (!/^[0-9a-f]{40,64}$/i.test(commit)) throw new Error('CONTAINER_AGENT_RECOVERY_REVIEW_COMMIT_INVALID');
+          if (isIsolatedBind) {
+            try {
+              await git(snapshot.snapshotPath, ['cat-file', '-e', commit]);
+            } catch {
+              throw new Error('CONTAINER_AGENT_RECOVERY_REVIEW_COMMIT_INVALID');
+            }
+          }
+          reviewCommits.set(Number(revStr), commit);
+        }
+      } else if (resources.revision > 0) {
+        if (isIsolatedBind) {
+          throw new Error('CONTAINER_AGENT_RECOVERY_REVIEW_COMMIT_INVALID');
+        }
         const head = (
           await this.runtime.execContainer(resources.workerContainer, [
             'git',
@@ -513,19 +767,47 @@ export class ContainerAgentManager {
               deletions: summary.deletions,
             }
           : undefined;
+
+      const persistedStale = Boolean(savedStaleManifests?.[repository.name]);
+      const changesStale = Boolean(changes && isDependencyManifestChanged(changes.changedPaths));
+      const summaryStale = summary?.dependency_manifest_stale;
+      const mustBeStale = persistedStale || changesStale;
+
+      if (mustBeStale) {
+        if (summary && summaryStale === false) {
+          throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+        }
+        if (input.changeSet && input.changeSet.dependency_manifest_stale === false) {
+          throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+        }
+      }
+
+      const dependencyManifestStale = mustBeStale || Boolean(summaryStale);
+
+      const repoMount = resources.windowsRepositoryMounts?.get(repository.name);
       resources.repositories.set(repository.name, {
         runRepository: repository,
         snapshot,
         changes,
         patchPath,
         reviewCommits,
+        workingClonePath: repoMount?.workingClonePath,
+        dependencyMounts: repoMount?.dependencyMounts,
+        dependencyManifestStale,
       });
     }
+
+    const anyRepoStale = [...resources.repositories.values()].some((r) => r.dependencyManifestStale);
+    if (input.changeSet && anyRepoStale && input.changeSet.dependency_manifest_stale === false) {
+      throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+    }
+
     this.agents.set(input.agentId, resources);
     return resources;
   }
 
   appServerWorker(worker: Worker, resources: ContainerAgentResources): ContainerAppServerWorker {
+    const layout = containerLayout(this.config);
     const relayAuthority = this.config.platform === 'windows' ? resources.proxyAddress : undefined;
     if (this.config.platform === 'windows' && !relayAuthority) throw new Error('CONTAINER_PROXY_ADDRESS_MISSING');
     return {
@@ -535,7 +817,7 @@ export class ContainerAgentManager {
         'exec',
         '--interactive',
         resources.workerContainer,
-        this.config.codex_command,
+        this.config.codex_command === 'codex' ? layout.codexExecutable : this.config.codex_command,
         '-c',
         `model_providers.${worker.model_provider}.base_url=${JSON.stringify(
           relayedModelBaseUrl(worker.container_model_provider!.base_url, relayAuthority),
@@ -698,6 +980,137 @@ export class ContainerAgentManager {
         container,
         ['icacls.exe', destination, '/grant:r', '*S-1-5-93-2-2:(OI)(CI)M', '/T', '/C'],
         { user: layout.administratorUser },
+      );
+    } finally {
+      await this.runtime.removeContainer(container, true).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Consolidates Windows setup steps into a single short-lived setup container:
+   * seeds proxy-shared, worker-config, proxy-config, and dependencies in one execution.
+   */
+  private async seedConsolidatedWindowsSetup(
+    container: string,
+    resources: ContainerAgentResources,
+    workerConfigPath: string,
+    proxyConfigPath: string,
+    labels: Record<string, string>,
+  ): Promise<void> {
+    const layout = containerLayout(this.config);
+    const proxyCodexHome = 'C:/local-engineer-proxy-codex-home';
+    const mounts: string[] = [
+      `type=volume,src=${resources.proxySharedVolume},dst=${layout.proxyShared}`,
+      `type=volume,src=${resources.workerConfigVolume},dst=${layout.codexHome}`,
+      `type=volume,src=${resources.proxyConfigVolume},dst=${proxyCodexHome}`,
+      `type=volume,src=${resources.dependencyVolume},dst=${layout.dependencyRoot}`,
+    ];
+
+    const agentState = join(this.stateDir, 'container-agents', resources.agentId);
+    const permittedWorkspacesRoot = join(agentState, 'workspaces');
+    const aclTargets: string[] = [];
+
+    if (resources.windowsRepositoryMounts) {
+      let index = 0;
+      for (const repoMount of resources.windowsRepositoryMounts.values()) {
+        const setupWorkspacePath = `C:/setup-workspaces/repo-${index++}`;
+        mounts.push(
+          this.runtime.buildBindMount({
+            source: repoMount.workingClonePath,
+            target: setupWorkspacePath,
+            readOnly: false,
+            permittedSourceRoots: [permittedWorkspacesRoot],
+          }),
+        );
+        if (repoMount.access !== 'read-only') {
+          aclTargets.push(setupWorkspacePath);
+        }
+      }
+    }
+
+    await this.runtime.createContainer({
+      name: container,
+      image: resources.image,
+      network: resources.internalNetwork,
+      user: layout.administratorUser,
+      capabilities: ['CHOWN'],
+      labels,
+      mounts,
+      command: layout.keepAliveCommand,
+    });
+    try {
+      if (this.config.platform === 'windows') await this.runtime.assertWindowsHyperVIsolation(container);
+      await this.runtime.startContainer(container);
+      if (this.config.platform === 'windows') await this.configureWindowsNetwork(container, resources.internalNetwork);
+
+      await this.runtime.copyToContainer(
+        workerConfigPath,
+        container,
+        joinContainerPath(this.config.platform, layout.codexHome, 'config.toml'),
+      );
+      await this.runtime.copyToContainer(
+        proxyConfigPath,
+        container,
+        joinContainerPath(this.config.platform, proxyCodexHome, 'config.toml'),
+      );
+
+      await this.runtime.execContainer(
+        container,
+        nodeMkdirCommand(
+          `${layout.dependencyRoot}/pip-cache`,
+          `${layout.dependencyRoot}/npm-cache`,
+          `${layout.dependencyRoot}/yarn-cache`,
+        ),
+        { user: layout.administratorUser, workdir: layout.safeAdminWorkdir },
+      );
+
+      await this.runtime.execContainer(
+        container,
+        ['icacls.exe', layout.proxyShared, '/grant:r', '*S-1-5-93-2-2:(OI)(CI)M', '/T', '/C'],
+        { user: layout.administratorUser, workdir: layout.safeAdminWorkdir },
+      );
+      await this.runtime.execContainer(
+        container,
+        ['icacls.exe', layout.dependencyRoot, '/grant:r', '*S-1-5-93-2-2:(OI)(CI)M', '/T', '/C'],
+        { user: layout.administratorUser, workdir: layout.safeAdminWorkdir },
+      );
+      await this.runtime.execContainer(
+        container,
+        ['icacls.exe', layout.codexHome, '/grant:r', '*S-1-5-93-2-2:(OI)(CI)M', '/T', '/C'],
+        { user: layout.administratorUser, workdir: layout.safeAdminWorkdir },
+      );
+      await this.runtime.execContainer(
+        container,
+        ['icacls.exe', proxyCodexHome, '/grant:r', '*S-1-5-93-2-2:(OI)(CI)M', '/T', '/C'],
+        { user: layout.administratorUser, workdir: layout.safeAdminWorkdir },
+      );
+
+      for (const aclTarget of aclTargets) {
+        await this.runtime.execContainer(
+          container,
+          ['icacls.exe', aclTarget, '/grant:r', '*S-1-5-93-2-2:(OI)(CI)M', '/T', '/C'],
+          { user: layout.administratorUser, workdir: layout.safeAdminWorkdir },
+        );
+      }
+
+      const tmpDir = joinContainerPath(this.config.platform, layout.codexHome, 'tmp');
+      const arg0File = joinContainerPath(this.config.platform, layout.codexHome, 'tmp', 'arg0');
+      await this.runtime.execContainer(
+        container,
+        [
+          layout.powershellExecutable,
+          '-NoLogo',
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          `Remove-Item -Recurse -Force "${tmpDir}" -ErrorAction SilentlyContinue; ` +
+            `New-Item -ItemType Directory -Force "${tmpDir}" | Out-Null; ` +
+            `New-Item -ItemType File -Force "${arg0File}" | Out-Null; ` +
+            `Set-ItemProperty -Path "${arg0File}" -Name IsReadOnly -Value $true; ` +
+            `icacls.exe "${tmpDir}" /deny "*S-1-5-93-2-2:(DC)" | Out-Null; ` +
+            `icacls.exe "${arg0File}" /deny "*S-1-5-93-2-2:(D,WDAC,WO)" | Out-Null`,
+        ],
+        { user: layout.administratorUser, workdir: layout.safeAdminWorkdir },
       );
     } finally {
       await this.runtime.removeContainer(container, true).catch(() => undefined);
@@ -890,6 +1303,45 @@ export class ContainerAgentManager {
   private workerRepositoryMounts(resources: ContainerAgentResources): string[] {
     if (this.config.platform !== 'windows')
       return [`type=volume,src=${resources.workspaceVolume},dst=${this.config.workspace_path}`];
+
+    if (resources.windowsWorkspaceMode === 'isolated-bind' || resources.windowsRepositoryMounts !== undefined) {
+      const mounts: string[] = [];
+      const agentState = join(this.stateDir, 'container-agents', resources.agentId);
+      const permittedWorkspacesRoot = join(agentState, 'workspaces');
+
+      for (const repository of resources.repositories.values()) {
+        const repoMount = resources.windowsRepositoryMounts?.get(repository.runRepository.name);
+        const workingClonePath =
+          repoMount?.workingClonePath ?? join(permittedWorkspacesRoot, repository.runRepository.name);
+
+        // 1. Working clone bind mount
+        mounts.push(
+          this.runtime.buildBindMount({
+            source: workingClonePath,
+            target: repository.runRepository.containerPath,
+            readOnly: repository.runRepository.access === 'read-only',
+            permittedSourceRoots: [permittedWorkspacesRoot],
+          }),
+        );
+
+        // 2. Nested dependency mounts, sorted by target path depth (length) ascending
+        const depMounts = (repoMount?.dependencyMounts ?? repository.dependencyMounts ?? [])
+          .slice()
+          .sort((a, b) => a.containerPath.length - b.containerPath.length);
+        for (const dep of depMounts) {
+          mounts.push(
+            this.runtime.buildBindMount({
+              source: dep.hostPath,
+              target: dep.containerPath,
+              readOnly: true,
+              permittedSourceRoots: [repository.runRepository.parentPath],
+            }),
+          );
+        }
+      }
+      return mounts;
+    }
+
     return [...resources.repositories.values()].map((repository) => {
       const volume = resources.repositoryVolumes.get(repository.runRepository.name);
       if (!volume) throw new Error('CONTAINER_REPOSITORY_VOLUME_MISSING');
@@ -900,27 +1352,56 @@ export class ContainerAgentManager {
   }
 
   private async assertWindowsRepositoryMounts(resources: ContainerAgentResources): Promise<void> {
+    const isIsolatedBind =
+      resources.windowsWorkspaceMode === 'isolated-bind' || resources.windowsRepositoryMounts !== undefined;
+
     for (const repository of resources.repositories.values()) {
-      if (repository.runRepository.access !== 'read-only') continue;
-      const probePath = joinContainerPath(
-        'windows',
-        repository.runRepository.containerPath,
-        `.local-engineer-read-only-probe-${createHash('sha256')
-          .update(`${resources.agentId}\0${repository.runRepository.name}`)
-          .digest('hex')
-          .slice(0, 16)}`,
-      );
-      const result = await this.runtime.execContainer(
-        resources.workerContainer,
-        [
-          'node',
-          '--eval',
-          "const fs=require('node:fs');const p=process.argv[1];if(fs.existsSync(p)){process.stdout.write('COLLISION')}else{try{fs.writeFileSync(p,'x');fs.unlinkSync(p);process.stdout.write('WRITABLE')}catch(e){if(e&&['EACCES','EPERM','EROFS'].includes(e.code))process.stdout.write('LOCKED');else throw e}}",
-          probePath,
-        ],
-        { user: this.config.worker_user },
-      );
-      if (result.stdout.trim() !== 'LOCKED') throw new Error('CONTAINER_WINDOWS_READ_ONLY_MOUNT_UNAVAILABLE');
+      if (repository.runRepository.access === 'read-only') {
+        const probePath = joinContainerPath(
+          'windows',
+          repository.runRepository.containerPath,
+          `.local-engineer-read-only-probe-${createHash('sha256')
+            .update(`${resources.agentId}\0${repository.runRepository.name}`)
+            .digest('hex')
+            .slice(0, 16)}`,
+        );
+        const result = await this.runtime.execContainer(
+          resources.workerContainer,
+          [
+            'node',
+            '--eval',
+            "const fs=require('node:fs');const p=process.argv[1];if(fs.existsSync(p)){process.stdout.write('COLLISION')}else{try{fs.writeFileSync(p,'x');fs.unlinkSync(p);process.stdout.write('WRITABLE')}catch(e){if(e&&['EACCES','EPERM','EROFS'].includes(e.code))process.stdout.write('LOCKED');else throw e}}",
+            probePath,
+          ],
+          { user: this.config.worker_user },
+        );
+        if (result.stdout.trim() !== 'LOCKED') throw new Error('CONTAINER_WINDOWS_READ_ONLY_MOUNT_UNAVAILABLE');
+      }
+
+      if (isIsolatedBind) {
+        const depMounts = repository.dependencyMounts ?? [];
+        for (const dep of depMounts) {
+          const depProbe = joinContainerPath(
+            'windows',
+            dep.containerPath,
+            `.probe-${createHash('sha256')
+              .update(`${resources.agentId}\0${dep.relativePath}`)
+              .digest('hex')
+              .slice(0, 16)}`,
+          );
+          const result = await this.runtime.execContainer(
+            resources.workerContainer,
+            [
+              'node',
+              '--eval',
+              "const fs=require('node:fs');const p=process.argv[1];if(fs.existsSync(p)){process.stdout.write('COLLISION')}else{try{fs.writeFileSync(p,'x');fs.unlinkSync(p);process.stdout.write('WRITABLE')}catch(e){if(e&&['EACCES','EPERM','EROFS'].includes(e.code))process.stdout.write('LOCKED');else throw e}}",
+              depProbe,
+            ],
+            { user: this.config.worker_user },
+          );
+          if (result.stdout.trim() !== 'LOCKED') throw new Error('CONTAINER_DEPENDENCY_READ_ONLY_FAILED');
+        }
+      }
     }
   }
 
@@ -984,200 +1465,539 @@ export class ContainerAgentManager {
     const previousRevision = resources.revision;
     const nextRevision = previousRevision + 1;
     const summaries: RepositoryChangeSummary[] = [];
-    for (const revision of resources.repositories.values()) {
-      if (revision.runRepository.access === 'read-only') {
-        const status = await this.runtime.execContainer(
-          resources.workerContainer,
-          [
-            layout.gitExecutable,
+    const isIsolatedBind =
+      resources.windowsWorkspaceMode === 'isolated-bind' || resources.windowsRepositoryMounts !== undefined;
+    const agentState = join(this.stateDir, 'container-agents', agentId);
+
+    let pausedWorker = false;
+    if (isIsolatedBind) {
+      const running = await this.runtime.isContainerRunning(resources.workerContainer);
+      if (running) {
+        if (this.config.platform === 'windows') {
+          await this.runtime.stopContainer(resources.workerContainer);
+          const stillRunning = await this.runtime.isContainerRunning(resources.workerContainer);
+          if (stillRunning) {
+            throw new Error('CONTAINER_STOP_FAILED');
+          }
+        } else {
+          await this.runtime.pauseContainer(resources.workerContainer);
+          pausedWorker = true;
+        }
+      }
+    }
+
+    try {
+      for (const revision of resources.repositories.values()) {
+        if (isIsolatedBind) {
+          const baselineGitDir = join(revision.snapshot.snapshotPath, '.git');
+          const workingClonePath =
+            revision.workingClonePath ?? join(agentState, 'workspaces', revision.runRepository.name);
+
+          assertNoReparsePoints(workingClonePath);
+
+          if (revision.runRepository.access === 'read-only') {
+            const status = await git(agentState, [
+              '--git-dir',
+              baselineGitDir,
+              '--work-tree',
+              workingClonePath,
+              'status',
+              '--porcelain=v1',
+              '--untracked-files=all',
+            ]);
+            if (status.trim()) throw new Error(`READ_ONLY_REPOSITORY_CHANGED:${revision.runRepository.name}`);
+            const previousCommit = revision.reviewCommits.get(previousRevision);
+            if (!previousCommit) throw new Error('CONTAINER_REVIEW_COMMIT_NOT_FOUND');
+            revision.reviewCommits.set(nextRevision, previousCommit);
+            continue;
+          }
+
+          const tempIndexFile = join(
+            agentState,
+            `tmp-index-${revision.runRepository.name}-${nextRevision}-${createHash('sha256')
+              .update(String(Date.now()))
+              .digest('hex')
+              .slice(0, 8)}`,
+          );
+          const gitEnv: Record<string, string> = {
+            GIT_DIR: resolve(baselineGitDir),
+            GIT_WORK_TREE: resolve(workingClonePath),
+            GIT_INDEX_FILE: resolve(tempIndexFile),
+          };
+
+          try {
+            const statusOutput = await git(
+              agentState,
+              [
+                '--git-dir',
+                baselineGitDir,
+                '--work-tree',
+                workingClonePath,
+                'status',
+                '--porcelain=v1',
+                '-z',
+                '--untracked-files=all',
+              ],
+              undefined,
+              gitEnv,
+            );
+
+            const statusEntries = statusOutput.split('\0').filter(Boolean);
+            for (const entry of statusEntries) {
+              const path = entry.slice(3);
+              if (!path) continue;
+              const normalized = path.replace(/\\/g, '/');
+              const firstSegment = normalized.split('/')[0];
+              if (
+                !firstSegment ||
+                firstSegment === 'node_modules' ||
+                (MANAGED_DEPENDENCY_PATHS as readonly string[]).includes(firstSegment)
+              ) {
+                continue;
+              }
+              validateRelativePath(path);
+
+              const fullPath = join(workingClonePath, path);
+              if (existsSync(fullPath)) {
+                const stat = lstatSync(fullPath);
+                if (stat.isSymbolicLink()) {
+                  throw new Error(`CONTAINER_PATCH_INVALID:symlink_not_permitted:${path}`);
+                }
+              }
+            }
+
+            await git(
+              agentState,
+              ['--git-dir', baselineGitDir, 'read-tree', revision.snapshot.baselineCommit],
+              undefined,
+              gitEnv,
+            );
+
+            await git(
+              agentState,
+              ['--git-dir', baselineGitDir, '--work-tree', workingClonePath, 'add', '--all'],
+              undefined,
+              gitEnv,
+            );
+
+            const patch = await git(
+              agentState,
+              [
+                '--git-dir',
+                baselineGitDir,
+                '--work-tree',
+                workingClonePath,
+                'diff',
+                '--cached',
+                '--binary',
+                '--full-index',
+                '--no-renames',
+                revision.snapshot.baselineCommit,
+              ],
+              undefined,
+              gitEnv,
+            );
+            if (Buffer.byteLength(patch) > 16 * 1024 * 1024) throw new Error('CONTAINER_PATCH_TOO_LARGE');
+
+            const names = await git(
+              agentState,
+              [
+                '--git-dir',
+                baselineGitDir,
+                '--work-tree',
+                workingClonePath,
+                'diff',
+                '--cached',
+                '--name-only',
+                '-z',
+                '--no-renames',
+                revision.snapshot.baselineCommit,
+              ],
+              undefined,
+              gitEnv,
+            );
+
+            const numstat = await git(
+              agentState,
+              [
+                '--git-dir',
+                baselineGitDir,
+                '--work-tree',
+                workingClonePath,
+                'diff',
+                '--cached',
+                '--numstat',
+                '--no-renames',
+                revision.snapshot.baselineCommit,
+              ],
+              undefined,
+              gitEnv,
+            );
+
+            const changes = changesFromOutput(patch, names, numstat);
+            if (changes.changedPaths.length > 1000) throw new Error('CONTAINER_TOO_MANY_CHANGED_PATHS');
+            for (const path of changes.changedPaths) validateRelativePath(path);
+
+            if (isDependencyManifestChanged(changes.changedPaths)) {
+              revision.dependencyManifestStale = true;
+            }
+
+            const previousCommit = revision.reviewCommits.get(previousRevision);
+            if (!previousCommit) throw new Error('CONTAINER_REVIEW_COMMIT_NOT_FOUND');
+
+            const deltaPatch = await git(
+              agentState,
+              [
+                '--git-dir',
+                baselineGitDir,
+                '--work-tree',
+                workingClonePath,
+                'diff',
+                '--cached',
+                '--binary',
+                '--full-index',
+                '--no-renames',
+                previousCommit,
+              ],
+              undefined,
+              gitEnv,
+            );
+
+            const deltaNames = await git(
+              agentState,
+              [
+                '--git-dir',
+                baselineGitDir,
+                '--work-tree',
+                workingClonePath,
+                'diff',
+                '--cached',
+                '--name-only',
+                '-z',
+                '--no-renames',
+                previousCommit,
+              ],
+              undefined,
+              gitEnv,
+            );
+
+            const deltaNumstat = await git(
+              agentState,
+              [
+                '--git-dir',
+                baselineGitDir,
+                '--work-tree',
+                workingClonePath,
+                'diff',
+                '--cached',
+                '--numstat',
+                '--no-renames',
+                previousCommit,
+              ],
+              undefined,
+              gitEnv,
+            );
+
+            const deltaChanges = changesFromOutput(deltaPatch, deltaNames, deltaNumstat);
+            for (const path of deltaChanges.changedPaths) validateRelativePath(path);
+
+            revision.changes = changes;
+            revision.patchPath = join(
+              this.stateDir,
+              'container-agents',
+              agentId,
+              'patches',
+              `revision-${nextRevision}`,
+              `${revision.runRepository.name}.full.patch`,
+            );
+            writePatchArtifact(revision.patchPath, changes);
+            writePatchArtifact(
+              join(
+                this.stateDir,
+                'container-agents',
+                agentId,
+                'patches',
+                `revision-${nextRevision}`,
+                `${revision.runRepository.name}.delta.patch`,
+              ),
+              deltaChanges,
+            );
+
+            const treeHash = (
+              await git(agentState, ['--git-dir', baselineGitDir, 'write-tree'], undefined, gitEnv)
+            ).trim();
+            const reviewCommit = (
+              await git(
+                agentState,
+                [
+                  '--git-dir',
+                  baselineGitDir,
+                  'commit-tree',
+                  treeHash,
+                  '-p',
+                  previousCommit,
+                  '-m',
+                  `Local Engineer review revision ${nextRevision}`,
+                ],
+                undefined,
+                gitEnv,
+              )
+            ).trim();
+
+            if (!/^[0-9a-f]{40,64}$/.test(reviewCommit)) throw new Error('CONTAINER_REVIEW_COMMIT_INVALID');
+            revision.reviewCommits.set(nextRevision, reviewCommit);
+
+            if (changes.changedPaths.length)
+              summaries.push({
+                repository: revision.runRepository.name,
+                changed_paths: changes.changedPaths,
+                additions: changes.additions,
+                deletions: changes.deletions,
+                patch_digest: changes.patchDigest,
+                delta_changed_paths: deltaChanges.changedPaths,
+                delta_additions: deltaChanges.additions,
+                delta_deletions: deltaChanges.deletions,
+                delta_patch_digest: deltaChanges.patchDigest,
+                dependency_manifest_stale: Boolean(revision.dependencyManifestStale),
+              });
+          } finally {
+            if (existsSync(tempIndexFile)) {
+              rmSync(tempIndexFile, { force: true });
+            }
+          }
+          continue;
+        }
+
+        if (revision.runRepository.access === 'read-only') {
+          const status = await this.runtime.execContainer(
+            resources.workerContainer,
+            [
+              layout.gitExecutable,
+              '-C',
+              revision.runRepository.containerPath,
+              'status',
+              '--porcelain=v1',
+              '--untracked-files=all',
+            ],
+            { user: layout.administratorUser, workdir: layout.safeAdminWorkdir },
+          );
+          if (status.stdout.trim()) throw new Error(`READ_ONLY_REPOSITORY_CHANGED:${revision.runRepository.name}`);
+          const previousCommit = revision.reviewCommits.get(previousRevision);
+          if (!previousCommit) throw new Error('CONTAINER_REVIEW_COMMIT_NOT_FOUND');
+          revision.reviewCommits.set(nextRevision, previousCommit);
+          continue;
+        }
+        await this.runtime.execContainer(resources.workerContainer, [
+          'git',
+          '-C',
+          revision.runRepository.containerPath,
+          'add',
+          '-A',
+        ]);
+        await this.runtime.execContainer(resources.workerContainer, [
+          'git',
+          '-C',
+          revision.runRepository.containerPath,
+          'reset',
+          '--quiet',
+          revision.snapshot.baselineCommit,
+          '--',
+          ...MANAGED_DEPENDENCY_PATHS,
+        ]);
+        const patch = (
+          await this.runtime.execContainer(resources.workerContainer, [
+            'git',
             '-C',
             revision.runRepository.containerPath,
-            'status',
-            '--porcelain=v1',
-            '--untracked-files=all',
-          ],
-          { user: layout.administratorUser, workdir: layout.safeAdminWorkdir },
-        );
-        if (status.stdout.trim()) throw new Error(`READ_ONLY_REPOSITORY_CHANGED:${revision.runRepository.name}`);
+            'diff',
+            '--cached',
+            '--binary',
+            '--full-index',
+            '--no-renames',
+            revision.snapshot.baselineCommit,
+          ])
+        ).stdout;
+        if (Buffer.byteLength(patch) > 16 * 1024 * 1024) throw new Error('CONTAINER_PATCH_TOO_LARGE');
+        const names = (
+          await this.runtime.execContainer(resources.workerContainer, [
+            'git',
+            '-C',
+            revision.runRepository.containerPath,
+            'diff',
+            '--cached',
+            '--name-only',
+            '-z',
+            '--no-renames',
+            revision.snapshot.baselineCommit,
+          ])
+        ).stdout;
+        const numstat = (
+          await this.runtime.execContainer(resources.workerContainer, [
+            'git',
+            '-C',
+            revision.runRepository.containerPath,
+            'diff',
+            '--cached',
+            '--numstat',
+            '--no-renames',
+            revision.snapshot.baselineCommit,
+          ])
+        ).stdout;
+        const changes = changesFromOutput(patch, names, numstat);
+        if (changes.changedPaths.length > 1000) throw new Error('CONTAINER_TOO_MANY_CHANGED_PATHS');
+        for (const path of changes.changedPaths) validateRelativePath(path);
         const previousCommit = revision.reviewCommits.get(previousRevision);
         if (!previousCommit) throw new Error('CONTAINER_REVIEW_COMMIT_NOT_FOUND');
-        revision.reviewCommits.set(nextRevision, previousCommit);
-        continue;
-      }
-      await this.runtime.execContainer(resources.workerContainer, [
-        'git',
-        '-C',
-        revision.runRepository.containerPath,
-        'add',
-        '-A',
-      ]);
-      await this.runtime.execContainer(resources.workerContainer, [
-        'git',
-        '-C',
-        revision.runRepository.containerPath,
-        'reset',
-        '--quiet',
-        revision.snapshot.baselineCommit,
-        '--',
-        ...MANAGED_DEPENDENCY_PATHS,
-      ]);
-      const patch = (
-        await this.runtime.execContainer(resources.workerContainer, [
-          'git',
-          '-C',
-          revision.runRepository.containerPath,
-          'diff',
-          '--cached',
-          '--binary',
-          '--full-index',
-          '--no-renames',
-          revision.snapshot.baselineCommit,
-        ])
-      ).stdout;
-      if (Buffer.byteLength(patch) > 16 * 1024 * 1024) throw new Error('CONTAINER_PATCH_TOO_LARGE');
-      const names = (
-        await this.runtime.execContainer(resources.workerContainer, [
-          'git',
-          '-C',
-          revision.runRepository.containerPath,
-          'diff',
-          '--cached',
-          '--name-only',
-          '-z',
-          '--no-renames',
-          revision.snapshot.baselineCommit,
-        ])
-      ).stdout;
-      const numstat = (
-        await this.runtime.execContainer(resources.workerContainer, [
-          'git',
-          '-C',
-          revision.runRepository.containerPath,
-          'diff',
-          '--cached',
-          '--numstat',
-          '--no-renames',
-          revision.snapshot.baselineCommit,
-        ])
-      ).stdout;
-      const changes = changesFromOutput(patch, names, numstat);
-      if (changes.changedPaths.length > 1000) throw new Error('CONTAINER_TOO_MANY_CHANGED_PATHS');
-      for (const path of changes.changedPaths) validateRelativePath(path);
-      const previousCommit = revision.reviewCommits.get(previousRevision);
-      if (!previousCommit) throw new Error('CONTAINER_REVIEW_COMMIT_NOT_FOUND');
-      const deltaPatch = (
-        await this.runtime.execContainer(resources.workerContainer, [
-          'git',
-          '-C',
-          revision.runRepository.containerPath,
-          'diff',
-          '--cached',
-          '--binary',
-          '--full-index',
-          '--no-renames',
-          previousCommit,
-        ])
-      ).stdout;
-      const deltaNames = (
-        await this.runtime.execContainer(resources.workerContainer, [
-          'git',
-          '-C',
-          revision.runRepository.containerPath,
-          'diff',
-          '--cached',
-          '--name-only',
-          '-z',
-          '--no-renames',
-          previousCommit,
-        ])
-      ).stdout;
-      const deltaNumstat = (
-        await this.runtime.execContainer(resources.workerContainer, [
-          'git',
-          '-C',
-          revision.runRepository.containerPath,
-          'diff',
-          '--cached',
-          '--numstat',
-          '--no-renames',
-          previousCommit,
-        ])
-      ).stdout;
-      const deltaChanges = changesFromOutput(deltaPatch, deltaNames, deltaNumstat);
-      for (const path of deltaChanges.changedPaths) validateRelativePath(path);
-      revision.changes = changes;
-      revision.patchPath = join(
-        this.stateDir,
-        'container-agents',
-        agentId,
-        'patches',
-        `revision-${nextRevision}`,
-        `${revision.runRepository.name}.full.patch`,
-      );
-      writePatchArtifact(revision.patchPath, changes);
-      writePatchArtifact(
-        join(
+        const deltaPatch = (
+          await this.runtime.execContainer(resources.workerContainer, [
+            'git',
+            '-C',
+            revision.runRepository.containerPath,
+            'diff',
+            '--cached',
+            '--binary',
+            '--full-index',
+            '--no-renames',
+            previousCommit,
+          ])
+        ).stdout;
+        const deltaNames = (
+          await this.runtime.execContainer(resources.workerContainer, [
+            'git',
+            '-C',
+            revision.runRepository.containerPath,
+            'diff',
+            '--cached',
+            '--name-only',
+            '-z',
+            '--no-renames',
+            previousCommit,
+          ])
+        ).stdout;
+        const deltaNumstat = (
+          await this.runtime.execContainer(resources.workerContainer, [
+            'git',
+            '-C',
+            revision.runRepository.containerPath,
+            'diff',
+            '--cached',
+            '--numstat',
+            '--no-renames',
+            previousCommit,
+          ])
+        ).stdout;
+        const deltaChanges = changesFromOutput(deltaPatch, deltaNames, deltaNumstat);
+        for (const path of deltaChanges.changedPaths) validateRelativePath(path);
+        revision.changes = changes;
+        revision.patchPath = join(
           this.stateDir,
           'container-agents',
           agentId,
           'patches',
           `revision-${nextRevision}`,
-          `${revision.runRepository.name}.delta.patch`,
-        ),
-        deltaChanges,
-      );
-      await this.runtime.execContainer(resources.workerContainer, [
-        'git',
-        '-c',
-        'user.name=Local Engineer Review',
-        '-c',
-        'user.email=review@local-engineer.invalid',
-        '-c',
-        'commit.gpgSign=false',
-        '-c',
-        'core.hooksPath=/dev/null',
-        '-C',
-        revision.runRepository.containerPath,
-        'commit',
-        '--allow-empty',
-        '--no-verify',
-        '--no-gpg-sign',
-        '-m',
-        `Local Engineer review revision ${nextRevision}`,
-      ]);
-      const reviewCommit = (
+          `${revision.runRepository.name}.full.patch`,
+        );
+        writePatchArtifact(revision.patchPath, changes);
+        writePatchArtifact(
+          join(
+            this.stateDir,
+            'container-agents',
+            agentId,
+            'patches',
+            `revision-${nextRevision}`,
+            `${revision.runRepository.name}.delta.patch`,
+          ),
+          deltaChanges,
+        );
         await this.runtime.execContainer(resources.workerContainer, [
           'git',
+          '-c',
+          'user.name=Local Engineer Review',
+          '-c',
+          'user.email=review@local-engineer.invalid',
+          '-c',
+          'commit.gpgSign=false',
+          '-c',
+          'core.hooksPath=/dev/null',
           '-C',
           revision.runRepository.containerPath,
-          'rev-parse',
-          'HEAD',
-        ])
-      ).stdout.trim();
-      if (!/^[0-9a-f]{40,64}$/.test(reviewCommit)) throw new Error('CONTAINER_REVIEW_COMMIT_INVALID');
-      revision.reviewCommits.set(nextRevision, reviewCommit);
-      if (changes.changedPaths.length)
-        summaries.push({
-          repository: revision.runRepository.name,
-          changed_paths: changes.changedPaths,
-          additions: changes.additions,
-          deletions: changes.deletions,
-          patch_digest: changes.patchDigest,
-          delta_changed_paths: deltaChanges.changedPaths,
-          delta_additions: deltaChanges.additions,
-          delta_deletions: deltaChanges.deletions,
-          delta_patch_digest: deltaChanges.patchDigest,
-        });
+          'commit',
+          '--allow-empty',
+          '--no-verify',
+          '--no-gpg-sign',
+          '-m',
+          `Local Engineer review revision ${nextRevision}`,
+        ]);
+        const reviewCommit = (
+          await this.runtime.execContainer(resources.workerContainer, [
+            'git',
+            '-C',
+            revision.runRepository.containerPath,
+            'rev-parse',
+            'HEAD',
+          ])
+        ).stdout.trim();
+        if (!/^[0-9a-f]{40,64}$/.test(reviewCommit)) throw new Error('CONTAINER_REVIEW_COMMIT_INVALID');
+        revision.reviewCommits.set(nextRevision, reviewCommit);
+        if (changes.changedPaths.length)
+          summaries.push({
+            repository: revision.runRepository.name,
+            changed_paths: changes.changedPaths,
+            additions: changes.additions,
+            deletions: changes.deletions,
+            patch_digest: changes.patchDigest,
+            delta_changed_paths: deltaChanges.changedPaths,
+            delta_additions: deltaChanges.additions,
+            delta_deletions: deltaChanges.deletions,
+            delta_patch_digest: deltaChanges.patchDigest,
+            dependency_manifest_stale: Boolean(revision.dependencyManifestStale),
+          });
+      }
+    } finally {
+      if (pausedWorker) {
+        await this.runtime.unpauseContainer(resources.workerContainer).catch(() => undefined);
+      }
     }
+
     resources.revision = nextRevision;
     const digest = `sha256:${createHash('sha256')
       .update(JSON.stringify(summaries.map((summary) => [summary.repository, summary.patch_digest])))
       .digest('hex')}`;
+
+    writeFileSync(
+      join(agentState, 'review-commits.json'),
+      JSON.stringify(
+        Object.fromEntries(
+          [...resources.repositories.entries()].map(([name, rev]) => [
+            name,
+            Object.fromEntries(rev.reviewCommits.entries()),
+          ]),
+        ),
+        null,
+        2,
+      ),
+      { encoding: 'utf8', mode: 0o600 },
+    );
+
+    writeFileSync(
+      join(agentState, 'dependency-manifest-stale.json'),
+      JSON.stringify(
+        Object.fromEntries(
+          [...resources.repositories.entries()].map(([name, rev]) => [name, Boolean(rev.dependencyManifestStale)]),
+        ),
+        null,
+        2,
+      ),
+      { encoding: 'utf8', mode: 0o600 },
+    );
+
+    const anyManifestStale = [...resources.repositories.values()].some((r) => r.dependencyManifestStale);
     return {
       revision: resources.revision,
       previous_revision: previousRevision,
       digest,
       repositories: summaries,
+      dependency_manifest_stale: anyManifestStale,
     };
   }
 
@@ -1207,19 +2027,38 @@ export class ContainerAgentManager {
     const fromCommit = revision.reviewCommits.get(fromRevision);
     const toCommit = revision.reviewCommits.get(toRevision);
     if (!fromCommit || !toCommit) throw new Error('CONTAINER_REVIEW_COMMIT_NOT_FOUND');
-    const patch = (
-      await this.runtime.execContainer(resources.workerContainer, [
-        'git',
-        '-C',
-        revision.runRepository.containerPath,
+
+    let patch: string;
+    if (
+      this.config.platform === 'windows' &&
+      (resources.windowsWorkspaceMode === 'isolated-bind' || resources.windowsRepositoryMounts !== undefined)
+    ) {
+      const baselineGitDir = join(revision.snapshot.snapshotPath, '.git');
+      patch = await git(this.stateDir, [
+        '--git-dir',
+        baselineGitDir,
         'diff',
         '--binary',
         '--full-index',
         '--no-renames',
         fromCommit,
         toCommit,
-      ])
-    ).stdout;
+      ]);
+    } else {
+      patch = (
+        await this.runtime.execContainer(resources.workerContainer, [
+          'git',
+          '-C',
+          revision.runRepository.containerPath,
+          'diff',
+          '--binary',
+          '--full-index',
+          '--no-renames',
+          fromCommit,
+          toCommit,
+        ])
+      ).stdout;
+    }
     if (Buffer.byteLength(patch) > 16 * 1024 * 1024) throw new Error('CONTAINER_PATCH_TOO_LARGE');
     return patch;
   }
@@ -1229,15 +2068,80 @@ export class ContainerAgentManager {
     const resources = this.require(agentId);
     const revision = resources.repositories.get(repository);
     if (!revision) throw new Error('CONTAINER_REPOSITORY_NOT_FOUND');
-    const result = await this.runtime.execContainer(resources.workerContainer, [
-      'node',
-      '--eval',
-      "process.stdout.write(require('node:fs').readFileSync(process.argv[1],'utf8'))",
-      posix.join(revision.runRepository.containerPath, path.replaceAll('\\', '/')),
-    ]);
-    if (Buffer.byteLength(result.stdout) > maximumBytes) throw new Error('CONTAINER_FILE_TOO_LARGE');
-    if (result.stdout.includes('\0')) throw new Error('CONTAINER_FILE_BINARY');
-    return result.stdout;
+
+    const reviewCommit = revision.reviewCommits.get(resources.revision) ?? revision.snapshot.baselineCommit;
+    const isIsolatedBind =
+      resources.windowsWorkspaceMode === 'isolated-bind' || resources.windowsRepositoryMounts !== undefined;
+    const normalizedPath = path.replaceAll('\\', '/');
+
+    if (isIsolatedBind) {
+      const gitDir = join(revision.snapshot.snapshotPath, '.git');
+      try {
+        const type = (
+          await git(revision.snapshot.snapshotPath, [
+            '--git-dir',
+            gitDir,
+            'cat-file',
+            '-t',
+            `${reviewCommit}:${normalizedPath}`,
+          ])
+        ).trim();
+        if (type !== 'blob') {
+          throw new Error('CONTAINER_FILE_NOT_FOUND');
+        }
+        const content = await git(revision.snapshot.snapshotPath, [
+          '--git-dir',
+          gitDir,
+          'cat-file',
+          '-p',
+          `${reviewCommit}:${normalizedPath}`,
+        ]);
+        if (Buffer.byteLength(content) > maximumBytes) throw new Error('CONTAINER_FILE_TOO_LARGE');
+        if (content.includes('\0')) throw new Error('CONTAINER_FILE_BINARY');
+        return content;
+      } catch (cause) {
+        if (cause instanceof Error) {
+          if (
+            ['CONTAINER_FILE_NOT_FOUND', 'CONTAINER_FILE_TOO_LARGE', 'CONTAINER_FILE_BINARY'].includes(cause.message)
+          ) {
+            throw cause;
+          }
+          if (cause.message.includes('does not exist') || cause.message.includes('Not a valid object name')) {
+            throw new Error('CONTAINER_FILE_NOT_FOUND');
+          }
+        }
+        throw cause;
+      }
+    }
+
+    try {
+      const typeResult = await this.runtime.execContainer(
+        resources.workerContainer,
+        ['git', '-C', revision.runRepository.containerPath, 'cat-file', '-t', `${reviewCommit}:${normalizedPath}`],
+        { user: this.config.worker_user },
+      );
+      if (typeResult.stdout.trim() !== 'blob') {
+        throw new Error('CONTAINER_FILE_NOT_FOUND');
+      }
+      const showResult = await this.runtime.execContainer(
+        resources.workerContainer,
+        ['git', '-C', revision.runRepository.containerPath, 'cat-file', '-p', `${reviewCommit}:${normalizedPath}`],
+        { user: this.config.worker_user },
+      );
+      if (Buffer.byteLength(showResult.stdout) > maximumBytes) throw new Error('CONTAINER_FILE_TOO_LARGE');
+      if (showResult.stdout.includes('\0')) throw new Error('CONTAINER_FILE_BINARY');
+      return showResult.stdout;
+    } catch (cause) {
+      if (cause instanceof Error) {
+        if (['CONTAINER_FILE_NOT_FOUND', 'CONTAINER_FILE_TOO_LARGE', 'CONTAINER_FILE_BINARY'].includes(cause.message)) {
+          throw cause;
+        }
+        if (cause.message.includes('does not exist') || cause.message.includes('Not a valid object name')) {
+          throw new Error('CONTAINER_FILE_NOT_FOUND');
+        }
+      }
+      throw cause;
+    }
   }
 
   /**
@@ -1247,7 +2151,12 @@ export class ContainerAgentManager {
    * - Verifies parent repository working tree has not diverged since the baseline snapshot.
    * - Applies patches to the host working tree and index, rolling back on failure.
    */
-  async promote(agentId: string, expectedRevision: number, expectedDigest: string): Promise<void> {
+  async promote(
+    agentId: string,
+    expectedRevision: number,
+    expectedDigest: string,
+    options?: { allowStaleDependencies?: boolean },
+  ): Promise<void> {
     const resources = this.require(agentId);
     if (resources.revision !== expectedRevision) throw new Error('CHANGE_SET_REVISION_MISMATCH');
     const summaries = [...resources.repositories.values()]
@@ -1256,6 +2165,14 @@ export class ContainerAgentManager {
     const digest = `sha256:${createHash('sha256').update(JSON.stringify(summaries)).digest('hex')}`;
     if (digest !== expectedDigest) throw new Error('CHANGE_SET_DIGEST_MISMATCH');
     const changed = [...resources.repositories.values()].filter((revision) => revision.changes?.changedPaths.length);
+
+    for (const revision of changed) {
+      if (revision.dependencyManifestStale && !options?.allowStaleDependencies) {
+        throw new Error(
+          `PROMOTION_DEPENDENCY_MANIFEST_STALE: Repository '${revision.runRepository.name}' modified dependency manifests while dependencies were mounted read-only. Host dependencies must be updated after promotion. Set allow_stale_dependencies to proceed.`,
+        );
+      }
+    }
     const locks = this.acquirePromotionLocks(changed);
     try {
       for (const revision of changed) await checkRepositoryPromotion(revision.snapshot, revision.changes!);
@@ -1306,6 +2223,10 @@ export class ContainerAgentManager {
    * - Deletes workspace, config, dependency, and shared proxy volumes.
    * - Purges the agent's state directory.
    */
+  async cleanup(agentId: string): Promise<void> {
+    return this.delete(agentId);
+  }
+
   async delete(agentId: string): Promise<void> {
     const suffix = createHash('sha256').update(agentId).digest('hex').slice(0, 20);
     const prefix = `le-${suffix}`;
@@ -1329,7 +2250,12 @@ export class ContainerAgentManager {
       } satisfies ContainerAgentResources);
     await this.cleanupResources(resources);
     this.agents.delete(agentId);
-    rmSync(join(this.stateDir, 'container-agents', agentId), { recursive: true, force: true });
+    const agentDir = resolve(this.stateDir, 'container-agents', agentId);
+    const expectedParent = resolve(this.stateDir, 'container-agents');
+    if (!agentDir.startsWith(expectedParent) || agentDir === expectedParent) {
+      throw new Error('CONTAINER_AGENT_CLEANUP_PATH_INVALID');
+    }
+    rmSync(agentDir, { recursive: true, force: true });
   }
 
   private require(agentId: string): ContainerAgentResources {
@@ -1355,6 +2281,10 @@ export class ContainerAgentManager {
       await this.runtime.removeNetwork(resources.egressNetwork).catch(() => undefined);
     if (await this.runtime.hasOwnershipLabels('volume', resources.workspaceVolume, labels))
       await this.runtime.removeVolume(resources.workspaceVolume).catch(() => undefined);
+    for (const volume of resources.repositoryVolumes.values()) {
+      if (await this.runtime.hasOwnershipLabels('volume', volume, labels))
+        await this.runtime.removeVolume(volume).catch(() => undefined);
+    }
     if (await this.runtime.hasOwnershipLabels('volume', resources.workerConfigVolume, labels))
       await this.runtime.removeVolume(resources.workerConfigVolume).catch(() => undefined);
     if (await this.runtime.hasOwnershipLabels('volume', resources.proxyConfigVolume, labels))
@@ -1478,4 +2408,51 @@ function repositoryVolumeName(prefix: string, repository: Pick<RunRepository, 'n
     .replace(/^-+|-+$/g, '')
     .slice(0, 32);
   return `${prefix}-repo-${slug ? `${slug}-` : ''}${hash}`;
+}
+
+export function assertNoReparsePoints(rootDir: string, currentDir = rootDir): void {
+  if (currentDir === rootDir) {
+    let rootStat;
+    try {
+      rootStat = fs.lstatSync(rootDir);
+    } catch (cause) {
+      throw new Error(
+        `CONTAINER_PATCH_INVALID:unreadable_path:${rootDir}:${cause instanceof Error ? cause.message : String(cause)}`,
+      );
+    }
+    if (rootStat.isSymbolicLink()) {
+      throw new Error('CONTAINER_PATCH_INVALID:reparse_point_detected:.');
+    }
+  }
+
+  let entries;
+  try {
+    entries = fs.readdirSync(currentDir, { withFileTypes: true });
+  } catch (cause) {
+    const rel = relative(rootDir, currentDir).replace(/\\/g, '/') || '.';
+    throw new Error(
+      `CONTAINER_PATCH_INVALID:unreadable_directory:${rel}:${cause instanceof Error ? cause.message : String(cause)}`,
+    );
+  }
+  for (const entry of entries) {
+    const fullPath = join(currentDir, entry.name);
+    const relPath = relative(rootDir, fullPath).replace(/\\/g, '/');
+    if (entry.isSymbolicLink()) {
+      throw new Error(`CONTAINER_PATCH_INVALID:reparse_point_detected:${relPath}`);
+    }
+    let stat;
+    try {
+      stat = fs.lstatSync(fullPath);
+    } catch (cause) {
+      throw new Error(
+        `CONTAINER_PATCH_INVALID:unreadable_path:${relPath}:${cause instanceof Error ? cause.message : String(cause)}`,
+      );
+    }
+    if (stat.isSymbolicLink()) {
+      throw new Error(`CONTAINER_PATCH_INVALID:reparse_point_detected:${relPath}`);
+    }
+    if (entry.isDirectory() && entry.name !== '.git') {
+      assertNoReparsePoints(rootDir, fullPath);
+    }
+  }
 }

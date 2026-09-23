@@ -11,7 +11,7 @@
 Local Engineer is a [Model Context Protocol](https://modelcontextprotocol.io/)
 server that delegates bounded engineering work to locally hosted coding models.
 Each untrusted worker operates autonomously inside an isolated, disposable
-container—never in the parent checkout or through a host repository mount.
+container—never in the parent checkout or through a direct parent repository checkout mount.
 
 The parent Codex agent plans and supervises the work. It receives bounded
 lifecycle metadata, a structured report, and only the Git diffs or files it
@@ -206,11 +206,17 @@ When the `local_engineer_*` MCP tools are available, ALWAYS use configured Local
 Container workers are autonomous and their output is untrusted. Safety comes
 from an external isolation and promotion boundary:
 
-- The parent repositories are copied into private Git snapshots; they are never
-  mounted into the worker container.
-- The complete selected worktree is copied, including ignored files. Anything
-  stored there—such as dependencies, build outputs, local data, or `.env`
-  files—is readable by the untrusted worker. Keep secrets outside selected
+- The parent repository checkout is never mounted into the worker container.
+  In `isolated-bind` mode (recommended on Windows), Local Engineer maintains an
+  immutable baseline clone on the host and bind-mounts a disposable working
+  clone into the worker container, while mounting dependencies read-only.
+  In `volume-copy` mode, repositories are copied into private Git snapshots
+  and seeded into dedicated Docker named volumes.
+- In `volume-copy` mode, the complete selected worktree is copied, including
+  ignored files and local build data. In `isolated-bind` mode, discovered dependency
+  directories are bind-mounted read-only from the host, while ordinary ignored files
+  are omitted from the clone; any file tracked in Git (including tracked `.env`
+  files) remains present. In either mode, keep secrets outside selected
   repositories and inject only explicitly configured credentials.
 - The worker receives no container-runtime socket, host home, SSH agent, browser
   profile, parent MCP credentials, or reusable `CODEX_HOME`.
@@ -232,7 +238,8 @@ from an external isolation and promotion boundary:
   unprivileged user. Windows containers require `--isolation hyperv`, run
   untrusted work as `ContainerUser`, apply memory/CPU ceilings, protect installed
   tools with NTFS ACLs, and enforce read-only repositories via Docker read-only
-  volume mounts and write-probe assertions. Process isolation is never accepted
+  volume mounts (in `volume-copy` mode) or read-only bind mounts (in `isolated-bind`
+  mode) with write-probe assertions. Process isolation is never accepted
   for Windows workers.
 - Worker changes reach the parent only through an exact, independently captured
   Git revision that the parent reviews and explicitly promotes.
@@ -292,29 +299,40 @@ multi-repository `workspace`. Every repository must:
 - be a Git repository with a valid `HEAD`; and
 - have an explicit `read-write` or `read-only` access mode.
 
-Local Engineer copies the complete current worktree into the private workspace,
-including committed files, staged and unstaged edits, untracked files, and
-ignored content such as `node_modules`. This lets each worker begin with the
-same dependencies and local build state as the parent without concurrent agents
-reinstalling into a shared checkout.
+Repository preparation depends on the configured workspace mode:
 
-The parent repository's root `.git` metadata is not exposed to the worker.
-After copying the worktree, Local Engineer replaces it with private snapshot
-metadata. If the Git-visible state is dirty, Local Engineer creates an
-ephemeral commit inside that private snapshot. The commit is only a comparison
-baseline and never appears in the parent repository.
+- **`isolated-bind` mode (recommended on Windows)**: Local Engineer uses a
+  fast three-tier clone model that avoids copying large dependency directories.
+  It creates an immutable baseline clone (`snapshots/<name>`) from the parent
+  repository checkout and an independent disposable working clone
+  (`workspaces/<name>`). Discovered dependency trees (`node_modules`) are
+  validated on the host against escaping junctions and bind-mounted read-only
+  over the working clone at mirrored paths, while ordinary ignored files are
+  omitted from the clone. Startup time and disk use remain minimal because
+  heavy dependencies are shared read-only rather than duplicated.
+- **`volume-copy` mode**: Local Engineer copies the complete current worktree
+  into the private workspace, including committed files, staged and unstaged
+  edits, untracked files, and ignored content such as `node_modules`. This lets
+  each worker begin with the same dependencies and local build state as the
+  parent, but startup time and disk use scale with the size of copied worktrees.
 
-Ignored content is available for execution and tests but remains outside the
-Git review and promotion contract. Worker changes to ignored files are
-discarded with the container. Each concurrent agent receives its own full copy,
-so startup time and temporary disk use scale with the selected worktrees.
+The parent repository's root `.git` metadata is never exposed to the worker.
+Local Engineer replaces it with private snapshot or clone metadata. If the
+Git-visible state is dirty, Local Engineer creates an ephemeral commit inside
+the baseline snapshot. The commit is only a comparison baseline and never
+appears in the parent repository.
 
-Each worker also receives an agent-scoped writable dependency volume at
-`$LOCAL_ENGINEER_DEPENDENCY_ROOT`, outside every repository. Python virtual
-environments and package caches belong there when copied dependencies are
-missing or incompatible. Local Engineer excludes its managed dependency paths
-from Git capture as a backstop, so generated package trees such as
-`.local-pkgs`, `.venv`, and `node_modules` cannot inflate a review patch or be
+In `volume-copy` mode, ignored content from the worktree is copied and available
+for execution and tests; in `isolated-bind` mode, only discovered dependency
+directories (`node_modules`) are mounted read-only, while ordinary ignored files
+are omitted. In both modes, ignored content remains outside the Git review and
+promotion contract, and worker changes to ignored files cannot be promoted. Each
+worker also receives an agent-scoped writable dependency volume
+at `$LOCAL_ENGINEER_DEPENDENCY_ROOT`, outside every repository. Python
+virtual environments and package caches belong there when pre-existing
+dependencies are missing or incompatible. Local Engineer excludes its managed
+dependency paths from Git capture as a backstop, so generated package trees such
+as `.local-pkgs`, `.venv`, and `node_modules` cannot inflate a review patch or be
 promoted accidentally.
 
 ### 2. Create an isolated worker
@@ -326,15 +344,20 @@ Each agent receives:
 - one worker-side network with direct egress blocked by the platform-specific
   network boundary;
 - one egress-capable network connected only to the proxy;
-- one ephemeral workspace volume;
+- an isolated workspace: in `volume-copy` mode, an ephemeral workspace named
+  volume; in `isolated-bind` mode, a host-backed disposable working clone bind
+  mount accompanied by read-only dependency bind mounts;
 - separate ephemeral worker and proxy configuration volumes; and
 - a minimal Codex configuration with no MCP servers, hooks, plugins, or web
   search.
 
-A short-lived setup container seeds the volumes and is removed before the
-worker begins. Local Engineer invokes a configurable Docker-compatible CLI, so
-the runtime may be Docker, Podman, nerdctl, or another compatible command that
-passes the capability probe.
+In `volume-copy` mode, short-lived setup containers seed repository volumes,
+configuration, and caches before the worker begins. In `isolated-bind` mode,
+repositories are prepared offline on the host without volume copying, while a
+consolidated setup container initializes configuration and cache volumes and
+applies required permissions. Local Engineer invokes a configurable
+Docker-compatible CLI, so the runtime may be Docker, Podman, nerdctl, or
+another compatible command that passes the capability probe.
 
 ### 3. Run autonomously
 
@@ -467,6 +490,10 @@ container:
     allow_private_model_endpoint: false
 ```
 
+`codex_command: codex` uses the image's fully qualified native Codex executable. This is required for Windows
+containers because direct `docker exec` calls cannot launch npm's `codex.cmd` shell shim. A different configured
+command is passed through unchanged.
+
 `container.command` is the exact executable Local Engineer invokes. Set
 `container.context` when the CLI has more than one daemon—for example, use
 `default` for a Rancher Desktop Moby daemon if `docker context ls` shows that
@@ -498,7 +525,7 @@ Native Windows workers fail closed unless all of these controls are active:
   `ContainerAdministrator`;
 - each Hyper-V utility VM receives explicit memory and CPU ceilings;
 - setup containers lose all non-loopback routes before they process repository
-  data; and
+  data or initialize volumes; and
 - the worker retains only its own address and an on-link `/32` route to the
   current sidecar IP. `ContainerUser` cannot restore privileged routes.
 
@@ -515,6 +542,9 @@ container:
   worker_user: ContainerUser
   windows_memory_limit: 4g
   windows_cpu_count: 2
+  # Workspace mode: 'isolated-bind' (recommended fast mode: three-tier clone with read-only dependency mounts)
+  # or 'volume-copy' (schema default: legacy named-volume copy)
+  windows_workspace_mode: isolated-bind
 ```
 
 Build and validate after switching Docker Desktop to Windows containers:
@@ -582,9 +612,11 @@ For a Rust project that must fetch crates, add only the exact required hosts to
 `github.com` only for an explicitly used Git dependency. Tauri's JavaScript
 packages use the same npm registry policy as other Node projects.
 Project dependencies are not baked into the shared image. They come from the
-private worktree copy or can be rebuilt in a read-write repository when the
-configured `read_only_domains` permit the required registries and artifact
-hosts. Never bake credentials into the image.
+private worktree copy (in `volume-copy` mode) or read-only dependency mounts
+(in `isolated-bind` mode), or can be rebuilt in a read-write repository or
+`$LOCAL_ENGINEER_DEPENDENCY_ROOT` when the configured `read_only_domains` permit
+the required registries and artifact hosts. Never bake credentials into the
+image.
 
 ### Project image profiles
 
@@ -1043,11 +1075,33 @@ Concurrency is layered:
 | --------------------------- | ----------------------------------------------------------------- |
 | `server.max_concurrency`    | Active agents across the shared state directory.                  |
 | `workers[].max_concurrency` | Active agents for one worker profile.                             |
-| Per-agent queue             | Continuations for one private Codex session run serially.         |
+| Multi-process leases        | Active runs and side-effecting agent operations are leased by `ownerId` with periodic heartbeats. |
+| Cleanup-before-release      | Expired worker runs remain capacity-consuming `recovery_required` records until resource cleanup succeeds. |
+| Split-brain fencing         | Monotonic `fenceToken` protects recovery, event ingestion, and agent operations from stale processes. |
+| Per-agent operation claims  | Reply, promotion, and deletion claim the latest agent record before any external side effect. |
 | Promotion locks             | Affected parent repositories are locked during pre-flight check and promotion. |
 
 Workers may run concurrently because they edit separate snapshots. Promotion
 still conflicts when another actor changes an affected parent path.
+
+### Multi-process leases and split-brain fencing
+
+When multiple Local Engineer processes share the same state directory:
+
+- **Lease heartbeats**: Active runs and in-flight reply/promotion/deletion claims record `ownerId`, `leaseHeartbeatAt`, and `leaseExpiresAt` (default 30 seconds). A live server process automatically sends periodic heartbeats (every 5 seconds) for its owned records.
+- **Transactional reconciliation and cleanup**: During startup or periodic maintenance, `reconcileStaleRuns()` checks for leases that have expired (`leaseExpiresAt <= now`). A worker-backed run is atomically fenced and moved to `recovery_required`; it continues consuming concurrency capacity while the adopting process awaits adapter and container-agent cleanup. Only successful cleanup moves it to `failed` or `cancelled` and releases capacity. Cleanup failure remains `recovery_required` with `requires_user_action: true`. An expired queued run has no worker resources and is cancelled directly.
+- **Live-owner preservation**: A live server instance never reclaims or alters active runs belonging to another live instance whose lease is valid, nor can one instance claim or start runs queued by another owner in `tryStart`.
+- **Fenced event ingestion**: Raw worker events, completed assistant messages, token accounting, and activity updates are fence-validated while a SQLite immediate transaction excludes reconciliation. SQLite writes are transactional; raw-event and metadata file writes are serialized with that check but cannot be rolled back with the database.
+- **Exclusive agent operations**: Reply, promotion, and deletion atomically claim the latest agent run, assign the current owner, and increment its `fenceToken` before retained-container recovery, host promotion, or resource deletion. A competing process fails before performing the external side effect. An ambiguous claimed-operation failure or lease expiry becomes `recovery_required`; further reply, promotion, and deletion claims fail closed until an operator resolves the ambiguous operation. Expiry alone does not prove the old external operation stopped.
+- **Fencing tokens**: Reconciliation and agent-operation claims increment `fenceToken`. If a delayed or paused owner attempts to mutate a reclaimed or claimed run, the update is rejected. Recovery state requires an explicit current token, and ordinary terminal-state mutation is forbidden.
+- **Legacy record safety**: Pre-lease historical records lacking lease metadata are handled conservatively and preserved (never declared dead on startup).
+
+### Cancellable startup attempts and late-prepare cleanup
+
+Startup operations are fenced by unique attempt identifiers validated across every asynchronous boundary:
+
+- If startup times out or is cancelled while worker container preparation is in-flight, the attempt is immediately marked invalid and the run transitions to `failed` (`STARTUP_TIMEOUT`) or `cancelled`.
+- When container preparation resolves late in the background, invalidation is detected before writing `run.container_prepared`, creating an adapter, or starting a turn. The server immediately invokes container cleanup (`manager.cleanup(agentId)`) to release all container and network resources, avoiding orphaned containers and preventing unhandled background rejections.
 
 Run listing is connection-scoped, but completed container agents are retained
 with their private snapshots, review commits, and resource manifest. A parent
@@ -1092,18 +1146,24 @@ separate future decision.
 ## Current limitations
 
 - Repositories without a valid `HEAD` are unsupported.
-- Ignored files are copied for worker use but cannot be reviewed or promoted
-  through the Git patch.
-- The worker can read every file in a selected worktree, including ignored
-  local files. Secrets must be stored elsewhere or injected through the
-  configured credential environment.
-- Host dependency trees are copied as-is. Native binaries, virtual environments,
-  or launchers may not run when the host and worker container use different
-  operating systems or architectures. The bundled Linux image provides Node.js
-  24 and Python 3.12; the Windows image provides Node.js 24 and Python 3.14.
-  Incompatible project dependencies may still need to be
-  reinstalled inside the private read-write worktree. This requires the relevant
-  registry and artifact domains to be explicitly allowlisted.
+- Ignored files (whether copied into the workspace in `volume-copy` mode or
+  supplied via read-only dependency mounts in `isolated-bind` mode) cannot be
+  reviewed or promoted through the Git patch.
+- In `volume-copy` mode, the worker can read every file in a selected worktree,
+  including ignored local files. In `isolated-bind` mode, ordinary ignored files
+  (such as untracked local `.env` files) are omitted from the clone, but any
+  file tracked in Git (including tracked `.env` files) is present in the
+  workspace. In either mode, secrets must be stored outside selected repositories
+  or injected through the configured credential environment.
+- Host dependency trees are provided as-is (copied in `volume-copy` mode or
+  mounted read-only in `isolated-bind` mode). Native binaries, virtual
+  environments, or launchers may not run when the host and worker container use
+  different operating systems or architectures. The bundled Linux image provides
+  Node.js 24 and Python 3.12; the Windows image provides Node.js 24 and Python
+  3.14. Incompatible project dependencies may still need to be reinstalled
+  inside the private read-write worktree or `$LOCAL_ENGINEER_DEPENDENCY_ROOT`.
+  This requires the relevant registry and artifact domains to be explicitly
+  allowlisted.
 - The shared image provides Rust and Linux Tauri build prerequisites, not every
   project dependency or platform target. Cross-compilation, mobile targets,
   platform-specific signing, and dependency registries such as crates.io still
@@ -1115,7 +1175,6 @@ separate future decision.
   externally built base image for other toolchains.
 - Submodules, Git LFS, unusual file modes, very large binaries, and non-Git
   state may have limitations.
-- Crash-orphan reconciliation is pending.
 - Windows project image profiles are not supported.
 - Native Windows-container mode requires Docker Desktop and Hyper-V isolation;
   process-isolated Windows containers are intentionally unsupported.

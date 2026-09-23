@@ -93,6 +93,7 @@ const containerSchema = z
       .regex(/^[1-9][0-9]*(?:[kKmMgG])?[bB]?$/)
       .default('4g'),
     windows_cpu_count: z.number().int().positive().max(64).default(2),
+    windows_workspace_mode: z.enum(['volume-copy', 'isolated-bind']).default('volume-copy'),
     network: z
       .object({
         model_domains: z.array(networkDomainSchema).min(1),
@@ -117,12 +118,21 @@ const containerSchema = z
           path: ['worker_user'],
           message: 'Windows workers must use ContainerUser',
         });
-    } else if (windowsPath) {
-      context.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['workspace_path'],
-        message: 'Linux workspace path required',
-      });
+    } else {
+      if (windowsPath) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['workspace_path'],
+          message: 'Linux workspace path required',
+        });
+      }
+      if (container.windows_workspace_mode === 'isolated-bind') {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['windows_workspace_mode'],
+          message: 'isolated-bind workspace mode is only supported on Windows platform',
+        });
+      }
     }
   });
 const workspaceSchema = z
