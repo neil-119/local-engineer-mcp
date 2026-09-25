@@ -96,7 +96,7 @@ export class ContainerRuntime {
    * Executes a comprehensive live capability probe of the container runtime:
    * 1. Validates Docker daemon responsiveness and OS platform match.
    * 2. Inspects base image availability and architectural compatibility.
-   * 3. Tests dual-network provisioning (bridge on Linux, NAT with 10.x subnets on Windows).
+   * 3. Tests private-network provisioning and, on Windows, the default NAT network's presence.
    * 4. Tests container creation with platform security controls (Hyper-V isolation, CPU/RAM caps).
    * 5. Boots test container and validates network routing lockdown and unprivileged user identity.
    * 6. Completely tears down all probe resources.
@@ -120,12 +120,8 @@ export class ContainerRuntime {
       await this.run(['info']);
       await this.run(['image', 'inspect', baseImage]);
       if (this.platform === 'windows') {
-        await this.createNetworkPair({
-          internalName: internal,
-          egressName: egress,
-          labels,
-          candidates: agentNetworkSubnetCandidates(`probe-${suffix}`),
-        });
+        await this.run(['network', 'inspect', 'nat']);
+        await this.createWindowsInternalNetwork(internal, labels, agentNetworkSubnetCandidates(`probe-${suffix}`));
       } else {
         await this.createNetwork(internal, true, labels);
         await this.createNetwork(egress, false, labels);
@@ -154,8 +150,7 @@ export class ContainerRuntime {
         await this.assertWindowsHyperVIsolation(container);
         await this.assertWindowsResourceLimits(container);
       }
-      await this.connectNetwork(egress, container);
-      if (this.platform === 'windows') await this.disconnectNetwork(egress, container);
+      if (this.platform === 'linux') await this.connectNetwork(egress, container);
       if (this.platform === 'windows') {
         await this.startContainer(container);
         const endpoint = await this.containerNetworkEndpoint(container, internal);
@@ -309,6 +304,24 @@ export class ContainerRuntime {
     throw new Error('CONTAINER_AGENT_NETWORK_POOL_EXHAUSTED');
   }
 
+  /** Windows supports one working outbound NAT; only the worker's private network is per-agent. */
+  async createWindowsInternalNetwork(
+    name: string,
+    labels: Record<string, string>,
+    candidates: ReadonlyArray<{ internal: string }>,
+  ): Promise<string> {
+    if (this.platform !== 'windows') throw new Error('CONTAINER_WINDOWS_NETWORK_PLATFORM_REQUIRED');
+    for (const candidate of candidates) {
+      try {
+        await this.createNetwork(name, true, labels, candidate.internal);
+        return candidate.internal;
+      } catch (cause) {
+        if (!isNetworkPoolOverlap(cause)) throw cause;
+      }
+    }
+    throw new Error('CONTAINER_AGENT_NETWORK_POOL_EXHAUSTED');
+  }
+
   removeNetwork(name: string): Promise<RuntimeCommandResult> {
     validateResourceName(name);
     return this.run(['network', 'rm', name]);
@@ -433,10 +446,12 @@ export class ContainerRuntime {
     return this.run(['logs', '--tail', String(tail), name]);
   }
 
-  connectNetwork(network: string, container: string): Promise<RuntimeCommandResult> {
+  connectNetwork(network: string, container: string, address?: string): Promise<RuntimeCommandResult> {
     validateResourceName(network);
     validateResourceName(container);
-    return this.run(['network', 'connect', network, container]);
+    if (address && !/^10\.\d{1,3}\.\d{1,3}\.2$/.test(address))
+      throw new Error('CONTAINER_NETWORK_STATIC_ADDRESS_INVALID');
+    return this.run(['network', 'connect', ...(address ? ['--ip', address] : []), network, container]);
   }
 
   disconnectNetwork(network: string, container: string): Promise<RuntimeCommandResult> {
@@ -740,7 +755,13 @@ export class ContainerRuntime {
     const networks = JSON.parse(result.stdout.trim()) as Record<string, { IPAddress?: unknown; MacAddress?: unknown }>;
     const address = networks[network]?.IPAddress;
     const macAddress = networks[network]?.MacAddress;
-    if (typeof address !== 'string' || isIP(address) !== 4 || !address.startsWith('10.'))
+    if (
+      typeof address !== 'string' ||
+      isIP(address) !== 4 ||
+      (network === 'nat'
+        ? !/^(?:10\.|172\.(?:1[6-9]|2\d|3[01])\.|192\.168\.)/.test(address)
+        : !address.startsWith('10.'))
+    )
       throw new Error('CONTAINER_NETWORK_ADDRESS_INVALID');
     if (typeof macAddress !== 'string' || !/^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/i.test(macAddress))
       throw new Error('CONTAINER_NETWORK_MAC_INVALID');

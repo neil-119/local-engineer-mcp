@@ -13,6 +13,7 @@ export function writeContainerCodexConfigs(
   container: ContainerConfig,
   workerConfigPath: string,
   proxyConfigPath: string,
+  proxyBindAddress?: string,
 ): GeneratedCodexConfigPaths {
   mkdirSync(dirname(workerConfigPath), { recursive: true });
   mkdirSync(dirname(proxyConfigPath), { recursive: true });
@@ -23,7 +24,7 @@ export function writeContainerCodexConfigs(
   } else {
     writeFileSync(workerConfigPath, generatedWorkerConfig(worker), { encoding: 'utf8', mode: 0o600 });
   }
-  writeFileSync(proxyConfigPath, generatedProxyConfig(container), { encoding: 'utf8', mode: 0o600 });
+  writeFileSync(proxyConfigPath, generatedProxyConfig(container, proxyBindAddress), { encoding: 'utf8', mode: 0o600 });
   return { workerConfigPath, proxyConfigPath };
 }
 
@@ -47,15 +48,18 @@ export function generatedWorkerConfig(worker: Worker): string {
   ].join('\n');
 }
 
-export function generatedProxyConfig(container: ContainerConfig): string {
+export function generatedProxyConfig(container: ContainerConfig, bindAddress?: string): string {
   const domains = [...new Set(container.network.read_only_domains)].sort();
   if (domains.includes('*')) throw new Error('CONTAINER_NETWORK_ALLOWLIST_INVALID');
+  if (container.platform === 'windows' && !/^10\.\d{1,3}\.\d{1,3}\.2$/.test(bindAddress ?? ''))
+    throw new Error('CONTAINER_PROXY_BIND_ADDRESS_INVALID');
+  const listenAddress = bindAddress ?? '0.0.0.0';
   return [
     '[network]',
     'enabled = true',
-    'proxy_url = "http://0.0.0.0:3128"',
+    `proxy_url = "http://${listenAddress}:3128"`,
     'enable_socks5 = true',
-    'socks_url = "http://0.0.0.0:8081"',
+    `socks_url = "http://${listenAddress}:8081"`,
     'enable_socks5_udp = false',
     'allow_upstream_proxy = false',
     'dangerously_allow_non_loopback_proxy = true',

@@ -3,6 +3,7 @@ import { copyFile, mkdir, readdir, rename, stat, writeFile } from 'node:fs/promi
 import http from 'node:http';
 import https from 'node:https';
 import { join } from 'node:path';
+import { isIP } from 'node:net';
 
 const relayEnabled = process.env.LOCAL_ENGINEER_MODEL_RELAY_ENABLED !== 'false';
 const upstream = relayEnabled ? new URL(requiredEnvironment('LOCAL_ENGINEER_MODEL_UPSTREAM')) : undefined;
@@ -14,6 +15,14 @@ const proxyExecutable =
   process.env.LOCAL_ENGINEER_PROXY_EXECUTABLE ??
   (windows ? 'C:/local-engineer/codex-network-proxy.exe' : '/usr/local/bin/codex-network-proxy');
 const relayPort = 8090;
+const relayBindAddress = process.env.LOCAL_ENGINEER_MODEL_RELAY_BIND_ADDRESS ?? (windows ? undefined : '0.0.0.0');
+if (
+  !relayBindAddress ||
+  isIP(relayBindAddress) !== 4 ||
+  (windows && !/^10\.\d{1,3}\.\d{1,3}\.2$/.test(relayBindAddress))
+) {
+  throw new Error('LOCAL_ENGINEER_MODEL_RELAY_BIND_ADDRESS_INVALID');
+}
 
 const proxy = spawn(proxyExecutable, [], {
   env: process.env,
@@ -58,8 +67,8 @@ const relay = relayEnabled
   : undefined;
 
 if (relay)
-  relay.listen(relayPort, '0.0.0.0', () => {
-    process.stdout.write(`model relay listening on 0.0.0.0:${relayPort}; target=${upstream.origin}\n`);
+  relay.listen(relayPort, relayBindAddress, () => {
+    process.stdout.write(`model relay listening on ${relayBindAddress}:${relayPort}; target=${upstream.origin}\n`);
   });
 
 publishManagedCa().catch((error) => {

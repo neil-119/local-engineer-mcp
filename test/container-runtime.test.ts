@@ -137,6 +137,28 @@ describe('container runtime adapter', () => {
     expect(calls.filter((call) => call.includes('--subnet') && call.includes(fallback.egress))).toHaveLength(1);
   });
 
+  it('creates only a private per-agent Windows network and retries HNS subnet collisions', async () => {
+    const calls: string[][] = [];
+    const preferred = agentNetworkSubnetCandidates('agt_private', '10.240.0.0/16')[0]!;
+    const fallback = agentNetworkSubnetCandidates('agt_private', '10.240.0.0/16')[1]!;
+    const runtime = new ContainerRuntime(
+      'docker',
+      async (_executable, arguments_) => {
+        calls.push([...arguments_]);
+        if (arguments_.includes(preferred.internal))
+          return { exitCode: 1, stdout: '', stderr: 'hnsCallRawResponse: The object already exists. (0x1392)' };
+        return { exitCode: 0, stdout: '', stderr: '' };
+      },
+      undefined,
+      'windows',
+    );
+    await expect(
+      runtime.createWindowsInternalNetwork('le-private', { 'local-engineer.managed': 'true' }, [preferred, fallback]),
+    ).resolves.toBe(fallback.internal);
+    expect(calls.filter((call) => call.includes('create'))).toHaveLength(2);
+    expect(calls.some((call) => call.includes(preferred.egress) || call.includes(fallback.egress))).toBe(false);
+  });
+
   it('permits only the narrowly scoped setup capability', async () => {
     const calls: string[][] = [];
     const runtime = new ContainerRuntime('docker', async (_executable, arguments_) => {
@@ -228,7 +250,10 @@ describe('container runtime adapter', () => {
     expect(calls.some((call) => call.some((argument) => argument.endsWith('/configure-worker-network.ps1')))).toBe(
       true,
     );
-    expect(calls.some((call) => call.includes('disconnect'))).toBe(true);
+    expect(calls.some((call) => call.includes('network') && call.includes('inspect') && call.includes('nat'))).toBe(
+      true,
+    );
+    expect(calls.some((call) => call.includes('disconnect'))).toBe(false);
     const imageLockProbe = calls.find((call) =>
       call.some((argument) => argument.includes('.local-engineer-write-probe')),
     )!;

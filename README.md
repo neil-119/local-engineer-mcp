@@ -273,7 +273,7 @@ flowchart LR
     end
   end
 
-  E["Egress network"]
+  E["Egress: per-agent on Linux, Docker default NAT on Windows"]
   L["Configured model endpoint"]
   D["Read-only dependency domains"]
 
@@ -343,7 +343,9 @@ Each agent receives:
 - one network-policy proxy sidecar;
 - one worker-side network with direct egress blocked by the platform-specific
   network boundary;
-- one egress-capable network connected only to the proxy;
+- an egress-capable network connected only to the proxy (per-agent on Linux,
+  Docker's shared default `nat` on Windows); the Windows proxy listeners bind
+  only to its dedicated private-network IP;
 - an isolated workspace: in `volume-copy` mode, an ephemeral workspace named
   volume; in `isolated-bind` mode, a host-backed disposable working clone bind
   mount accompanied by read-only dependency bind mounts;
@@ -392,7 +394,8 @@ implementation is correct or ready to promote.
 ### Network paths
 
 The worker has no route to the external network. Its generated model URL points
-to a stable internal sidecar name, not directly to the configured provider.
+to a private sidecar address (a name on Linux, an IP on Windows), not directly
+to the configured provider.
 The fixed-target relay is the only path that can reach a configured
 `model_domains` host, and it supports the methods and streaming behavior the
 model API needs. A worker cannot redirect that relay to another host.
@@ -506,9 +509,12 @@ runtimes fail closed rather than falling back to host execution.
 
 `agent_network_pool` prevents Docker's automatic address allocator from
 choosing a private bridge subnet that overlaps a LAN-hosted model endpoint.
-Local Engineer derives one internal and one egress `/24` per agent from this
-reserved `/16`; choose a `10.x.0.0/16` range that is unused by your LAN, VPN,
-and model network.
+Local Engineer derives one private `/24` per Windows agent, or an internal and
+egress `/24` pair per Linux agent, from this reserved `/16`; choose a
+`10.x.0.0/16` range unused by your LAN, VPN, and model network. On Windows,
+the proxy uses Docker Desktop's existing default `nat` network for outbound
+traffic. Its private adapter's competing default route is removed and verified
+before the worker starts.
 
 ### Docker Desktop Windows containers
 
@@ -556,12 +562,13 @@ node .\dist\index.js image build
 node .\dist\index.js doctor
 ```
 
-The Windows image provides Node.js 24, Python 3.14, Git, Rust, Codex, and the
-same policy sidecar. Downloaded Node, Rustup, MinGit, and Codex source inputs
-are pinned by SHA-256; the Rust compiler version is checked before building the
-proxy; and the Microsoft Build Tools bootstrapper must have a valid Microsoft
-Authenticode signature. Windows project image profiles are currently rejected
-rather than falling back to a weaker build path.
+The Windows image provides Node.js 24, Python 3.14, Git, Terraform 1.12.2,
+Rust, Codex, and the same policy sidecar. Downloaded Node, Rustup, MinGit,
+Codex source, and Terraform inputs are pinned by SHA-256. The Rust compiler
+version is checked before building the proxy, and the Microsoft Build Tools
+bootstrapper must have a valid Microsoft Authenticode signature. Windows
+project image profiles are currently rejected rather than falling back to a
+weaker build path.
 
 ### Rancher Desktop on Windows
 

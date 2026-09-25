@@ -86,9 +86,47 @@
       .nav-controls { display: flex; gap: 8px; align-items: center; }
       .nav-controls button { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 4px 10px; cursor: pointer; }
       .nav-controls button:disabled { opacity: 0.45; cursor: default; }
-      .msg-toggle {
-        margin-top: 12px; background: var(--panel-2); color: var(--text);
+      .action-bar { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+      .timeline-toggle, .msg-toggle {
+        background: var(--panel-2); color: var(--text);
         border: 1px solid var(--border); border-radius: 8px; padding: 6px 12px; cursor: pointer;
+        font-weight: 500; font-size: 13px; display: inline-flex; align-items: center; gap: 6px;
+      }
+      .timeline-toggle:hover, .msg-toggle:hover { border-color: var(--review); }
+      .timeline-toggle.open { background: rgba(61, 139, 255, 0.15); border-color: var(--review); }
+      .timeline-container { margin-top: 12px; border-top: 1px solid var(--border); padding-top: 12px; }
+      .timeline-container[hidden] { display: none; }
+      .timeline-toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+      .filter-group { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+      .filter-btn {
+        background: var(--panel-2); color: var(--muted); border: none; padding: 4px 10px; cursor: pointer; font-size: 12px;
+      }
+      .filter-btn.active { background: var(--border); color: var(--text); font-weight: 600; }
+      .live-badge {
+        font-size: 11px; padding: 2px 8px; border-radius: 999px; background: rgba(52, 201, 142, 0.2);
+        color: var(--terminal); font-weight: 600; display: inline-flex; align-items: center; gap: 5px;
+      }
+      .live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--terminal); animation: pulse 1.5s infinite; }
+      @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.3; transform: scale(0.8); } }
+      .timeline-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+      .tl-item { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; background: var(--panel-2); }
+      .tl-item.command { border-left: 3px solid #8b5cf6; }
+      .tl-item.message { border-left: 3px solid var(--review); }
+      .tl-item.error { border-left: 3px solid var(--error); background: rgba(255, 107, 107, 0.06); }
+      .tl-meta { color: var(--muted); font-size: 12px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 6px; }
+      .tl-title { font-weight: 600; color: var(--text); display: inline-flex; align-items: center; gap: 5px; }
+      .tl-cwd { color: var(--muted); font-family: monospace; font-size: 11px; background: rgba(0,0,0,0.25); padding: 1px 5px; border-radius: 4px; }
+      .cmd-pre {
+        margin: 4px 0 6px; padding: 8px 10px; background: #0b0e14; border-radius: 6px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 12px; color: #a5d6ff; overflow-x: auto; white-space: pre-wrap; word-break: break-all;
+      }
+      .cmd-out-details { margin-top: 6px; font-size: 12px; }
+      .cmd-out-details summary { cursor: pointer; color: var(--muted); font-size: 11px; user-select: none; }
+      .cmd-out-details summary:hover { color: var(--text); }
+      .cmd-out-pre {
+        margin: 4px 0 0; padding: 8px 10px; background: #05070a; border: 1px solid var(--border); border-radius: 6px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; color: #d1d7e0;
+        max-height: 280px; overflow: auto; white-space: pre-wrap; word-break: break-all;
       }
       .messages { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 10px; }
       .messages[hidden] { display: none; }
@@ -151,6 +189,15 @@
         nextCursor: null,
         hasMore: false,
         container: null
+      };
+
+      var timelineState = {
+        runId: null,
+        filter: 'all',
+        pollTimer: null,
+        container: null,
+        btn: null,
+        data: null
       };
 
       document.getElementById('refresh').addEventListener('click', load);
@@ -238,6 +285,188 @@
         document.getElementById('run-prev').disabled = runCursorStack.length === 0;
         document.getElementById('run-next').disabled = !runHasMore;
         document.getElementById('run-page-indicator').textContent = 'Page ' + (runCursorStack.length + 1);
+      }
+
+      function toggleTimeline(el, run) {
+        var container = el.querySelector('.timeline-container');
+        var toggleBtn = el.querySelector('.timeline-toggle');
+        var wasHidden = container.hidden;
+
+        if (timelineState.container && timelineState.container !== container) {
+          timelineState.container.hidden = true;
+          if (timelineState.btn) timelineState.btn.classList.remove('open');
+          if (timelineState.pollTimer) {
+            clearInterval(timelineState.pollTimer);
+            timelineState.pollTimer = null;
+          }
+        }
+
+        container.hidden = !wasHidden;
+        if (container.hidden) {
+          toggleBtn.classList.remove('open');
+          if (timelineState.pollTimer) {
+            clearInterval(timelineState.pollTimer);
+            timelineState.pollTimer = null;
+          }
+          timelineState.runId = null;
+          timelineState.container = null;
+          timelineState.btn = null;
+          return;
+        }
+
+        toggleBtn.classList.add('open');
+        timelineState.runId = run.run_id;
+        timelineState.container = container;
+        timelineState.btn = toggleBtn;
+        timelineState.filter = 'all';
+
+        loadTimeline(container, run.run_id, false, run.status);
+
+        var isActive = run.lifecycle === 'active' || ['queued', 'starting', 'running', 'cancel_requested'].indexOf(run.status) >= 0;
+        if (isActive) {
+          timelineState.pollTimer = setInterval(function () {
+            if (timelineState.runId === run.run_id && !container.hidden) {
+              loadTimeline(container, run.run_id, true, run.status);
+            } else {
+              clearInterval(timelineState.pollTimer);
+              timelineState.pollTimer = null;
+            }
+          }, 2000);
+        }
+      }
+
+      function loadTimeline(container, runId, isBackground, status) {
+        if (!isBackground) {
+          container.innerHTML = '<div class="msg-loading">Loading session activity…</div>';
+        }
+        fetch('/api/runs/' + encodeURIComponent(runId) + '/timeline', { cache: 'no-store' })
+          .then(function (r) {
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return r.json();
+          })
+          .then(function (res) {
+            if (timelineState.runId !== runId) return;
+            timelineState.data = res;
+            renderTimeline(container, runId, res, status);
+          })
+          .catch(function (err) {
+            if (!isBackground) {
+              container.innerHTML = '<div class="msg-error">Could not load timeline: ' + esc(err.message) + '</div>';
+            }
+          });
+      }
+
+      function renderTimeline(container, runId, res, status) {
+        var items = res.items || [];
+        var filter = timelineState.filter || 'all';
+
+        var commandCount = 0;
+        var messageCount = 0;
+        items.forEach(function (it) {
+          if (it.type === 'command') commandCount++;
+          else if (it.type === 'message') messageCount++;
+        });
+
+        var filtered = items.filter(function (it) {
+          if (filter === 'commands') return it.type === 'command';
+          if (filter === 'messages') return it.type === 'message';
+          return true;
+        });
+
+        var html = '<div class="timeline-toolbar">';
+        html += '<div class="filter-group">';
+        html += '<button type="button" class="filter-btn' + (filter === 'all' ? ' active' : '') + '" data-filter="all">All (' + items.length + ')</button>';
+        html += '<button type="button" class="filter-btn' + (filter === 'commands' ? ' active' : '') + '" data-filter="commands">Commands (' + commandCount + ')</button>';
+        html += '<button type="button" class="filter-btn' + (filter === 'messages' ? ' active' : '') + '" data-filter="messages">Messages (' + messageCount + ')</button>';
+        html += '</div>';
+
+        if (res.active) {
+          html += '<span class="live-badge"><span class="live-dot"></span> Live streaming</span>';
+        }
+        html += '<span style="color:var(--muted);font-size:12px;margin-left:auto">' + filtered.length + ' shown</span>';
+        html += '</div>';
+
+        if (filtered.length === 0) {
+          html += '<div class="msg-empty">No activity items recorded for this run yet.</div>';
+        } else {
+          html += '<ul class="timeline-list">';
+          filtered.forEach(function (it) {
+            if (it.type === 'command') {
+              html += '<li class="tl-item command">';
+              html += '<div class="tl-meta">';
+              html += '<span class="tl-title">⚙️ Tool Call</span>';
+              if (it.status === 'in_progress') {
+                html += '<span class="badge active">running...</span>';
+              } else if (it.status === 'completed' || it.exitCode === 0) {
+                html += '<span class="badge terminal">exit 0</span>';
+              } else {
+                html += '<span class="badge failed">exit ' + (it.exitCode != null ? it.exitCode : 'fail') + '</span>';
+              }
+              if (it.durationMs != null) {
+                html += '<span>' + (it.durationMs / 1000).toFixed(2) + 's</span>';
+              }
+              if (it.cwd) {
+                html += '<span class="tl-cwd">' + esc(it.cwd) + '</span>';
+              }
+              if (it.startedAt) {
+                html += '<span style="margin-left:auto">' + fmtTime(it.startedAt) + '</span>';
+              }
+              html += '</div>';
+              if (it.command) {
+                html += '<pre class="cmd-pre"><code>' + esc(it.command) + '</code></pre>';
+              }
+              if (it.output) {
+                html += '<details class="cmd-out-details"><summary>Output (' + it.output.length + ' chars)</summary><pre class="cmd-out-pre">' + esc(it.output) + '</pre></details>';
+              }
+              html += '</li>';
+            } else if (it.type === 'message') {
+              html += '<li class="tl-item message">';
+              html += '<div class="tl-meta">';
+              html += '<span class="tl-title">💬 Assistant Message</span>';
+              if (it.startedAt || it.completedAt) {
+                html += '<span style="margin-left:auto">' + fmtTime(it.completedAt || it.startedAt) + '</span>';
+              }
+              html += '</div>';
+              html += '<div class="msg-text">' + esc(it.text || '') + '</div>';
+              html += '</li>';
+            } else if (it.type === 'error') {
+              html += '<li class="tl-item error">';
+              html += '<div class="tl-meta"><span class="tl-title" style="color:var(--error)">⚠️ Error</span>';
+              if (it.startedAt) html += '<span style="margin-left:auto">' + fmtTime(it.startedAt) + '</span>';
+              html += '</div>';
+              html += '<div class="msg-text" style="color:var(--error)">' + esc(it.text || '') + '</div>';
+              html += '</li>';
+            }
+          });
+          html += '</ul>';
+        }
+
+        container.innerHTML = html;
+
+        Array.prototype.slice.call(container.querySelectorAll('[data-filter]')).forEach(function (b) {
+          b.addEventListener('click', function () {
+            timelineState.filter = b.getAttribute('data-filter');
+            if (timelineState.data) {
+              renderTimeline(container, runId, timelineState.data, status);
+            }
+          });
+        });
+      }
+
+      function reopenTimeline() {
+        if (!timelineState.runId) return;
+        var openEl = Array.prototype.slice.call(content.querySelectorAll('[data-run-id="' + timelineState.runId + '"]'))[0];
+        if (!openEl) return;
+        var container = openEl.querySelector('.timeline-container');
+        var btn = openEl.querySelector('.timeline-toggle');
+        if (!container) return;
+        container.hidden = false;
+        if (btn) btn.classList.add('open');
+        timelineState.container = container;
+        timelineState.btn = btn;
+        if (timelineState.data) {
+          renderTimeline(container, timelineState.runId, timelineState.data);
+        }
       }
 
       function toggleMessages(el, runId) {
@@ -415,12 +644,17 @@
           }
         }
 
-        html += '<div class="msg-head">';
-        html += '<button type="button" class="msg-toggle">Messages</button>';
+        html += '<div class="action-bar">';
+        html += '<button type="button" class="timeline-toggle' + (timelineState.runId === run.run_id ? ' open' : '') + '">⚡ Live Activity &amp; Tool Calls</button>';
+        html += '<button type="button" class="msg-toggle">💬 Notes</button>';
         html += '</div>';
+        html += '<div class="timeline-container" hidden></div>';
         html += '<div class="messages" hidden></div>';
 
         el.innerHTML = html;
+        el.querySelector('.timeline-toggle').addEventListener('click', function () {
+          toggleTimeline(el, run);
+        });
         el.querySelector('.msg-toggle').addEventListener('click', function () {
           toggleMessages(el, run.run_id);
         });
@@ -439,6 +673,7 @@
         }
         runCount.textContent = snapshot.count + ' run' + (snapshot.count === 1 ? '' : 's');
         snapshot.runs.forEach(function (run) { content.appendChild(renderRun(run)); });
+        reopenTimeline();
         reopenMessages();
       }
 

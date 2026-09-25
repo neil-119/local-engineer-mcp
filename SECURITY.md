@@ -15,7 +15,7 @@ Local Engineer enforces five core security invariants:
    - In `volume-copy` mode, repositories are copied into private, ephemeral Docker named volumes (`le-<suffix>-repo-...`).
    - In `isolated-bind` mode, an immutable baseline clone is kept offline under private agent state, a disposable working clone is bind-mounted read/write, and verified dependency directories (`node_modules`) are bind-mounted read-only over the working clone. The parent repository working tree is never exposed to the worker container.
 3. **No Direct Egress**: The worker container cannot route traffic directly to the Internet, local area networks (LANs), or cloud metadata endpoints (`169.254.169.254`). All outbound traffic must pass through a policy proxy sidecar.
-4. **Least-Privilege Container Identity**: Untrusted code executes exclusively as an unprivileged user (`ContainerUser` on Windows, non-root `codex` on Linux). Initial filesystem provisioning runs in a short-lived setup container destroyed before the worker boots, while trusted control-plane operations running inside the live worker container (initial network routing configuration and post-run read-only repository integrity checks) execute as `ContainerAdministrator` under strictly enforced safe working directories and fully qualified system paths.
+4. **Least-Privilege Container Identity**: Untrusted code executes exclusively as an unprivileged user (`ContainerUser` on Windows, non-root `codex` on Linux). Initial filesystem provisioning runs in a short-lived setup container destroyed before the worker boots. Trusted route setup in the live worker and proxy containers, and post-run read-only repository integrity checks, execute as `ContainerAdministrator` under strictly enforced safe working directories and fully qualified system paths.
 5. **Independently Verified Promotion**: Code written by a local worker reaches the parent repository only through an exact, cryptographic Git patch revision that the parent supervisor explicitly reviews and promotes.
 
 ---
@@ -40,11 +40,13 @@ Local Engineer supports both Linux and Windows container runtimes with platform-
 
 ## 3. Network Architecture & Deny-by-Default Egress
 
-### The Twin-Network Model
+### Worker and Sidecar Networks
 
-Every agent provisions two dedicated networks:
+On Linux, each agent provisions dedicated internal and egress networks. On Windows, each new agent provisions one dedicated `10.x.y.0/24` private NAT network and attaches only its trusted proxy sidecar to Docker Desktop's existing default `nat` network for outbound access:
 - **`internalNetwork` (`${prefix}-internal`)**: Connects the worker container to the proxy sidecar. The worker is **only** attached to this network.
-- **`egressNetwork` (`${prefix}-egress`)**: Connects the proxy sidecar to upstream networks (host / external model providers / dependency hosts). The worker is **never** attached to this network.
+- **Egress**: A per-agent `${prefix}-egress` network on Linux, or the shared Docker `nat` network on Windows. The worker is **never** attached to either egress network.
+
+The Windows proxy's model relay and dependency proxy bind only to its fixed private-network IP, not `0.0.0.0` or its shared NAT IP. Before the worker starts, `configure-proxy-network.ps1` removes the proxy's competing private-network default route and verifies that the default NAT adapter is its sole outbound gateway. Existing retained agents created under older schemas keep their previous network topology until deleted.
 
 ```mermaid
 flowchart LR
@@ -61,7 +63,7 @@ flowchart LR
         Proxy["Limited Dependency Proxy (:3128)"]
     end
 
-    subgraph EgressNet["Egress Network (10.x.y+1.0/24)"]
+    subgraph EgressNet["Egress (Linux: per-agent; Windows: Docker default NAT)"]
         ExtModel["Local / Remote Model Provider"]
         ExtDep["Whitelisted Package Registries"]
     end
@@ -88,7 +90,7 @@ Because the Docker NAT driver on Windows does not provide a native `--internal` 
 
 ### Deterministic Subnet Allocation
 
-To prevent IP collisions with corporate LANs, VPNs, or private model provider addresses, networks are deterministically allocated in non-overlapping `/24` pairs under a configurable `10.240.0.0/16` pool using `agentNetworkSubnetCandidates()`.
+To prevent IP collisions with corporate LANs, VPNs, or private model provider addresses, private networks are deterministically allocated from a configurable `10.240.0.0/16` pool using `agentNetworkSubnetCandidates()`. Linux also allocates a per-agent egress `/24`; Windows uses Docker's existing default NAT subnet for egress. The configured pool and Docker NAT subnet must not overlap the model LAN or VPN routes.
 
 ---
 
@@ -152,7 +154,7 @@ Local Engineer supports two workspace architectures on Windows:
   ```
   `ContainerUser` (`*S-1-5-93-2-2`) receives recursive Modify (`M`) access on `C:\workspace` and each writable repository directory. The `(OI)(CI)` (Object Inherit / Container Inherit) flags ensure that files and directories created by Git, compilers, or tools during execution automatically inherit full Modify permissions, while snapshot files seeded by `ContainerAdministrator` are fully accessible to `ContainerUser`.
 - **Installed Toolchain Immutability**:
-  All installed execution tooling paths (`C:\local-engineer`, `C:\Node`, `C:\Python`, `C:\MinGit`, `C:\Rust`, `C:\npm`, `C:\BuildTools`, `C:\src`) have their inheritance stripped and are locked down to Read & Execute (`RX`) for `ContainerUser`:
+  All installed execution tooling paths (`C:\local-engineer`, `C:\Node`, `C:\Python`, `C:\MinGit`, `C:\Terraform`, `C:\Rust`, `C:\npm`, `C:\BuildTools`, `C:\src`) have their inheritance stripped and are locked down to Read & Execute (`RX`) for `ContainerUser`:
   ```cmd
   icacls.exe $toolRoot /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-93-2-1:(OI)(CI)F' '*S-1-5-93-2-2:(OI)(CI)RX'
   icacls.exe "$toolRoot\*" /reset /T /C /Q
@@ -206,7 +208,7 @@ The probe verifies:
 - Worker base image inspect and architecture compatibility.
 - Hyper-V isolation capability on Windows (`--isolation hyperv`).
 - Utility VM CPU core and memory hardware ceilings.
-- Deterministic 10.x dual-network creation.
+- Deterministic 10.x private-network creation on Windows (dual-network creation on Linux) and presence of Docker's default Windows NAT network.
 - Routing table lockdown and route stripping (`LOCAL_ENGINEER_NETWORK_OK`).
 - Unprivileged user identity verification: confirms `ContainerUser` is not a member of `BUILTIN\Administrators` (it does not prove exclusive membership in `BUILTIN\Users`).
 - Effective CPU and memory limits from Docker inspection.
@@ -220,7 +222,7 @@ The probe verifies:
 - Docker Desktop and anyone able to control its daemon have host-administrator-equivalent power.
 - Hyper-V isolation is a strong boundary, not a guarantee against unknown container, hypervisor, or host vulnerabilities. Keep all layers patched.
 - Windows does not use Docker's read-only-root option here. The container has a writable sandbox layer; installed Local Engineer tooling is protected with NTFS ACLs and verified by the capability probe.
-- The proxy sidecar is trusted. A vulnerability that compromises it could reach its egress network, although it has no workspace volume.
+- The proxy sidecar is trusted. A vulnerability that compromises it could reach its egress network, although it has no workspace volume. On Windows the egress network is Docker's shared default NAT; private-IP-only listener binding prevents ordinary peers on that shared NAT from directly using the sidecar, but Docker/HNS and host routing remain trusted boundary components.
 - The configured model endpoint receives task prompts, tool output, and repository content needed for the task. Treat it as trusted for that data.
 - In `volume-copy` mode, ignored files inside selected repositories are copied into the worker volume. In `isolated-bind` mode, ignored dependency trees (`node_modules`) are excluded from the baseline and mounted read-only, while other ignored files (like `.env`) are excluded from Git tracking in the baseline clone. Regardless of mode, operators should keep secrets outside selected repositories.
 - Explicitly allowed environment variables are exposed to untrusted worker code. Use narrowly scoped, short-lived credentials where possible.

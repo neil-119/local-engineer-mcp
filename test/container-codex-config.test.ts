@@ -62,6 +62,16 @@ describe('container Codex configuration', () => {
     expect(config).toContain('allow_local_binding = false');
   });
 
+  it('binds both Windows proxy listeners only to the dedicated private address', () => {
+    const windows = { ...container, platform: 'windows' as const };
+    const config = generatedProxyConfig(windows, '10.240.20.2');
+    expect(config).toContain('proxy_url = "http://10.240.20.2:3128"');
+    expect(config).toContain('socks_url = "http://10.240.20.2:8081"');
+    expect(config).not.toContain('0.0.0.0');
+    expect(() => generatedProxyConfig(windows)).toThrow('CONTAINER_PROXY_BIND_ADDRESS_INVALID');
+    expect(() => generatedProxyConfig(windows, '172.28.32.42')).toThrow('CONTAINER_PROXY_BIND_ADDRESS_INVALID');
+  });
+
   it('rejects custom configs that could restore worker-to-parent communication', () => {
     expect(() => validateCustomCodexConfig('[mcp_servers.parent]\ncommand = "parent-mcp"')).toThrow(
       'CONTAINER_CODEX_CONFIG_UNSAFE',

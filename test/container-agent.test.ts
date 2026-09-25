@@ -259,14 +259,19 @@ describe('container agent workspace seeding', () => {
       if (args.includes('{{.HostConfig.Isolation}}')) return { exitCode: 0, stdout: 'hyperv\n', stderr: '' };
       if (args.includes('{{json .NetworkSettings.Networks}}')) {
         const proxy = args.at(-1)!;
+        const addressCall = calls.find(
+          (call) => call.includes('connect') && call.includes('--ip') && call.at(-1) === proxy,
+        );
+        const privateAddress = addressCall?.[addressCall.indexOf('--ip') + 1] ?? '10.240.7.2';
         return {
           exitCode: 0,
           stdout: JSON.stringify({
+            nat: { IPAddress: '172.28.32.42', MacAddress: '00:15:5d:00:00:04' },
             [proxy.replace(
               /-(?:proxy|worker|proxy-shared-seed|worker-config-seed|dependency-seed|proxy-config-seed|workspace-seed)$/,
               '-internal',
             )]: {
-              IPAddress: proxy.endsWith('-proxy') ? '10.240.7.2' : '10.240.7.3',
+              IPAddress: proxy.endsWith('-proxy') ? privateAddress : '10.240.7.3',
               MacAddress: proxy.endsWith('-proxy') ? '00:15:5d:00:00:02' : '00:15:5d:00:00:03',
             },
           }),
@@ -275,6 +280,8 @@ describe('container agent workspace seeding', () => {
       }
       if (args.some((argument) => argument.endsWith('/configure-worker-network.ps1')))
         return { exitCode: 0, stdout: 'LOCAL_ENGINEER_NETWORK_OK\n', stderr: '' };
+      if (args.some((argument) => argument.endsWith('/configure-proxy-network.ps1')))
+        return { exitCode: 0, stdout: 'LOCAL_ENGINEER_PROXY_NETWORK_OK\n', stderr: '' };
       if (args.some((argument) => argument.endsWith('whoami.exe')))
         return { exitCode: 0, stdout: 'BUILTIN\\Users S-1-5-32-545 Enabled group\n', stderr: '' };
       if (args.some((argument) => argument.includes('.local-engineer-read-only-probe-')))
@@ -312,7 +319,34 @@ describe('container agent workspace seeding', () => {
     expect(networkCalls).toHaveLength(6);
     expect(networkCalls.filter((args) => args.includes('-ProxyAddress'))).toHaveLength(1);
     const workerCreate = creates.find((args) => args.includes(resources.workerContainer))!;
-    expect(workerCreate).toContain('HTTP_PROXY=http://10.240.7.2:3128');
+    expect(workerCreate).toContain(`HTTP_PROXY=http://${resources.proxyAddress}:3128`);
+    expect(resources.egressNetwork).toBe('nat');
+    const proxyCreate = creates.find((args) => args.includes(resources.proxyContainer))!;
+    expect(proxyCreate).toContain('nat');
+    expect(proxyCreate).toContain(`LOCAL_ENGINEER_MODEL_RELAY_BIND_ADDRESS=${resources.proxyAddress}`);
+    expect(calls).toContainEqual([
+      '--context',
+      'desktop-windows',
+      'network',
+      'connect',
+      '--ip',
+      resources.proxyAddress!,
+      resources.internalNetwork,
+      resources.proxyContainer,
+    ]);
+    const proxyRouteCheck = calls.findIndex((args) =>
+      args.some((argument) => argument.endsWith('/configure-proxy-network.ps1')),
+    );
+    const workerStartIndex = calls.findIndex(
+      (args) => args.includes('start') && args.at(-1) === resources.workerContainer,
+    );
+    expect(proxyRouteCheck).toBeGreaterThanOrEqual(0);
+    expect(proxyRouteCheck).toBeLessThan(workerStartIndex);
+    const modelPreflight = calls.findIndex((args) =>
+      args.some((argument) => argument.includes('LOCAL_ENGINEER_MODEL_UPSTREAM') && argument.includes('net.connect')),
+    );
+    expect(modelPreflight).toBeGreaterThan(proxyRouteCheck);
+    expect(modelPreflight).toBeLessThan(workerStartIndex);
     const workerStart = calls.findIndex((args) => args.includes('start') && args.includes(resources.workerContainer));
     const workerNetworkIsolation = calls.findIndex(
       (args) =>
@@ -344,7 +378,7 @@ describe('container agent workspace seeding', () => {
       ),
     ).toBe(true);
     expect(manager.appServerWorker(worker(), resources).args).toContain(
-      'model_providers.local-provider.base_url="http://10.240.7.2:8090/v1"',
+      `model_providers.local-provider.base_url="http://${resources.proxyAddress}:8090/v1"`,
     );
     await manager.capture(resources.agentId);
     const readOnlyIntegrityCheck = calls.find(
@@ -376,14 +410,19 @@ describe('container agent workspace seeding', () => {
       if (args.includes('{{.HostConfig.Isolation}}')) return { exitCode: 0, stdout: 'hyperv\n', stderr: '' };
       if (args.includes('{{json .NetworkSettings.Networks}}')) {
         const proxy = args.at(-1)!;
+        const addressCall = calls.find(
+          (call) => call.includes('connect') && call.includes('--ip') && call.at(-1) === proxy,
+        );
+        const privateAddress = addressCall?.[addressCall.indexOf('--ip') + 1] ?? '10.240.7.2';
         return {
           exitCode: 0,
           stdout: JSON.stringify({
+            nat: { IPAddress: '172.28.32.42', MacAddress: '00:15:5d:00:00:04' },
             [proxy.replace(
               /-(?:proxy|worker|proxy-shared-seed|worker-config-seed|dependency-seed|proxy-config-seed|workspace-seed)$/,
               '-internal',
             )]: {
-              IPAddress: proxy.endsWith('-proxy') ? '10.240.7.2' : '10.240.7.3',
+              IPAddress: proxy.endsWith('-proxy') ? privateAddress : '10.240.7.3',
               MacAddress: proxy.endsWith('-proxy') ? '00:15:5d:00:00:02' : '00:15:5d:00:00:03',
             },
           }),
@@ -392,6 +431,8 @@ describe('container agent workspace seeding', () => {
       }
       if (args.some((argument) => argument.endsWith('/configure-worker-network.ps1')))
         return { exitCode: 0, stdout: 'LOCAL_ENGINEER_NETWORK_OK\n', stderr: '' };
+      if (args.some((argument) => argument.endsWith('/configure-proxy-network.ps1')))
+        return { exitCode: 0, stdout: 'LOCAL_ENGINEER_PROXY_NETWORK_OK\n', stderr: '' };
       if (args.some((argument) => argument.endsWith('whoami.exe')))
         return { exitCode: 0, stdout: 'BUILTIN\\Users S-1-5-32-545 Enabled group\n', stderr: '' };
       return { exitCode: 0, stdout: '', stderr: '' };
@@ -604,7 +645,7 @@ describe('Windows isolated-bind workspace mode', () => {
     for (const path of temporaryRoots.splice(0)) rmSync(path, { recursive: true, force: true });
   });
 
-  function createWindowsMock(calls: string[][]): RuntimeCommandExecutor {
+  function createWindowsMock(calls: string[][], recoveredProxyAddress?: string): RuntimeCommandExecutor {
     const stoppedContainers = new Set<string>();
     return async (_executable, arguments_) => {
       const args = [...arguments_];
@@ -627,14 +668,19 @@ describe('Windows isolated-bind workspace mode', () => {
       }
       if (args.includes('{{json .NetworkSettings.Networks}}')) {
         const target = args.at(-1)!;
+        const addressCall = calls.find(
+          (call) => call.includes('connect') && call.includes('--ip') && call.at(-1) === target,
+        );
+        const privateAddress = addressCall?.[addressCall.indexOf('--ip') + 1] ?? recoveredProxyAddress ?? '10.240.7.2';
         return {
           exitCode: 0,
           stdout: JSON.stringify({
+            nat: { IPAddress: '172.28.32.42', MacAddress: '00:15:5d:00:00:04' },
             [target.replace(
               /-(?:proxy|worker|consolidated-setup|proxy-shared-seed|worker-config-seed|dependency-seed|proxy-config-seed|workspace-seed)$/,
               '-internal',
             )]: {
-              IPAddress: target.endsWith('-proxy') ? '10.240.7.2' : '10.240.7.3',
+              IPAddress: target.endsWith('-proxy') ? privateAddress : '10.240.7.3',
               MacAddress: target.endsWith('-proxy') ? '00:15:5d:00:00:02' : '00:15:5d:00:00:03',
             },
           }),
@@ -643,6 +689,8 @@ describe('Windows isolated-bind workspace mode', () => {
       }
       if (args.some((argument) => argument.endsWith('/configure-worker-network.ps1')))
         return { exitCode: 0, stdout: 'LOCAL_ENGINEER_NETWORK_OK\n', stderr: '' };
+      if (args.some((argument) => argument.endsWith('/configure-proxy-network.ps1')))
+        return { exitCode: 0, stdout: 'LOCAL_ENGINEER_PROXY_NETWORK_OK\n', stderr: '' };
       if (args.some((argument) => argument.endsWith('whoami.exe')))
         return { exitCode: 0, stdout: 'BUILTIN\\Users S-1-5-32-545 Enabled group\n', stderr: '' };
       if (args.some((argument) => argument.includes('read-only-probe') || argument.includes('.probe-')))
@@ -675,11 +723,21 @@ describe('Windows isolated-bind workspace mode', () => {
     };
   }
 
-  function createWindowsRuntime(config: ContainerConfig, calls: string[][] = []): ContainerRuntime {
-    return new ContainerRuntime('docker', createWindowsMock(calls), config.context, config.platform, {
-      memoryLimit: config.windows_memory_limit ?? '4g',
-      cpuCount: config.windows_cpu_count ?? 2,
-    });
+  function createWindowsRuntime(
+    config: ContainerConfig,
+    calls: string[][] = [],
+    recoveredProxyAddress?: string,
+  ): ContainerRuntime {
+    return new ContainerRuntime(
+      'docker',
+      createWindowsMock(calls, recoveredProxyAddress),
+      config.context,
+      config.platform,
+      {
+        memoryLimit: config.windows_memory_limit ?? '4g',
+        cpuCount: config.windows_cpu_count ?? 2,
+      },
+    );
   }
 
   function setupTestRepo(root: string, name: string): string {
@@ -698,6 +756,35 @@ describe('Windows isolated-bind workspace mode', () => {
     git(repoPath, ['commit', '-m', 'initial']);
     return repoPath;
   }
+
+  it('fails before worker startup when the proxy cannot connect to its model endpoint', async () => {
+    const root = mkdtempSync(join(testTemporaryDirectory(), 'iso-model-unreachable-'));
+    temporaryRoots.push(root);
+    const parent = setupTestRepo(root, 'parent');
+    const calls: string[][] = [];
+    const base = createWindowsMock(calls);
+    const execute: RuntimeCommandExecutor = async (executable, arguments_, options) => {
+      if (
+        arguments_.some(
+          (argument) => argument.includes('LOCAL_ENGINEER_MODEL_UPSTREAM') && argument.includes('net.connect'),
+        )
+      ) {
+        calls.push([...arguments_]);
+        return { exitCode: 1, stdout: '', stderr: 'ETIMEDOUT' };
+      }
+      return base(executable, arguments_, options);
+    };
+    const config = windowsIsolatedBindConfig();
+    const runtime = new ContainerRuntime('docker', execute, config.context, config.platform);
+    const manager = new ContainerAgentManager(config, join(root, 'state'), runtime);
+
+    await expect(
+      manager.prepare('agt_model_unreachable', worker(), [
+        { name: 'app', parentPath: parent, containerPath: 'C:/repos/app', access: 'read-write' },
+      ]),
+    ).rejects.toThrow('CONTAINER_MODEL_UPSTREAM_UNREACHABLE');
+    expect(calls.some((args) => args.includes('start') && args.some((arg) => arg.endsWith('-worker')))).toBe(false);
+  });
 
   it('mounts the disposable clone and node_modules read-only, never the parent repo or baseline clone, and hides .env', async () => {
     const root = mkdtempSync(join(testTemporaryDirectory(), 'iso-bind-test-'));
@@ -1237,7 +1324,7 @@ describe('Windows isolated-bind workspace mode', () => {
     expect(JSON.parse(readFileSync(staleJsonPath, 'utf8'))).toEqual({ app: true });
 
     // Test tamper resistance: forged changeSet claiming dependency_manifest_stale: false
-    const manager2 = new ContainerAgentManager(config, state, createWindowsRuntime(config));
+    const manager2 = new ContainerAgentManager(config, state, createWindowsRuntime(config, [], resources.proxyAddress));
     const forgedChangeSet = {
       ...changeSet,
       dependency_manifest_stale: false,
@@ -1263,7 +1350,7 @@ describe('Windows isolated-bind workspace mode', () => {
     ).rejects.toThrow('CONTAINER_AGENT_RETAINED_STATE_INVALID');
 
     // Valid recovery restores dependencyManifestStale
-    const manager3 = new ContainerAgentManager(config, state, createWindowsRuntime(config));
+    const manager3 = new ContainerAgentManager(config, state, createWindowsRuntime(config, [], resources.proxyAddress));
     const recovered = await manager3.recover({
       agentId: resources.agentId,
       image: config.image,

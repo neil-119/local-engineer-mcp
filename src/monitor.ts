@@ -10,7 +10,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import type { Run, RunStatus } from './domain.js';
-import type { RunStore } from './store.js';
+import type { RunStore, TimelineItem } from './store.js';
 
 export const DEFAULT_PORT = 8899;
 export const MAX_RUNS = 200;
@@ -167,6 +167,12 @@ export interface MonitorMessagesPage {
   has_more: boolean;
   next_cursor?: string;
   messages: MonitorMessage[];
+}
+export interface MonitorTimelineResponse {
+  run_id: string;
+  active: boolean;
+  count: number;
+  items: TimelineItem[];
 }
 
 const MAX_SUMMARY = 2000;
@@ -467,6 +473,26 @@ export function handleRequest(store: RunStore, request: IncomingMessage, respons
         text: message.text,
         ...(message.truncated ? { truncated: true as const } : {}),
       })),
+    };
+    sendJson(response, 200, body, method === 'HEAD');
+    return;
+  }
+  const timelineMatch = /^\/api\/runs\/([^/]+)\/timeline$/.exec(url.pathname);
+  if (timelineMatch) {
+    const runHandle = timelineMatch[1]!;
+    if (!RUN_HANDLE.test(runHandle) || !store.hasRun(runHandle)) {
+      sendText(response, 404, 'Not Found\n', method === 'HEAD');
+      return;
+    }
+    const limit = parsePageLimit(url.searchParams.get('limit')) ?? 200;
+    const run = store.get(runHandle);
+    const active = run ? ['queued', 'starting', 'running', 'cancel_requested'].includes(run.status) : false;
+    const items = store.readTimeline(runHandle, limit);
+    const body: MonitorTimelineResponse = {
+      run_id: runHandle,
+      active,
+      count: items.length,
+      items,
     };
     sendJson(response, 200, body, method === 'HEAD');
     return;

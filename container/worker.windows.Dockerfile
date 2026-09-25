@@ -65,12 +65,18 @@ ARG CODEX_VERSION=0.144.6
 ARG GIT_VERSION=2.55.0
 ARG GIT_WINDOWS_REVISION=1
 ARG GIT_SHA256=31497e7968196332263459ee319d2524e3ebc5786ab895e2abad34ffdd4f4ebf
+ARG TERRAFORM_VERSION=1.12.2
+ARG TERRAFORM_SHA256=0a1565ace9da37c2778868c2e97452d8fc25e40e530bafbbab97231e69b0a201
 
 COPY --from=python-runtime C:\Python C:\Python
 RUN Invoke-WebRequest -UseBasicParsing "https://github.com/git-for-windows/git/releases/download/v$env:GIT_VERSION.windows.$env:GIT_WINDOWS_REVISION/MinGit-$env:GIT_VERSION-64-bit.zip" -OutFile C:\mingit.zip; `
     if ((Get-FileHash C:\mingit.zip -Algorithm SHA256).Hash -ne $env:GIT_SHA256) { throw 'MinGit archive checksum mismatch' }; `
     Expand-Archive C:\mingit.zip -DestinationPath C:\MinGit; `
     Remove-Item C:\mingit.zip -Force; `
+    Invoke-WebRequest -UseBasicParsing "https://releases.hashicorp.com/terraform/${env:TERRAFORM_VERSION}/terraform_${env:TERRAFORM_VERSION}_windows_amd64.zip" -OutFile C:\terraform.zip; `
+    if ((Get-FileHash C:\terraform.zip -Algorithm SHA256).Hash -ne $env:TERRAFORM_SHA256) { throw 'Terraform archive checksum mismatch' }; `
+    Expand-Archive C:\terraform.zip -DestinationPath C:\Terraform; `
+    Remove-Item C:\terraform.zip -Force; `
     New-Item -ItemType Directory -Force C:\npm | Out-Null; `
     npm install --global --prefix C:\npm "@openai/codex@$env:CODEX_VERSION"; `
     New-Item -ItemType Directory -Force C:\local-engineer,C:\workspace,C:\local-engineer\codex-home,C:\local-engineer\proxy-shared,C:\local-engineer\dependencies,C:\local-engineer\bin,C:\local-engineer\codex-home\tmp | Out-Null; `
@@ -85,17 +91,19 @@ COPY apply_patch.bat C:\local-engineer\bin\apply_patch.bat
 COPY apply_patch.ps1 C:\local-engineer\bin\apply_patch.ps1
 COPY cargo.cmd C:\local-engineer\bin\cargo.cmd
 COPY configure-worker-network.ps1 C:\local-engineer\configure-worker-network.ps1
+COPY configure-proxy-network.ps1 C:\local-engineer\configure-proxy-network.ps1
 
 ENV CODEX_HOME=C:\local-engineer\codex-home `
     RUSTUP_HOME=C:\Rust\rustup `
-    PATH=C:\local-engineer\bin;C:\npm;C:\Python;C:\Python\Scripts;C:\MinGit\cmd;C:\Rust\cargo\bin;C:\Node;C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem;C:\Windows\System32\WindowsPowerShell\v1.0
+    PATH=C:\local-engineer\bin;C:\npm;C:\Python;C:\Python\Scripts;C:\MinGit\cmd;C:\Terraform;C:\Rust\cargo\bin;C:\Node;C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem;C:\Windows\System32\WindowsPowerShell\v1.0
 
 RUN python --version; `
     node --version; `
     git --version; `
+    terraform version; `
     & 'C:\npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe' --version; `
     rustc --version; `
-    $toolRoots = @('C:\local-engineer','C:\npm','C:\Rust','C:\Node','C:\Python','C:\MinGit','C:\BuildTools','C:\src'); `
+    $toolRoots = @('C:\local-engineer','C:\npm','C:\Rust','C:\Node','C:\Python','C:\MinGit','C:\Terraform','C:\BuildTools','C:\src'); `
     foreach ($toolRoot in $toolRoots) { `
       icacls.exe $toolRoot /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-93-2-1:(OI)(CI)F' '*S-1-5-93-2-2:(OI)(CI)RX' | Out-Null; `
       icacls.exe "$toolRoot\*" /reset /T /C /Q | Out-Null `

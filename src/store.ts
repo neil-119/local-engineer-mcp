@@ -1,5 +1,14 @@
 import { DatabaseSync } from 'node:sqlite';
-import { appendFileSync, existsSync, mkdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 import type { AgentOperation, Result, Run, RunStatus } from './domain.js';
@@ -7,6 +16,20 @@ import { terminalStatuses } from './domain.js';
 
 export const MAX_MESSAGE_TEXT = 8000;
 export const MAX_MESSAGES_PER_RUN = 1000;
+
+export interface TimelineItem {
+  id: string;
+  type: 'message' | 'command' | 'error';
+  status: 'in_progress' | 'completed' | 'failed';
+  text?: string;
+  command?: string;
+  cwd?: string;
+  output?: string;
+  exitCode?: number;
+  durationMs?: number;
+  startedAt?: string;
+  completedAt?: string;
+}
 
 export interface Clock {
   now(): Date;
@@ -888,6 +911,153 @@ export class RunStore extends EventEmitter {
       renameSync(current, archived);
     }
     appendFileSync(current, entry);
+  }
+  readTimeline(runId: string, maxItems = 200): TimelineItem[] {
+    this.assertSafeId(runId);
+    const rawEventsFile = join(this.stateDir, 'runs', runId, 'harness', 'raw-events.jsonl');
+    if (existsSync(rawEventsFile)) {
+      try {
+        const content = readFileSync(rawEventsFile, 'utf8');
+        const lines = content.split('\n');
+        const items = new Map<string, TimelineItem>();
+        const order: string[] = [];
+        const MAX_OUTPUT_PER_COMMAND = 64 * 1024;
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const ev = JSON.parse(line) as {
+              method?: string;
+              params?: Record<string, unknown>;
+            };
+            const method = ev.method ?? '';
+            const params = ev.params ?? {};
+
+            if (method === 'item/started') {
+              const item = params.item as Record<string, unknown> | undefined;
+              if (!item || typeof item.id !== 'string') continue;
+              const id = item.id;
+              const type =
+                item.type === 'commandExecution' ? 'command' : item.type === 'agentMessage' ? 'message' : undefined;
+              if (!type) continue;
+              const startedAt =
+                typeof params.startedAtMs === 'number'
+                  ? new Date(params.startedAtMs).toISOString()
+                  : new Date().toISOString();
+              const timelineItem: TimelineItem = {
+                id,
+                type,
+                status: 'in_progress',
+                ...(type === 'command'
+                  ? {
+                      command: typeof item.command === 'string' ? item.command : '',
+                      cwd: typeof item.cwd === 'string' ? item.cwd : '',
+                      output: '',
+                    }
+                  : {
+                      text: typeof item.text === 'string' ? item.text : '',
+                    }),
+                startedAt,
+              };
+              items.set(id, timelineItem);
+              order.push(id);
+            } else if (method === 'item/agentMessage/delta') {
+              const itemId = typeof params.itemId === 'string' ? params.itemId : undefined;
+              const delta = typeof params.delta === 'string' ? params.delta : '';
+              if (itemId && delta) {
+                const it = items.get(itemId);
+                if (it) it.text = (it.text ?? '') + delta;
+              }
+            } else if (method === 'item/commandExecution/outputDelta') {
+              const itemId = typeof params.itemId === 'string' ? params.itemId : undefined;
+              const delta = typeof params.delta === 'string' ? params.delta : '';
+              if (itemId && delta) {
+                const it = items.get(itemId);
+                if (it && (it.output?.length ?? 0) < MAX_OUTPUT_PER_COMMAND) {
+                  it.output = (it.output ?? '') + delta;
+                  if (it.output.length > MAX_OUTPUT_PER_COMMAND) {
+                    it.output = it.output.slice(0, MAX_OUTPUT_PER_COMMAND) + '\n[output truncated]';
+                  }
+                }
+              }
+            } else if (method === 'item/completed') {
+              const item = params.item as Record<string, unknown> | undefined;
+              if (!item || typeof item.id !== 'string') continue;
+              const id = item.id;
+              let it = items.get(id);
+              if (!it) {
+                const type =
+                  item.type === 'commandExecution' ? 'command' : item.type === 'agentMessage' ? 'message' : undefined;
+                if (!type) continue;
+                it = { id, type, status: 'completed' };
+                items.set(id, it);
+                order.push(id);
+              }
+              const completedAt =
+                typeof params.completedAtMs === 'number'
+                  ? new Date(params.completedAtMs).toISOString()
+                  : new Date().toISOString();
+              it.completedAt = completedAt;
+              if (it.type === 'command') {
+                const exitCode = typeof item.exitCode === 'number' ? item.exitCode : undefined;
+                it.exitCode = exitCode;
+                it.status =
+                  item.status === 'failed' || (exitCode !== undefined && exitCode !== 0) ? 'failed' : 'completed';
+                if (typeof item.durationMs === 'number') it.durationMs = item.durationMs;
+                if (typeof item.command === 'string') it.command = item.command;
+                if (typeof item.cwd === 'string') it.cwd = item.cwd;
+                if (typeof item.aggregatedOutput === 'string') {
+                  it.output =
+                    item.aggregatedOutput.length > MAX_OUTPUT_PER_COMMAND
+                      ? item.aggregatedOutput.slice(0, MAX_OUTPUT_PER_COMMAND) + '\n[output truncated]'
+                      : item.aggregatedOutput;
+                }
+              } else if (it.type === 'message') {
+                it.status = 'completed';
+                if (typeof item.text === 'string') it.text = item.text;
+              }
+            } else if (method === 'error') {
+              const err = params.error as Record<string, unknown> | undefined;
+              const errId = `err_${order.length + 1}`;
+              const message =
+                typeof err?.message === 'string'
+                  ? err.message
+                  : typeof params.additionalDetails === 'string'
+                    ? params.additionalDetails
+                    : 'Unknown worker error';
+              const timelineItem: TimelineItem = {
+                id: errId,
+                type: 'error',
+                status: 'failed',
+                text: message,
+                startedAt: new Date().toISOString(),
+              };
+              items.set(errId, timelineItem);
+              order.push(errId);
+            }
+          } catch {
+            // Ignore malformed line
+          }
+        }
+        if (order.length > 0) {
+          const result = order.map((id) => items.get(id)!);
+          return result.slice(-maxItems);
+        }
+      } catch {
+        // Fall back to sqlite messages on read error
+      }
+    }
+
+    // Fallback: SQLite messages table
+    const page = this.listMessagesPage(runId, maxItems);
+    return page.messages.reverse().map((msg, index) => ({
+      id: `msg_${msg.seq || index}`,
+      type: 'message' as const,
+      status: 'completed' as const,
+      text: msg.text,
+      startedAt: msg.ts,
+      completedAt: msg.ts,
+    }));
   }
 }
 export function emptyResult(): Result {

@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { request, type IncomingHttpHeaders, type IncomingMessage } from 'node:http';
 import type { ChildProcess } from 'node:child_process';
@@ -562,5 +562,159 @@ describe('monitor assistant messages', () => {
         (await httpRequest(port, 'GET', `/api/runs/${runId}/messages?cursor=` + encodeURIComponent('bad!!'))).status,
       ).toBe(400);
     });
+  });
+});
+
+describe('monitor session activity and timeline', () => {
+  it('serves live tool calls and messages from raw events', async () => {
+    const stateDirectory = mkdtempSync(join(testTemporaryDirectory(), 'monitor-tl-'));
+    temporaryRoots.push(stateDirectory);
+    const store = new RunStore(stateDirectory);
+    const runId = 'run_' + 'X'.repeat(16);
+    store.add(
+      makeRun({
+        runId,
+        agentId: 'agt_tl_1',
+        status: 'running',
+        createdAt: '2026-07-24T00:00:00.000Z',
+      }),
+    );
+
+    // Write raw-events.jsonl to harness directory
+    const harnessDir = join(stateDirectory, 'runs', runId, 'harness');
+    mkdirSync(harnessDir, { recursive: true });
+    const events = [
+      JSON.stringify({
+        method: 'item/started',
+        params: {
+          startedAtMs: 1790120000000,
+          item: {
+            id: 'call_1',
+            type: 'commandExecution',
+            command: 'powershell.exe -Command "git status"',
+            cwd: 'C:/repos/test',
+            status: 'inProgress',
+          },
+        },
+      }),
+      JSON.stringify({
+        method: 'item/commandExecution/outputDelta',
+        params: { itemId: 'call_1', delta: 'On branch main\n' },
+      }),
+      JSON.stringify({
+        method: 'item/completed',
+        params: {
+          completedAtMs: 1790120001000,
+          item: {
+            id: 'call_1',
+            type: 'commandExecution',
+            command: 'powershell.exe -Command "git status"',
+            cwd: 'C:/repos/test',
+            status: 'completed',
+            exitCode: 0,
+            durationMs: 1000,
+            aggregatedOutput: 'On branch main\nnothing to commit\n',
+          },
+        },
+      }),
+      JSON.stringify({
+        method: 'item/started',
+        params: {
+          startedAtMs: 1790120002000,
+          item: { id: 'msg_1', type: 'agentMessage', text: '' },
+        },
+      }),
+      JSON.stringify({
+        method: 'item/agentMessage/delta',
+        params: { itemId: 'msg_1', delta: 'Repository is clean.' },
+      }),
+      JSON.stringify({
+        method: 'item/completed',
+        params: {
+          completedAtMs: 1790120003000,
+          item: { id: 'msg_1', type: 'agentMessage', text: 'Repository is clean.' },
+        },
+      }),
+    ];
+    writeFileSync(join(harnessDir, 'raw-events.jsonl'), events.join('\n') + '\n');
+
+    const { server } = createMonitorServer(store, { port: 0, open: false, help: false });
+    await new Promise<void>((done, fail) => {
+      server.once('error', fail);
+      server.listen(0, '127.0.0.1', () => done());
+    });
+
+    try {
+      const address = server.address();
+      const port = typeof address === 'object' && address ? address.port : 0;
+      const res = await httpRequest(port, 'GET', `/api/runs/${runId}/timeline`);
+      expect(res.status).toBe(200);
+      const parsed = JSON.parse(res.body);
+      expect(parsed.run_id).toBe(runId);
+      expect(parsed.active).toBe(true);
+      expect(parsed.items).toHaveLength(2);
+
+      const cmd = parsed.items[0];
+      expect(cmd.type).toBe('command');
+      expect(cmd.status).toBe('completed');
+      expect(cmd.command).toBe('powershell.exe -Command "git status"');
+      expect(cmd.cwd).toBe('C:/repos/test');
+      expect(cmd.output).toBe('On branch main\nnothing to commit\n');
+      expect(cmd.exitCode).toBe(0);
+      expect(cmd.durationMs).toBe(1000);
+
+      const msg = parsed.items[1];
+      expect(msg.type).toBe('message');
+      expect(msg.status).toBe('completed');
+      expect(msg.text).toBe('Repository is clean.');
+
+      // HEAD request
+      const head = await httpRequest(port, 'HEAD', `/api/runs/${runId}/timeline`);
+      expect(head.status).toBe(200);
+      expect(head.body).toBe('');
+
+      // Unknown run
+      const unknown = await httpRequest(port, 'GET', `/api/runs/${'run_' + 'W'.repeat(16)}/timeline`);
+      expect(unknown.status).toBe(404);
+    } finally {
+      await new Promise<void>((done) => server.close(() => done()));
+      store.close();
+    }
+  });
+
+  it('falls back to sqlite messages when raw-events.jsonl is not present', async () => {
+    const stateDirectory = mkdtempSync(join(testTemporaryDirectory(), 'monitor-tl-fallback-'));
+    temporaryRoots.push(stateDirectory);
+    const store = new RunStore(stateDirectory);
+    const runId = 'run_' + 'V'.repeat(16);
+    store.add(
+      makeRun({
+        runId,
+        agentId: 'agt_tl_2',
+        status: 'promoted',
+      }),
+    );
+    store.captureMessage(runId, 'item_fb_1', '2026-07-24T00:00:01.000Z', 'fallback note');
+
+    const { server } = createMonitorServer(store, { port: 0, open: false, help: false });
+    await new Promise<void>((done, fail) => {
+      server.once('error', fail);
+      server.listen(0, '127.0.0.1', () => done());
+    });
+
+    try {
+      const address = server.address();
+      const port = typeof address === 'object' && address ? address.port : 0;
+      const res = await httpRequest(port, 'GET', `/api/runs/${runId}/timeline`);
+      expect(res.status).toBe(200);
+      const parsed = JSON.parse(res.body);
+      expect(parsed.active).toBe(false);
+      expect(parsed.items).toHaveLength(1);
+      expect(parsed.items[0].type).toBe('message');
+      expect(parsed.items[0].text).toBe('fallback note');
+    } finally {
+      await new Promise<void>((done) => server.close(() => done()));
+      store.close();
+    }
   });
 });

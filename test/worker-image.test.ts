@@ -40,6 +40,12 @@ describe('shared worker image contract', () => {
     expect(dockerfile).toContain('ARG RUSTUP_SHA256=');
     expect(dockerfile).toContain('ARG RUST_TOOLCHAIN_VERSION=1.98.1');
     expect(dockerfile).toContain('ARG GIT_SHA256=');
+    expect(dockerfile).toContain('ARG TERRAFORM_VERSION=1.12.2');
+    expect(dockerfile).toContain(
+      'ARG TERRAFORM_SHA256=0a1565ace9da37c2778868c2e97452d8fc25e40e530bafbbab97231e69b0a201',
+    );
+    expect(dockerfile).toContain('Terraform archive checksum mismatch');
+    expect(dockerfile).toContain("'C:\\Terraform'");
     expect(dockerfile).toContain('ARG CODEX_SOURCE_SHA256=');
     expect(dockerfile).toContain('Codex source archive checksum mismatch');
     expect(dockerfile).toContain("$env:RUSTUP_TOOLCHAIN = 'stable'");
@@ -69,5 +75,7 @@ describe('shared worker image contract', () => {
     expect(DEFAULT_WORKER_POLICY).toContain('`apply_patch --check`');
     expect(DEFAULT_WORKER_POLICY).toContain('manipulate headers');
     expect(DEFAULT_WORKER_POLICY).toContain('error-masking shell logic');
+    expect(DEFAULT_WORKER_POLICY).toContain('do not guess patch filenames');
+    expect(DEFAULT_WORKER_POLICY).toContain('$patch | apply_patch --check');
   });
 });

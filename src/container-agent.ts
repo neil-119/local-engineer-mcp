@@ -44,8 +44,8 @@ import {
  *
  * Orchestrates disposable Docker container agents across Linux and Windows:
  * - Twin-container architecture: untrusted worker container + strictly brokered proxy sidecar.
- * - Twin-network isolation: internal bridge/NAT (worker <-> proxy) with stripped routes, plus
- *   an external egress network attached strictly to the proxy sidecar.
+ * - Network isolation: private worker/proxy bridge or NAT with stripped worker routes, plus
+ *   sidecar-only egress (per-agent on Linux; Docker's default NAT on Windows).
  * - Volume layout: isolated repository volumes, Codex home, dependency cache, and proxy shared state.
  * - Read-only Windows repositories use Docker read-only volume mounts because Windows named-volume
  *   mount semantics do not reliably enforce in-container NTFS ACL changes.
@@ -172,7 +172,7 @@ export class ContainerAgentManager {
   /**
    * Prepares and initializes the complete container environment for an agent:
    * 1. Takes immutable Git snapshots of all assigned repositories.
-   * 2. Creates an isolated internal/egress network pair.
+   * 2. Creates a private network and selects sidecar-only egress.
    * 3. Provisions dedicated volumes for workspace, Codex config, proxy shared state, and dependencies.
    * 4. Seeds proxy and worker configuration volumes.
    * 5. Seeds the workspace volume with repository snapshots and strict ACL inheritance.
@@ -222,7 +222,7 @@ export class ContainerAgentManager {
       workerContainer: `${prefix}-worker`,
       proxyContainer: `${prefix}-proxy`,
       internalNetwork: `${prefix}-internal`,
-      egressNetwork: `${prefix}-egress`,
+      egressNetwork: this.config.platform === 'windows' ? 'nat' : `${prefix}-egress`,
       workspaceVolume: `${prefix}-workspace`,
       repositoryVolumes: new Map(
         this.config.platform === 'windows' && !isIsolatedBind
@@ -326,16 +326,26 @@ export class ContainerAgentManager {
       );
       const workerConfigPath = join(agentState, 'worker-config.toml');
       const proxyConfigPath = join(agentState, 'proxy-config.toml');
-      writeContainerCodexConfigs(worker, this.config, workerConfigPath, proxyConfigPath);
-
       const startNetwork = Date.now();
-      await this.runtime.createNetworkPair({
-        internalName: resources.internalNetwork,
-        egressName: resources.egressNetwork,
-        labels,
-        candidates: agentNetworkSubnetCandidates(agentId, this.config.agent_network_pool),
-      });
+      const candidates = agentNetworkSubnetCandidates(agentId, this.config.agent_network_pool);
+      if (this.config.platform === 'windows') {
+        await this.runtime.run(['network', 'inspect', 'nat']);
+        const internalSubnet = await this.runtime.createWindowsInternalNetwork(
+          resources.internalNetwork,
+          labels,
+          candidates,
+        );
+        resources.proxyAddress = internalSubnet.replace(/\.0\/24$/, '.2');
+      } else {
+        await this.runtime.createNetworkPair({
+          internalName: resources.internalNetwork,
+          egressName: resources.egressNetwork,
+          labels,
+          candidates,
+        });
+      }
       timings.networkAllocationMs = Date.now() - startNetwork;
+      writeContainerCodexConfigs(worker, this.config, workerConfigPath, proxyConfigPath, resources.proxyAddress);
 
       if (this.config.platform === 'windows') {
         if (!isIsolatedBind) {
@@ -398,8 +408,8 @@ export class ContainerAgentManager {
       await this.runtime.createContainer({
         name: resources.proxyContainer,
         image: resources.image,
-        network: this.config.platform === 'windows' ? resources.egressNetwork : resources.internalNetwork,
-        networkAliases: ['local-engineer-proxy'],
+        network: this.config.platform === 'windows' ? 'nat' : resources.internalNetwork,
+        networkAliases: this.config.platform === 'windows' ? [] : ['local-engineer-proxy'],
         user: this.config.worker_user,
         labels,
         mounts: [
@@ -409,6 +419,9 @@ export class ContainerAgentManager {
         environment: {
           CODEX_HOME: layout.codexHome,
           LOCAL_ENGINEER_MODEL_UPSTREAM: worker.container_model_provider!.base_url,
+          ...(this.config.platform === 'windows'
+            ? { LOCAL_ENGINEER_MODEL_RELAY_BIND_ADDRESS: resources.proxyAddress! }
+            : {}),
           LOCAL_ENGINEER_PROXY_SHARED: layout.proxyShared,
           ...(this.config.platform === 'windows'
             ? { LOCAL_ENGINEER_PROXY_EXECUTABLE: 'C:/local-engineer/codex-network-proxy.exe' }
@@ -420,13 +433,30 @@ export class ContainerAgentManager {
       await this.runtime.connectNetwork(
         this.config.platform === 'windows' ? resources.internalNetwork : resources.egressNetwork,
         resources.proxyContainer,
+        this.config.platform === 'windows' ? resources.proxyAddress : undefined,
       );
       await this.runtime.startContainer(resources.proxyContainer);
-      if (this.config.platform === 'windows')
-        resources.proxyAddress = await this.runtime.containerNetworkAddress(
+      if (this.config.platform === 'windows') {
+        const liveProxyAddress = await this.runtime.containerNetworkAddress(
           resources.proxyContainer,
           resources.internalNetwork,
         );
+        if (liveProxyAddress !== resources.proxyAddress) throw new Error('CONTAINER_PROXY_ADDRESS_CHANGED');
+        await this.configureWindowsProxyNetwork(resources);
+        try {
+          await this.runtime.execContainer(
+            resources.proxyContainer,
+            [
+              'C:/Node/node.exe',
+              '--eval',
+              'const net=require("node:net");const u=new URL(process.env.LOCAL_ENGINEER_MODEL_UPSTREAM);const s=net.connect({host:u.hostname,port:Number(u.port)||(u.protocol==="https:"?443:80)});s.setTimeout(8000,()=>s.destroy(new Error("timeout")));s.once("connect",()=>{s.destroy();process.exit(0)});s.once("error",()=>process.exit(1));',
+            ],
+            { user: this.config.worker_user },
+          );
+        } catch {
+          throw new Error('CONTAINER_MODEL_UPSTREAM_UNREACHABLE');
+        }
+      }
 
       if (!isIsolatedBind) {
         await this.seedWorkspaceVolume(`${prefix}-workspace-seed`, resources, labels);
@@ -511,7 +541,7 @@ export class ContainerAgentManager {
         join(agentState, 'resources.json'),
         JSON.stringify(
           {
-            schema_version: 3,
+            schema_version: 4,
             agent_id: agentId,
             windows_workspace_mode: this.config.windows_workspace_mode ?? 'volume-copy',
             worker_container: resources.workerContainer,
@@ -570,14 +600,14 @@ export class ContainerAgentManager {
     const resourcePath = join(state, 'resources.json');
     if (!existsSync(resourcePath)) throw new Error('CONTAINER_AGENT_RETAINED_STATE_NOT_FOUND');
     const persisted = JSON.parse(readFileSync(resourcePath, 'utf8')) as Record<string, unknown>;
-    if (persisted.schema_version !== 2 && persisted.schema_version !== 3)
+    if (persisted.schema_version !== 2 && persisted.schema_version !== 3 && persisted.schema_version !== 4)
       throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
 
     const expected = {
       worker_container: `${prefix}-worker`,
       proxy_container: `${prefix}-proxy`,
       internal_network: `${prefix}-internal`,
-      egress_network: `${prefix}-egress`,
+      egress_network: this.config.platform === 'windows' && persisted.schema_version === 4 ? 'nat' : `${prefix}-egress`,
       workspace_volume: `${prefix}-workspace`,
       worker_config_volume: `${prefix}-worker-config`,
       proxy_config_volume: `${prefix}-proxy-config`,
@@ -586,7 +616,7 @@ export class ContainerAgentManager {
     };
     const isIsolatedBind =
       this.config.platform === 'windows' &&
-      persisted.schema_version === 3 &&
+      (persisted.schema_version === 3 || persisted.schema_version === 4) &&
       persisted.windows_workspace_mode === 'isolated-bind';
 
     const expectedRepositoryVolumes = Object.fromEntries(
@@ -696,6 +726,7 @@ export class ContainerAgentManager {
         resources.internalNetwork,
       );
       if (liveProxyAddress !== resources.proxyAddress) throw new Error('CONTAINER_PROXY_ADDRESS_CHANGED');
+      if (persisted.schema_version === 4) await this.configureWindowsProxyNetwork(resources);
       const running = await this.runtime.isContainerRunning(resources.workerContainer);
       if (running) {
         await this.configureWindowsWorkerNetwork(resources);
@@ -1413,6 +1444,39 @@ export class ContainerAgentManager {
       resources.proxyAddress,
       true,
     );
+  }
+
+  private async configureWindowsProxyNetwork(resources: ContainerAgentResources): Promise<void> {
+    if (resources.egressNetwork !== 'nat' || !resources.proxyAddress)
+      throw new Error('CONTAINER_WINDOWS_PROXY_NETWORK_INPUT_INVALID');
+    const layout = containerLayout(this.config);
+    const internal = await this.runtime.containerNetworkEndpoint(resources.proxyContainer, resources.internalNetwork);
+    const egress = await this.runtime.containerNetworkEndpoint(resources.proxyContainer, 'nat');
+    if (internal.address !== resources.proxyAddress) throw new Error('CONTAINER_PROXY_ADDRESS_CHANGED');
+    const result = await this.runtime.execContainer(
+      resources.proxyContainer,
+      [
+        layout.powershellExecutable,
+        '-NoLogo',
+        '-NoProfile',
+        '-NonInteractive',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-File',
+        'C:/local-engineer/configure-proxy-network.ps1',
+        '-InternalAddress',
+        internal.address,
+        '-InternalMacAddress',
+        internal.macAddress,
+        '-EgressAddress',
+        egress.address,
+        '-EgressMacAddress',
+        egress.macAddress,
+      ],
+      { user: layout.administratorUser, workdir: layout.safeAdminWorkdir },
+    );
+    if (result.stdout.trim() !== 'LOCAL_ENGINEER_PROXY_NETWORK_OK')
+      throw new Error('CONTAINER_WINDOWS_PROXY_NETWORK_VERIFICATION_FAILED');
   }
 
   private async configureWindowsNetwork(

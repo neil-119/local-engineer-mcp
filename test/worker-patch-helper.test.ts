@@ -30,6 +30,17 @@ afterEach(() => {
 });
 
 describe('container apply_patch helper', () => {
+  it('reports a missing patch file instead of treating its name as patch content', () => {
+    const directory = worktree();
+    const result = spawnSync(process.execPath, [helper, '--check', 'dummy-new-file.patch'], {
+      cwd: directory,
+      encoding: 'utf8',
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('patch file not found: dummy-new-file.patch');
+  });
+
   it('checks and applies structured updates while preserving CRLF', () => {
     const directory = worktree();
     const file = join(directory, 'src', 'sample.ts');
