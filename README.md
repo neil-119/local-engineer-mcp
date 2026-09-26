@@ -400,11 +400,17 @@ The fixed-target relay is the only path that can reach a configured
 `model_domains` host, and it supports the methods and streaming behavior the
 model API needs. A worker cannot redirect that relay to another host.
 
-All other outbound HTTP, HTTPS, WebSocket, and SOCKS traffic is sent to the
-sidecar's read-only proxy. It TLS-inspects exact `read_only_domains` and allows
-only `GET`, `HEAD`, and `OPTIONS`; a dependency `POST`, an unlisted host, or a
-direct route is rejected. The proxy's temporary CA is shared only with the
-worker for this inspection and is deleted with the agent.
+Allowed dependency traffic can reach the sidecar's read-only HTTP or SOCKS
+proxy through injected `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` settings.
+This is not transparent forwarding: clients that ignore those settings must
+configure the proxy explicitly. For example, Windows PowerShell can use
+`Invoke-WebRequest -Proxy $env:HTTPS_PROXY -Uri https://registry.terraform.io/`.
+A direct DNS lookup or unproxied request failing is expected and does not prove
+an allowlisted domain is unavailable. The proxy TLS-inspects exact
+`read_only_domains` and allows only `GET`, `HEAD`, and `OPTIONS`; a dependency
+`POST`, an unlisted host, or a direct route is rejected. The proxy's temporary
+CA is shared only with the worker for this inspection and is deleted with the
+agent. Do not disable TLS verification to work around a client trust error.
 
 Project-image dependency installation follows the same boundary. Its temporary
 installer container has no model relay and is checked for both direct-egress and

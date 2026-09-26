@@ -48,7 +48,7 @@ export function createServer(engine: LocalEngineer): McpServer {
   server.tool(
     'local_engineer_start',
     toolDescription(
-      'Start an autonomous disposable container worker asynchronously. Prefer the repository image_profile documented in AGENTS.md. A missing or stale profile fails closed with exact local_engineer_build_image planning instructions; do not silently fall back or build without user approval.',
+      'Start an autonomous disposable container worker asynchronously. Prefer the repository image_profile documented in AGENTS.md. A missing or stale profile fails closed with exact local_engineer_build_image planning instructions; do not silently fall back or build without user approval. Workers have no direct Internet or external DNS route: allowed dependency requests use injected HTTP_PROXY/HTTPS_PROXY or explicit client proxy settings. A failed direct DNS or unproxied request alone does not mean an allowlisted domain is unavailable; have the worker verify through its proxy before reporting a network blocker.',
     ),
     {
       title: z.string(),

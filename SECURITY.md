@@ -105,6 +105,7 @@ All outbound communication from the worker must pass through the proxy sidecar:
 
 ### B. Limited Dependency Proxy (`:3128`)
 - Injects `HTTP_PROXY` and `HTTPS_PROXY` pointing to the sidecar.
+- These settings are advisory to clients, not transparent interception. The worker has no direct Internet or external DNS route; a client that ignores the proxy variables must explicitly select the proxy. A failed direct DNS lookup or unproxied request is expected, not evidence that an allowlisted host is blocked by the proxy. Keep TLS verification enabled with the injected CA settings.
 - **Strict Method Whitelist**: Permits only `GET`, `HEAD`, and `OPTIONS`. All write methods (`POST`, `PUT`, `DELETE`, `PATCH`) return `403 Forbidden`.
 - **Exact Domain Whitelisting**: Only exact hosts listed in `read_only_domains` (e.g. `registry.npmjs.org`, `pypi.org`, `crates.io`, `registry.terraform.io`, `learn.microsoft.com`, `developers.cloudflare.com`, `nodejs.org`) are permitted. Wildcards and unlisted hosts are rejected.
 - **No Unlisted Dependency Hosts**: Dependency traffic is limited to exact configured hosts. Operators must treat every listed host, including any private IP address they explicitly list, as trusted.

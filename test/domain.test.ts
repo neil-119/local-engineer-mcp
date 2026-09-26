@@ -41,6 +41,14 @@ describe('worker prompt', () => {
     expect(prompt).toContain('return the required blocked JSON report promptly');
     expect(prompt).toContain('alternate external installers such as curl downloads');
   });
+
+  it('explains explicit proxy use even when a custom worker policy replaces the default', () => {
+    const prompt = buildPrompt('Dependency test', 'run_4', 'Check Terraform.', undefined, 'Be concise.');
+    expect(prompt).toContain('these variables are not transparent forwarding');
+    expect(prompt).toContain('Invoke-WebRequest -Proxy $env:HTTPS_PROXY');
+    expect(prompt).toContain('retry the same read-only request once');
+    expect(prompt).toContain('never bypass the proxy, change routing, or disable certificate checks');
+  });
 });
 
 describe('result normalization', () => {
