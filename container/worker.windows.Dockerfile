@@ -56,6 +56,10 @@ RUN Copy-Item C:\network-proxy-main.rs C:\src\codex\codex-rs\network-proxy\src\m
     $cargo = Get-Content -Raw $cargoPath; `
     $cargo = $cargo -replace '(?m)^(tokio\s*=.*)$', ('$1' + [Environment]::NewLine + 'toml = { workspace = true }'); `
     Set-Content -LiteralPath $cargoPath -Value $cargo -Encoding utf8; `
+    $certsPath = 'C:\src\codex\codex-rs\network-proxy\src\certs.rs'; `
+    $certs = Get-Content -Raw $certsPath; `
+    $certs = $certs -replace '(?m)^\s*params\.extended_key_usages\s*=', ('    params.use_authority_key_identifier_extension = true;' + [Environment]::NewLine + '    params.extended_key_usages ='); `
+    Set-Content -LiteralPath $certsPath -Value $certs -Encoding utf8; `
     $env:RUSTUP_TOOLCHAIN = 'stable'; `
     cmd.exe /D /S /C 'call C:\BuildTools\VC\Auxiliary\Build\vcvars64.bat >nul && cd /d C:\src\codex\codex-rs && cargo build --release -p codex-network-proxy --bin codex-network-proxy'
 

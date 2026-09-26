@@ -197,6 +197,7 @@ export class ContainerAgentManager {
           await this.runtime.startContainer(existing.workerContainer);
           await this.configureWindowsWorkerNetwork(existing);
           await this.assertWindowsRepositoryMounts(existing);
+          await this.installWindowsWorkerCertificates(existing);
         }
       }
       return existing;
@@ -533,6 +534,9 @@ export class ContainerAgentManager {
         const excerpt = `${logs?.stdout ?? ''}\n${logs?.stderr ?? ''}`.trim().slice(-4000);
         throw new Error(`CONTAINER_PROXY_NOT_READY:${excerpt || 'no proxy logs'}`);
       }
+      if (this.config.platform === 'windows') {
+        await this.installWindowsWorkerCertificates(resources);
+      }
       timings.appServerReadinessMs = Date.now() - startAppServer;
       timings.totalPreparationMs = Date.now() - startPreparation;
       resources.timings = timings;
@@ -730,6 +734,7 @@ export class ContainerAgentManager {
       const running = await this.runtime.isContainerRunning(resources.workerContainer);
       if (running) {
         await this.configureWindowsWorkerNetwork(resources);
+        await this.installWindowsWorkerCertificates(resources);
       }
     }
     const reviewCommitsPath = join(state, 'review-commits.json');
@@ -1443,6 +1448,24 @@ export class ContainerAgentManager {
       resources.internalNetwork,
       resources.proxyAddress,
       true,
+    );
+  }
+
+  private async installWindowsWorkerCertificates(resources: ContainerAgentResources): Promise<void> {
+    const layout = containerLayout(this.config);
+    await this.runtime.execContainer(
+      resources.workerContainer,
+      [
+        layout.powershellExecutable,
+        '-NoLogo',
+        '-NoProfile',
+        '-NonInteractive',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-Command',
+        `$ErrorActionPreference = 'Stop'; Import-Certificate -FilePath '${layout.caFile}' -CertStoreLocation Cert:\\LocalMachine\\Root | Out-Null`,
+      ],
+      { user: layout.administratorUser, workdir: layout.safeAdminWorkdir },
     );
   }
 

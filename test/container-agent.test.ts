@@ -358,6 +358,19 @@ describe('container agent workspace seeding', () => {
     );
     expect(workerNetworkIsolation).toBeGreaterThan(workerStart);
     expect(workerReadyCheck).toBeGreaterThan(workerNetworkIsolation);
+    const certImportCall = calls.find(
+      (args) =>
+        args.includes(resources.workerContainer) &&
+        args.some((arg) => typeof arg === 'string' && arg.includes('Import-Certificate')),
+    );
+    expect(certImportCall).toBeDefined();
+    expect(certImportCall).toContain('--user');
+    expect(certImportCall).toContain('ContainerAdministrator');
+    expect(certImportCall?.some((arg) => typeof arg === 'string' && arg.includes('Cert:\\LocalMachine\\Root'))).toBe(
+      true,
+    );
+    const certImportIndex = calls.indexOf(certImportCall!);
+    expect(certImportIndex).toBeGreaterThan(workerReadyCheck);
     expect(
       calls.some(
         (args) =>
@@ -1268,6 +1281,9 @@ describe('Windows isolated-bind workspace mode', () => {
     expect(await runtime.isContainerRunning(resources.workerContainer)).toBe(true);
     expect(calls.some((args) => args.includes('start') && args.includes(resources.workerContainer))).toBe(true);
     expect(calls.some((args) => args.some((a) => a.endsWith('/configure-worker-network.ps1')))).toBe(true);
+    expect(calls.some((args) => args.some((a) => typeof a === 'string' && a.includes('Import-Certificate')))).toBe(
+      true,
+    );
   });
 
   it('getFile returns immutable reviewed revision content even if working clone is mutated after capture', async () => {
