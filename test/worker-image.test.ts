@@ -78,4 +78,10 @@ describe('shared worker image contract', () => {
     expect(DEFAULT_WORKER_POLICY).toContain('do not guess patch filenames');
     expect(DEFAULT_WORKER_POLICY).toContain('$patch | apply_patch --check');
   });
+
+  it('ensures Windows apply_patch.ps1 accepts pipeline input and remaining arguments', () => {
+    const ps1 = readContainerFile('apply_patch.ps1');
+    expect(ps1).toContain('ValueFromPipeline = $true');
+    expect(ps1).toContain('ValueFromRemainingArguments = $true');
+  });
 });

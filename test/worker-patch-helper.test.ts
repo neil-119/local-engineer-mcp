@@ -172,4 +172,75 @@ describe('container apply_patch helper', () => {
     expect(apply(directory, gitAliasPatch).status).not.toBe(0);
     expect(apply(directory, gitAliasPatch).stderr).toContain('path escapes worktree');
   });
+
+  it.runIf(process.platform === 'win32')(
+    'PowerShell wrapper apply_patch.ps1 supports pipeline input and positional args',
+    () => {
+      const directory = worktree();
+      const ps1Helper = fileURLToPath(new URL('../container/apply_patch.ps1', import.meta.url));
+
+      const patchContent = `*** Begin Patch\n*** Add File: src/via-pipe.ts\n+export const piped = true;\n*** End Patch\n`;
+
+      // Test pipeline input with --check
+      const checkResult = spawnSync(
+        'powershell.exe',
+        [
+          '-NoLogo',
+          '-NoProfile',
+          '-NonInteractive',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-Command',
+          `$patch = @'\n${patchContent}'@; $patch | & '${ps1Helper}' --check`,
+        ],
+        {
+          cwd: directory,
+          encoding: 'utf8',
+        },
+      );
+      expect(checkResult.status, checkResult.stderr).toBe(0);
+      expect(() => readFileSync(join(directory, 'src', 'via-pipe.ts'), 'utf8')).toThrow();
+
+      // Test pipeline application
+      const applyResult = spawnSync(
+        'powershell.exe',
+        [
+          '-NoLogo',
+          '-NoProfile',
+          '-NonInteractive',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-Command',
+          `$patch = @'\n${patchContent}'@; $patch | & '${ps1Helper}'`,
+        ],
+        {
+          cwd: directory,
+          encoding: 'utf8',
+        },
+      );
+      expect(applyResult.status).toBe(0);
+      expect(readFileSync(join(directory, 'src', 'via-pipe.ts'), 'utf8')).toBe('export const piped = true;\n');
+
+      // Test positional argument
+      const updatePatch = `*** Begin Patch\n*** Update File: src/via-pipe.ts\n@@\n-export const piped = true;\n+export const piped = 42;\n*** End Patch\n`;
+      const argResult = spawnSync(
+        'powershell.exe',
+        [
+          '-NoLogo',
+          '-NoProfile',
+          '-NonInteractive',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-Command',
+          `& '${ps1Helper}' '${updatePatch.replace(/'/g, "''")}'`,
+        ],
+        {
+          cwd: directory,
+          encoding: 'utf8',
+        },
+      );
+      expect(argResult.status).toBe(0);
+      expect(readFileSync(join(directory, 'src', 'via-pipe.ts'), 'utf8')).toBe('export const piped = 42;\n');
+    },
+  );
 });
