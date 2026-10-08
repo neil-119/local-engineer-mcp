@@ -19,6 +19,14 @@ export type RuntimeCommandExecutor = (
   options?: { input?: string | Buffer; timeoutMs?: number },
 ) => Promise<RuntimeCommandResult>;
 
+export interface ContainerMountInfo {
+  type: string;
+  name?: string;
+  source: string;
+  destination: string;
+  rw: boolean;
+}
+
 export interface ContainerRuntimeProbe {
   supported: boolean;
   executable: string;
@@ -322,9 +330,23 @@ export class ContainerRuntime {
     throw new Error('CONTAINER_AGENT_NETWORK_POOL_EXHAUSTED');
   }
 
-  removeNetwork(name: string): Promise<RuntimeCommandResult> {
+  async removeNetwork(name: string, retries = 5, retryDelayMs = 250): Promise<RuntimeCommandResult> {
     validateResourceName(name);
-    return this.run(['network', 'rm', name]);
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        return await this.run(['network', 'rm', name]);
+      } catch (cause) {
+        lastError = cause;
+        const message = cause instanceof Error ? cause.message : String(cause);
+        const isRetryable = /has active endpoints|is in use|active endpoints|resource busy/i.test(message);
+        if (!isRetryable || attempt === retries) {
+          throw cause;
+        }
+        await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+      }
+    }
+    throw lastError;
   }
 
   createVolume(name: string, labels: Record<string, string>): Promise<RuntimeCommandResult> {
@@ -733,6 +755,26 @@ export class ContainerRuntime {
       throw new Error('CONTAINER_WINDOWS_RESOURCE_LIMITS_REQUIRED');
   }
 
+  async inspectContainerMounts(container: string): Promise<ContainerMountInfo[]> {
+    validateResourceName(container);
+    const result = await this.run(['container', 'inspect', '--format', '{{json .Mounts}}', container]);
+    const raw = JSON.parse(result.stdout.trim()) as Array<{
+      Type?: string;
+      Name?: string;
+      Source?: string;
+      Destination?: string;
+      RW?: boolean;
+    }>;
+    if (!Array.isArray(raw)) throw new Error('CONTAINER_MOUNTS_INSPECT_INVALID');
+    return raw.map((m) => ({
+      type: (m.Type ?? '').toLowerCase(),
+      name: m.Name,
+      source: m.Source ?? '',
+      destination: (m.Destination ?? '').replace(/\\/g, '/'),
+      rw: Boolean(m.RW),
+    }));
+  }
+
   async containerNetworkAddress(container: string, network: string): Promise<string> {
     return (await this.containerNetworkEndpoint(container, network)).address;
   }
@@ -817,6 +859,113 @@ export class ContainerRuntime {
       .filter(Boolean);
     for (const name of names) validateResourceName(name);
     return names;
+  }
+
+  async listNetworksByLabels(expected: Record<string, string>): Promise<string[]> {
+    const filters = Object.entries(expected)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .flatMap(([name, value]) => {
+        if (!/^local-engineer\.[a-z0-9-]+$/.test(name) || /[\r\n\0]/.test(value))
+          throw new Error('CONTAINER_LABEL_INVALID');
+        return ['--filter', `label=${name}=${value}`];
+      });
+    const result = await this.run(['network', 'ls', ...filters, '--format', '{{.Name}}']);
+    return result.stdout
+      .split(/\r?\n/)
+      .map((name) => name.trim())
+      .filter((name) => RESOURCE_NAME.test(name));
+  }
+
+  async networkConnectedContainers(name: string): Promise<string[]> {
+    validateResourceName(name);
+    const result = await this.run(['network', 'inspect', '--format', '{{json .Containers}}', name]);
+    const raw = result.stdout.trim();
+    if (!raw || raw === 'null') return [];
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error(`CONTAINER_NETWORK_INSPECT_MALFORMED:${name}`);
+    }
+    if (parsed === null) return [];
+    if (typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error(`CONTAINER_NETWORK_INSPECT_INVALID:${name}`);
+    }
+    return Object.keys(parsed as Record<string, unknown>);
+  }
+
+  /**
+   * Safely discovers and removes orphaned networks created by local-engineer.
+   * Invariants:
+   * - Only considers networks prefixed with `le-` and labeled `local-engineer.managed=true`.
+   * - Never touches system/default networks (`nat`, `none`, `Default Switch`, `host`).
+   * - Skips any network belonging to an active or retained agent in `activeAgentIds`.
+   * - Skips any network that currently has connected containers.
+   * - Skips any network when container connectivity inspection is ambiguous or fails.
+   * - Skips any network created recently (within minAgeMs, default 15 minutes) to protect starting containers.
+   */
+  async pruneStaleManagedNetworks(
+    options?: ReadonlySet<string> | { activeAgentIds?: ReadonlySet<string>; minAgeMs?: number },
+  ): Promise<string[]> {
+    const isSet = options instanceof Set || (Boolean(options) && 'has' in (options as object));
+    const activeAgentIds = isSet
+      ? (options as ReadonlySet<string>)
+      : (options as { activeAgentIds?: ReadonlySet<string>; minAgeMs?: number } | undefined)?.activeAgentIds;
+    const minAgeMs = isSet
+      ? 0
+      : ((options as { activeAgentIds?: ReadonlySet<string>; minAgeMs?: number } | undefined)?.minAgeMs ??
+        15 * 60 * 1000);
+    const managedNetworks = await this.listNetworksByLabels({ 'local-engineer.managed': 'true' }).catch(() => []);
+    const pruned: string[] = [];
+    const now = Date.now();
+    for (const name of managedNetworks) {
+      if (!name.startsWith('le-')) continue;
+      if (['nat', 'none', 'host', 'Default Switch'].includes(name)) continue;
+
+      if (minAgeMs > 0) {
+        try {
+          const createdResult = await this.run(['network', 'inspect', '--format', '{{.Created}}', name]);
+          const createdTime = Date.parse(createdResult.stdout.trim());
+          if (!Number.isFinite(createdTime) || now - createdTime < minAgeMs) {
+            continue;
+          }
+        } catch {
+          continue;
+        }
+      }
+
+      try {
+        const result = await this.run([
+          'network',
+          'inspect',
+          '--format',
+          '{{index .Labels "local-engineer.agent-id"}}',
+          name,
+        ]);
+        const agentId = result.stdout.trim();
+        if (!/^[A-Za-z0-9_-]{1,128}$/.test(agentId)) continue;
+        if (activeAgentIds?.has(agentId)) continue;
+      } catch {
+        continue;
+      }
+
+      let connected: string[];
+      try {
+        connected = await this.networkConnectedContainers(name);
+      } catch {
+        // Fail-closed: skip deletion if inspection fails, is malformed, or returns ambiguous non-empty structure
+        continue;
+      }
+      if (connected.length > 0) continue;
+
+      try {
+        await this.removeNetwork(name);
+        pruned.push(name);
+      } catch {
+        // Opportunistic cleanup ignore
+      }
+    }
+    return pruned;
   }
 
   /**

@@ -58,6 +58,15 @@ export interface ContainerConfig {
   windows_workspace_mode?: 'volume-copy' | 'isolated-bind';
   network: ContainerNetworkConfig;
 }
+export type DependencyMode = 'read-only' | 'private-install';
+
+export interface PrivateInstallTarget {
+  repository: string;
+  relativePath: string;
+  containerPath: string;
+  volume: string;
+}
+
 export interface WindowsDependencyMount {
   relativePath: string;
   hostPath: string;
@@ -85,6 +94,7 @@ export interface ContainerPreparationTimings {
 export interface ContainerModelProvider {
   base_url: string;
   wire_api: 'responses' | 'chat';
+  wire_api_compatibility?: 'standard' | 'flatten_namespaces';
   api_key_environment_variable?: string;
   requires_openai_auth: boolean;
 }
@@ -191,10 +201,13 @@ export interface Worker {
   environment_from_host?: string[];
   container_model_provider?: ContainerModelProvider;
   container_codex_config_file?: string;
+  auto_compact_token_limit?: number;
+  model_catalog_json_file?: string;
 }
 export interface Config {
   version: 1;
   default_worker?: string;
+  default_dependency_mode?: DependencyMode;
   server: {
     state_dir: string;
     max_concurrency: number;
@@ -247,6 +260,7 @@ export interface Run {
   imageProfile?: string;
   imageReference?: string;
   changeSet?: ContainerChangeSet;
+  dependencyMode?: DependencyMode;
   worker: string;
   status: RunStatus;
   continuationIndex: number;
@@ -261,6 +275,23 @@ export interface Run {
   diagnostics?: RunDiagnostics;
   stats?: RunStats;
   requiresUserAction: boolean;
+  pendingSteer?: { message: string; requestedAt: string; id: string };
+  steeringQueue?: SteeringMessage[];
+  steeringMessages?: SteeringMessage[];
+  steeringVersion?: number;
+}
+export type SteeringStatus = 'pending' | 'dispatching' | 'delivered' | 'failed' | 'uncertain';
+
+export interface SteeringMessage {
+  id: string;
+  message: string;
+  status: SteeringStatus;
+  queuedAt: string;
+  dispatchingAt?: string;
+  dispatchOwnerId?: string;
+  dispatchFenceToken?: number;
+  sentAt?: string;
+  error?: string;
 }
 export interface RunStats {
   worker_tokens?: {
@@ -338,3 +369,23 @@ export const transition = (from: RunStatus, to: RunStatus): void => {
   };
   if (!allowed[from].includes(to)) throw new Error(`INVALID_STATE_TRANSITION:${from}->${to}`);
 };
+
+export interface RunSummaryResult {
+  schema_version: 1;
+  run_id: string;
+  agent_id: string;
+  title: string;
+  status: RunStatus;
+  duration_seconds?: number;
+  in_progress: boolean;
+  summary_source: 'model' | 'deterministic_fallback';
+  summary_advisory: true;
+  model_summary_error?: string;
+  summary: string;
+  key_blockers: string[];
+  files_changed: string[];
+  commands_count: number;
+  failed_commands_count: number;
+  timeline_items_analyzed: number;
+  history_truncated: boolean;
+}

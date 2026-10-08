@@ -65,10 +65,11 @@ RUN apt-get update \
 
 COPY --from=proxy-builder /src/codex/codex-rs/target/release/codex-network-proxy /usr/local/bin/codex-network-proxy
 COPY proxy-sidecar.mjs /usr/local/lib/local-engineer/proxy-sidecar.mjs
+COPY file-tools-server.mjs /usr/local/lib/local-engineer/file-tools-server.mjs
 COPY apply_patch /usr/local/bin/apply_patch
 COPY apply_patch.mjs /usr/local/lib/local-engineer/apply_patch.mjs
 COPY rust-path.sh /etc/profile.d/local-engineer-rust.sh
-RUN chmod 0755 /usr/local/bin/apply_patch /etc/profile.d/local-engineer-rust.sh
+RUN chmod 0755 /usr/local/bin/apply_patch /etc/profile.d/local-engineer-rust.sh /usr/local/lib/local-engineer/file-tools-server.mjs
 
 ENV CODEX_HOME=/home/codex/.codex \
     RUSTUP_HOME=/usr/local/rustup \

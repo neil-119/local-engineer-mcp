@@ -95,11 +95,15 @@ export class CodexAppServer {
   setupProcess(child: ChildProcess): void {
     this.process = child;
     child.stdin?.on('error', () => undefined);
-    child.stderr?.on('data', (data: Buffer | string) =>
-      this.onEvent({ jsonrpc: '2.0', method: 'stderr', params: { text: String(data) } }),
-    );
+    let recentStderr = '';
+    child.stderr?.on('data', (data: Buffer | string) => {
+      const text = String(data);
+      recentStderr = (recentStderr + text).slice(-2000);
+      this.onEvent({ jsonrpc: '2.0', method: 'stderr', params: { text } });
+    });
     child.on('exit', (code: number | null) => {
-      const error = new Error(`CODEX_APP_SERVER_EXIT:${code ?? 'unknown'}`);
+      const detail = recentStderr.trim();
+      const error = new Error(`CODEX_APP_SERVER_EXIT:${code ?? 'unknown'}${detail ? `: ${detail}` : ''}`);
       for (const pending of this.pending.values()) pending.reject(error);
       this.pending.clear();
       this.failActiveTurns(error);
@@ -292,6 +296,18 @@ export class CodexAppServer {
    */
   async interrupt(threadId: string, turnId: string): Promise<void> {
     await this.request('turn/interrupt', { threadId, turnId });
+  }
+
+  /**
+   * Injects mid-turn guidance into the active turn without interrupting execution.
+   */
+  async steer(threadId: string, turnId: string, prompt: string): Promise<string> {
+    const turn = await this.request('turn/steer', {
+      threadId,
+      expectedTurnId: turnId,
+      input: [{ type: 'text', text: prompt, text_elements: [] }],
+    });
+    return (stringAt(turn, ['turnId']) ?? stringAt(turn, ['turn', 'id']) ?? turnId) as string;
   }
 
   /**

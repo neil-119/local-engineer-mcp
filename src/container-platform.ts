@@ -19,6 +19,8 @@ export interface ContainerLayout {
   dependencyRoot: string;
   caFile: string;
   proxySidecar: string;
+  fileToolsServer: string;
+  nodeExecutable: string;
   networkScript?: string;
   keepAliveCommand: string[];
   administratorUser: string;
@@ -45,6 +47,8 @@ export function containerLayout(config: ContainerConfig): ContainerLayout {
       dependencyRoot: 'C:/local-engineer/dependencies',
       caFile: `${proxyShared}/ca.pem`,
       proxySidecar: 'C:/local-engineer/proxy-sidecar.mjs',
+      fileToolsServer: 'C:/local-engineer/file-tools-server.mjs',
+      nodeExecutable: 'C:/Node/node.exe',
       networkScript: 'C:/local-engineer/configure-worker-network.ps1',
       keepAliveCommand: [
         'powershell.exe',
@@ -73,6 +77,8 @@ export function containerLayout(config: ContainerConfig): ContainerLayout {
     dependencyRoot: '/local-engineer-dependencies',
     caFile: `${proxyShared}/ca.pem`,
     proxySidecar: '/usr/local/lib/local-engineer/proxy-sidecar.mjs',
+    fileToolsServer: '/usr/local/lib/local-engineer/file-tools-server.mjs',
+    nodeExecutable: '/usr/local/bin/node',
     keepAliveCommand: ['sleep', 'infinity'],
     administratorUser: '0',
     codexExecutable: '/usr/local/bin/codex',

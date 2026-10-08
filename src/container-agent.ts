@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import fs, {
   appendFileSync,
   closeSync,
@@ -6,6 +7,7 @@ import fs, {
   lstatSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   rmSync,
   unlinkSync,
@@ -17,6 +19,8 @@ import type {
   ContainerConfig,
   ContainerPlatform,
   ContainerPreparationTimings,
+  DependencyMode,
+  PrivateInstallTarget,
   RepositoryChangeSummary,
   RunRepository,
   WindowsDependencyMount,
@@ -27,7 +31,17 @@ import type { ContainerAppServerWorker } from './codex.js';
 import { relayedModelBaseUrl, writeContainerCodexConfigs } from './container-codex-config.js';
 import { containerLayout, joinContainerPath, nodeMkdirCommand, nodeRemoveCommand } from './container-platform.js';
 import { agentNetworkSubnetCandidates, ContainerRuntime } from './container-runtime.js';
-import { discoverDependencyMounts, isDependencyManifestChanged } from './dependency-mount.js';
+import {
+  assertNoManagedDependencyPaths,
+  discoverDependencyMounts,
+  discoverPrivateInstallTargets,
+  isDependencyManifestChanged,
+  isManagedDependencyPath,
+  MANAGED_DEPENDENCY_DIR_NAMES,
+  MANAGED_DEPENDENCY_EXCLUDE_PATTERNS,
+  privateInstallVolumeName,
+  resolvePrimaryInstallTarget,
+} from './dependency-mount.js';
 import {
   checkRepositoryPromotion,
   createRepositorySnapshot,
@@ -39,18 +53,15 @@ import {
   writePatchArtifact,
 } from './repository-snapshot.js';
 
-/**
- * Container Agent Lifecycle & Workspace Isolation
- *
- * Orchestrates disposable Docker container agents across Linux and Windows:
- * - Twin-container architecture: untrusted worker container + strictly brokered proxy sidecar.
- * - Network isolation: private worker/proxy bridge or NAT with stripped worker routes, plus
- *   sidecar-only egress (per-agent on Linux; Docker's default NAT on Windows).
- * - Volume layout: isolated repository volumes, Codex home, dependency cache, and proxy shared state.
- * - Read-only Windows repositories use Docker read-only volume mounts because Windows named-volume
- *   mount semantics do not reliably enforce in-container NTFS ACL changes.
- * - Atomic Git snapshots and review revisions without polluting the parent repository.
- */
+export {
+  assertNoManagedDependencyPaths,
+  isManagedDependencyPath,
+  MANAGED_DEPENDENCY_DIR_NAMES,
+  MANAGED_DEPENDENCY_EXCLUDE_PATTERNS,
+};
+
+/** Dependencies managed outside Git tracking within isolated volumes. */
+export const MANAGED_DEPENDENCY_PATHS = MANAGED_DEPENDENCY_DIR_NAMES;
 
 interface RepositoryRevision {
   runRepository: RunRepository;
@@ -62,15 +73,6 @@ interface RepositoryRevision {
   dependencyMounts?: WindowsDependencyMount[];
   dependencyManifestStale?: boolean;
 }
-
-/** Dependencies managed outside Git tracking within isolated volumes. */
-const MANAGED_DEPENDENCY_PATHS = [
-  '.local-engineer-dependencies',
-  '.local-pkgs',
-  '.venv',
-  'node_modules',
-  '__pypackages__',
-] as const;
 
 /** Complete resource descriptor for an active or recoverable container agent. */
 export interface ContainerAgentResources {
@@ -92,6 +94,8 @@ export interface ContainerAgentResources {
   proxyAddress?: string;
   repositories: Map<string, RepositoryRevision>;
   revision: number;
+  dependencyMode: DependencyMode;
+  privateInstallTargets?: PrivateInstallTarget[];
   timings?: ContainerPreparationTimings;
 }
 
@@ -100,6 +104,7 @@ interface RecoveryInput {
   image: string;
   repositories: RunRepository[];
   changeSet?: ContainerChangeSet;
+  dependencyMode?: DependencyMode;
 }
 
 /**
@@ -134,9 +139,25 @@ export class ContainerAgentManager {
       });
   }
 
+  async pruneStaleNetworks(minAgeMs = 15 * 60 * 1000): Promise<string[]> {
+    const active = new Set(this.agents.keys());
+    const agentParent = resolve(this.stateDir, 'container-agents');
+    try {
+      if (existsSync(agentParent)) {
+        for (const entry of readdirSync(agentParent, { withFileTypes: true })) {
+          if (entry.isDirectory()) active.add(entry.name);
+        }
+      }
+    } catch {
+      // Ignore disk inspection errors during opportunistic prune
+    }
+    return this.runtime.pruneStaleManagedNetworks({ activeAgentIds: active, minAgeMs });
+  }
+
   async probe(image = this.config.image) {
     const cached = this.successfulProbes.get(image);
     if (cached) return cached;
+    await this.pruneStaleNetworks().catch(() => undefined);
     const result = await this.runtime.probe(image);
     if (result.supported) this.successfulProbes.set(image, result);
     return result;
@@ -184,6 +205,8 @@ export class ContainerAgentManager {
     repositories: RunRepository[],
     image = this.config.image,
     profileRepository?: string,
+    dependencyMode: DependencyMode = 'read-only',
+    workingDirectory?: string,
   ): Promise<ContainerAgentResources> {
     const layout = containerLayout(this.config);
     if (this.config.platform === 'windows' && profileRepository) throw new Error('IMAGE_PROFILE_WINDOWS_UNSUPPORTED');
@@ -237,8 +260,22 @@ export class ContainerAgentManager {
       windowsWorkspaceMode: isIsolatedBind ? 'isolated-bind' : 'volume-copy',
       repositories: new Map(),
       revision: 0,
+      dependencyMode,
       timings,
     };
+
+    if (dependencyMode === 'private-install') {
+      const writableRepos = repositories.filter((r) => r.access !== 'read-only');
+      if (writableRepos.length === 0) {
+        throw new Error('PRIVATE_INSTALL_NO_WRITABLE_REPOSITORIES');
+      }
+      const privateTargets: PrivateInstallTarget[] = [];
+      for (const repo of writableRepos) {
+        const targets = discoverPrivateInstallTargets(repo.name, repo.parentPath, repo.containerPath, prefix);
+        privateTargets.push(...targets);
+      }
+      resources.privateInstallTargets = privateTargets;
+    }
     const labels = {
       'local-engineer.agent-id': agentId,
       'local-engineer.managed': 'true',
@@ -287,11 +324,11 @@ export class ContainerAgentManager {
 
           const excludePath = join(workingClonePath, '.git', 'info', 'exclude');
           mkdirSync(dirname(excludePath), { recursive: true });
-          appendFileSync(excludePath, '\n' + MANAGED_DEPENDENCY_PATHS.map((p) => `/${p}/`).join('\n') + '\n');
+          appendFileSync(excludePath, '\n' + MANAGED_DEPENDENCY_EXCLUDE_PATTERNS.join('\n') + '\n');
 
           const baselineExcludePath = join(rev.snapshot.snapshotPath, '.git', 'info', 'exclude');
           mkdirSync(dirname(baselineExcludePath), { recursive: true });
-          appendFileSync(baselineExcludePath, '\n' + MANAGED_DEPENDENCY_PATHS.map((p) => `/${p}/`).join('\n') + '\n');
+          appendFileSync(baselineExcludePath, '\n' + MANAGED_DEPENDENCY_EXCLUDE_PATTERNS.join('\n') + '\n');
 
           rev.workingClonePath = workingClonePath;
         }
@@ -300,7 +337,11 @@ export class ContainerAgentManager {
         const startDepVal = Date.now();
         for (const repository of repositories) {
           const rev = resources.repositories.get(repository.name)!;
-          const depMounts = discoverDependencyMounts(repository.parentPath, repository.containerPath);
+          const isPrivateInstallWritable =
+            resources.dependencyMode === 'private-install' && repository.access !== 'read-only';
+          const depMounts = isPrivateInstallWritable
+            ? []
+            : discoverDependencyMounts(repository.parentPath, repository.containerPath);
           rev.dependencyMounts = depMounts;
 
           windowsMounts.set(repository.name, {
@@ -346,7 +387,14 @@ export class ContainerAgentManager {
         });
       }
       timings.networkAllocationMs = Date.now() - startNetwork;
-      writeContainerCodexConfigs(worker, this.config, workerConfigPath, proxyConfigPath, resources.proxyAddress);
+      const codexConfigPaths = writeContainerCodexConfigs(
+        worker,
+        this.config,
+        workerConfigPath,
+        proxyConfigPath,
+        resources.proxyAddress,
+        repositories.map((r) => ({ containerPath: r.containerPath, access: r.access })),
+      );
 
       if (this.config.platform === 'windows') {
         if (!isIsolatedBind) {
@@ -359,6 +407,11 @@ export class ContainerAgentManager {
       await this.runtime.createVolume(resources.proxyConfigVolume, labels);
       await this.runtime.createVolume(resources.proxySharedVolume, labels);
       await this.runtime.createVolume(resources.dependencyVolume, labels);
+      if (resources.privateInstallTargets) {
+        for (const target of resources.privateInstallTargets) {
+          await this.runtime.createVolume(target.volume, labels);
+        }
+      }
 
       const startSetup = Date.now();
       if (isIsolatedBind) {
@@ -368,6 +421,7 @@ export class ContainerAgentManager {
           workerConfigPath,
           proxyConfigPath,
           labels,
+          codexConfigPaths.modelCatalogPath,
         );
       } else {
         await this.seedWritableVolume(
@@ -386,6 +440,7 @@ export class ContainerAgentManager {
           resources.internalNetwork,
           labels,
           true,
+          codexConfigPaths.modelCatalogPath,
         );
         await this.seedDependencyVolume(
           `${prefix}-dependency-seed`,
@@ -420,6 +475,9 @@ export class ContainerAgentManager {
         environment: {
           CODEX_HOME: layout.codexHome,
           LOCAL_ENGINEER_MODEL_UPSTREAM: worker.container_model_provider!.base_url,
+          ...(worker.container_model_provider?.wire_api_compatibility === 'flatten_namespaces'
+            ? { LOCAL_ENGINEER_RESPONSES_COMPATIBILITY: 'flatten_namespaces' }
+            : {}),
           ...(this.config.platform === 'windows'
             ? { LOCAL_ENGINEER_MODEL_RELAY_BIND_ADDRESS: resources.proxyAddress! }
             : {}),
@@ -428,7 +486,12 @@ export class ContainerAgentManager {
             ? { LOCAL_ENGINEER_PROXY_EXECUTABLE: 'C:/local-engineer/codex-network-proxy.exe' }
             : {}),
         },
-        command: ['node', layout.proxySidecar],
+        command: [
+          'node',
+          existsSync(fileURLToPath(new URL('../container/proxy-sidecar.mjs', import.meta.url)))
+            ? joinContainerPath(this.config.platform, layout.codexHome, 'proxy-sidecar.mjs')
+            : layout.proxySidecar,
+        ],
       });
       if (this.config.platform === 'windows') await this.runtime.assertWindowsHyperVIsolation(resources.proxyContainer);
       await this.runtime.connectNetwork(
@@ -465,6 +528,11 @@ export class ContainerAgentManager {
       const proxyHost = this.config.platform === 'windows' ? resources.proxyAddress : resources.proxyContainer;
       if (!proxyHost) throw new Error('CONTAINER_PROXY_ADDRESS_MISSING');
 
+      const primaryInstallTarget =
+        resources.dependencyMode === 'private-install'
+          ? resolvePrimaryInstallTarget(resources.privateInstallTargets, repositories, workingDirectory)
+          : undefined;
+
       const startWorker = Date.now();
       await this.runtime.createContainer({
         name: resources.workerContainer,
@@ -498,10 +566,25 @@ export class ContainerAgentManager {
           PIP_CACHE_DIR: `${layout.dependencyRoot}/pip-cache`,
           npm_config_cache: `${layout.dependencyRoot}/npm-cache`,
           YARN_CACHE_FOLDER: `${layout.dependencyRoot}/yarn-cache`,
+          npm_config_store_dir: `${layout.dependencyRoot}/pnpm-store`,
           ...(this.config.platform === 'windows'
             ? {
                 CARGO_HOME: `${layout.dependencyRoot}/cargo-home`,
                 RUSTUP_HOME: 'C:/Rust/rustup',
+              }
+            : {}),
+          ...(resources.dependencyMode === 'private-install'
+            ? {
+                npm_config_node_linker: 'hoisted',
+                npm_config_package_import_method: 'copy',
+                npm_config_confirm_modules_purge: 'false',
+                npm_config_audit: 'false',
+                npm_config_fund: 'false',
+                ...(this.config.platform === 'windows' && primaryInstallTarget
+                  ? {
+                      npm_config_store_dir: `${primaryInstallTarget.containerPath}/.pnpm-store`,
+                    }
+                  : {}),
               }
             : {}),
           ...worker.environment,
@@ -545,8 +628,15 @@ export class ContainerAgentManager {
         join(agentState, 'resources.json'),
         JSON.stringify(
           {
-            schema_version: 4,
+            schema_version: 5,
             agent_id: agentId,
+            dependency_mode: resources.dependencyMode,
+            private_install_targets: resources.privateInstallTargets?.map((t) => ({
+              repository: t.repository,
+              relative_path: t.relativePath,
+              container_path: t.containerPath,
+              volume: t.volume,
+            })),
             windows_workspace_mode: this.config.windows_workspace_mode ?? 'volume-copy',
             worker_container: resources.workerContainer,
             proxy_container: resources.proxyContainer,
@@ -581,6 +671,13 @@ export class ContainerAgentManager {
         ),
         { encoding: 'utf8', mode: 0o600 },
       );
+      if (resources.dependencyMode === 'private-install' && resources.privateInstallTargets) {
+        writeFileSync(
+          join(agentState, 'authorized-targets.json'),
+          JSON.stringify(resources.privateInstallTargets, null, 2),
+          { encoding: 'utf8', mode: 0o600 },
+        );
+      }
       this.agents.set(agentId, resources);
       return resources;
     } catch (cause) {
@@ -604,14 +701,22 @@ export class ContainerAgentManager {
     const resourcePath = join(state, 'resources.json');
     if (!existsSync(resourcePath)) throw new Error('CONTAINER_AGENT_RETAINED_STATE_NOT_FOUND');
     const persisted = JSON.parse(readFileSync(resourcePath, 'utf8')) as Record<string, unknown>;
-    if (persisted.schema_version !== 2 && persisted.schema_version !== 3 && persisted.schema_version !== 4)
+    if (
+      persisted.schema_version !== 2 &&
+      persisted.schema_version !== 3 &&
+      persisted.schema_version !== 4 &&
+      persisted.schema_version !== 5
+    )
       throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
 
     const expected = {
       worker_container: `${prefix}-worker`,
       proxy_container: `${prefix}-proxy`,
       internal_network: `${prefix}-internal`,
-      egress_network: this.config.platform === 'windows' && persisted.schema_version === 4 ? 'nat' : `${prefix}-egress`,
+      egress_network:
+        this.config.platform === 'windows' && (persisted.schema_version === 4 || persisted.schema_version === 5)
+          ? 'nat'
+          : `${prefix}-egress`,
       workspace_volume: `${prefix}-workspace`,
       worker_config_volume: `${prefix}-worker-config`,
       proxy_config_volume: `${prefix}-proxy-config`,
@@ -620,7 +725,7 @@ export class ContainerAgentManager {
     };
     const isIsolatedBind =
       this.config.platform === 'windows' &&
-      (persisted.schema_version === 3 || persisted.schema_version === 4) &&
+      (persisted.schema_version === 3 || persisted.schema_version === 4 || persisted.schema_version === 5) &&
       persisted.windows_workspace_mode === 'isolated-bind';
 
     const expectedRepositoryVolumes = Object.fromEntries(
@@ -700,6 +805,194 @@ export class ContainerAgentManager {
           snapshot: RepositorySnapshot;
         }>)
       : [];
+
+    let dependencyMode: DependencyMode;
+    const privateInstallTargets: PrivateInstallTarget[] = [];
+
+    if (persisted.schema_version === 5) {
+      if (persisted.dependency_mode !== 'read-only' && persisted.dependency_mode !== 'private-install') {
+        throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+      }
+      dependencyMode = persisted.dependency_mode;
+      if (input.dependencyMode && input.dependencyMode !== dependencyMode) {
+        throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+      }
+
+      if (dependencyMode === 'read-only') {
+        if (
+          persisted.private_install_targets !== undefined &&
+          (!Array.isArray(persisted.private_install_targets) || persisted.private_install_targets.length > 0)
+        ) {
+          throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+        }
+      } else {
+        // private-install mode
+        if (!Array.isArray(persisted.private_install_targets)) {
+          throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+        }
+
+        const authorizedPath = join(state, 'authorized-targets.json');
+        if (!existsSync(authorizedPath)) {
+          throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+        }
+        let authorizedTargets: PrivateInstallTarget[];
+        try {
+          authorizedTargets = JSON.parse(readFileSync(authorizedPath, 'utf8')) as PrivateInstallTarget[];
+        } catch {
+          throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+        }
+        if (!Array.isArray(authorizedTargets)) {
+          throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+        }
+
+        if (persisted.private_install_targets.length !== authorizedTargets.length) {
+          throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+        }
+        for (let i = 0; i < authorizedTargets.length; i++) {
+          const auth = authorizedTargets[i]!;
+          const p = persisted.private_install_targets[i]! as Record<string, unknown>;
+          if (
+            auth.repository !== p.repository ||
+            auth.relativePath !== p.relative_path ||
+            auth.containerPath !== p.container_path ||
+            auth.volume !== p.volume
+          ) {
+            throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+          }
+        }
+
+        const seenTargetKeys = new Set<string>();
+        const seenVolumes = new Set<string>();
+        const seenContainerPaths = new Set<string>();
+        const repoMap = new Map(input.repositories.map((r) => [r.name, r]));
+
+        for (const t of persisted.private_install_targets as Array<Record<string, unknown>>) {
+          if (
+            typeof t.repository !== 'string' ||
+            typeof t.relative_path !== 'string' ||
+            typeof t.container_path !== 'string' ||
+            typeof t.volume !== 'string'
+          ) {
+            throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+          }
+
+          const targetRepo = repoMap.get(t.repository);
+          if (!targetRepo || targetRepo.access === 'read-only') {
+            throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+          }
+
+          const relPath = t.relative_path.replace(/\\/g, '/');
+          const segments = relPath.split('/');
+          if (
+            !relPath ||
+            relPath.startsWith('/') ||
+            relPath.includes(':') ||
+            segments.includes('..') ||
+            segments.includes('.') ||
+            segments.includes('.git') ||
+            segments.at(-1) !== 'node_modules'
+          ) {
+            throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+          }
+
+          const expectedContainerPath = join(targetRepo.containerPath, relPath).replace(/\\/g, '/');
+          if (t.container_path !== expectedContainerPath) {
+            throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+          }
+
+          const expectedVolume = privateInstallVolumeName(prefix, t.repository, relPath);
+          if (t.volume !== expectedVolume) {
+            throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+          }
+
+          const targetKey = `${t.repository}:${relPath.toLowerCase()}`;
+          if (
+            seenTargetKeys.has(targetKey) ||
+            seenVolumes.has(t.volume) ||
+            seenContainerPaths.has(expectedContainerPath)
+          ) {
+            throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+          }
+          seenTargetKeys.add(targetKey);
+          seenVolumes.add(t.volume);
+          seenContainerPaths.add(expectedContainerPath);
+
+          privateInstallTargets.push({
+            repository: t.repository,
+            relativePath: t.relative_path,
+            containerPath: t.container_path,
+            volume: t.volume,
+          });
+        }
+
+        for (let i = 0; i < privateInstallTargets.length; i++) {
+          for (let j = i + 1; j < privateInstallTargets.length; j++) {
+            const shorter = privateInstallTargets[i]!.containerPath;
+            const longer = privateInstallTargets[j]!.containerPath;
+            if (longer.startsWith(shorter + '/') || shorter.startsWith(longer + '/')) {
+              throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+            }
+          }
+        }
+
+        // Verify target completeness against immutable retained baseline manifests
+        const requiredBaselineTargets: PrivateInstallTarget[] = [];
+        for (const repo of input.repositories) {
+          if (repo.access !== 'read-only') {
+            const saved = savedSnapshots.find((entry) => entry.runRepository.name === repo.name);
+            const snapshotPath = saved?.snapshot.snapshotPath ?? join(state, 'snapshots', repo.name);
+            if (existsSync(snapshotPath)) {
+              requiredBaselineTargets.push(
+                ...discoverPrivateInstallTargets(repo.name, snapshotPath, repo.containerPath, prefix),
+              );
+            }
+          }
+        }
+
+        if (privateInstallTargets.length !== requiredBaselineTargets.length) {
+          throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+        }
+
+        // 1. Every baseline manifest target must be present in privateInstallTargets
+        for (const required of requiredBaselineTargets) {
+          const match = privateInstallTargets.find(
+            (t) =>
+              t.repository === required.repository &&
+              t.relativePath === required.relativePath &&
+              t.containerPath === required.containerPath &&
+              t.volume === required.volume,
+          );
+          if (!match) {
+            throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+          }
+        }
+
+        // 2. Every target in privateInstallTargets must correspond to a valid directory in the retained baseline
+        for (const target of privateInstallTargets) {
+          const saved = savedSnapshots.find((entry) => entry.runRepository.name === target.repository);
+          const snapshotPath = saved?.snapshot.snapshotPath ?? join(state, 'snapshots', target.repository);
+          const parentDirRel = target.relativePath.includes('/')
+            ? target.relativePath.slice(0, target.relativePath.lastIndexOf('/'))
+            : '';
+          if (parentDirRel) {
+            const parentDir = join(snapshotPath, parentDirRel);
+            if (!existsSync(parentDir)) {
+              throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+            }
+          }
+        }
+      }
+    } else {
+      // Schemas 2, 3, 4: Strictly read-only
+      if (persisted.dependency_mode !== undefined || persisted.private_install_targets !== undefined) {
+        throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+      }
+      if (input.dependencyMode && input.dependencyMode !== 'read-only') {
+        throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+      }
+      dependencyMode = 'read-only';
+    }
+
     const resources: ContainerAgentResources = {
       agentId: input.agentId,
       image: input.image,
@@ -719,8 +1012,78 @@ export class ContainerAgentManager {
       ...(typeof persisted.proxy_address === 'string' ? { proxyAddress: persisted.proxy_address } : {}),
       repositories: new Map(),
       revision: input.changeSet?.revision ?? 0,
+      dependencyMode,
+      ...(privateInstallTargets.length > 0 ? { privateInstallTargets } : {}),
       timings: persisted.timings as ContainerPreparationTimings | undefined,
     };
+
+    // Verify ownership labels and mounts BEFORE any container execution or network configuration
+    const labels = {
+      'local-engineer.agent-id': resources.agentId,
+      'local-engineer.managed': 'true',
+    };
+    if (!(await this.runtime.hasOwnershipLabels('container', resources.workerContainer, labels))) {
+      throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+    }
+    if (!(await this.runtime.hasOwnershipLabels('container', resources.proxyContainer, labels))) {
+      throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+    }
+    if (!(await this.runtime.hasOwnershipLabels('network', resources.internalNetwork, labels))) {
+      throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+    }
+    if (this.config.platform === 'windows' && resources.egressNetwork === 'nat') {
+      if (resources.egressNetwork !== 'nat') throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+    } else {
+      if (!(await this.runtime.hasOwnershipLabels('network', resources.egressNetwork, labels))) {
+        throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+      }
+    }
+    if (this.config.platform !== 'windows') {
+      if (!(await this.runtime.hasOwnershipLabels('volume', resources.workspaceVolume, labels))) {
+        throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+      }
+    } else if (!isIsolatedBind) {
+      for (const volume of resources.repositoryVolumes.values()) {
+        if (!(await this.runtime.hasOwnershipLabels('volume', volume, labels))) {
+          throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+        }
+      }
+    }
+    if (!(await this.runtime.hasOwnershipLabels('volume', resources.workerConfigVolume, labels))) {
+      throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+    }
+    if (!(await this.runtime.hasOwnershipLabels('volume', resources.proxyConfigVolume, labels))) {
+      throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+    }
+    if (!(await this.runtime.hasOwnershipLabels('volume', resources.proxySharedVolume, labels))) {
+      throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+    }
+    if (!(await this.runtime.hasOwnershipLabels('volume', resources.dependencyVolume, labels))) {
+      throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+    }
+    if (resources.privateInstallTargets) {
+      for (const target of resources.privateInstallTargets) {
+        if (!(await this.runtime.hasOwnershipLabels('volume', target.volume, labels))) {
+          throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+        }
+      }
+    }
+
+    if (resources.dependencyMode === 'private-install' && resources.privateInstallTargets) {
+      const actualMounts = await this.runtime.inspectContainerMounts(resources.workerContainer);
+      for (const target of resources.privateInstallTargets) {
+        const targetPathNorm = target.containerPath.replace(/\\/g, '/').toLowerCase();
+        const actual = actualMounts.find((m) => m.destination.replace(/\\/g, '/').toLowerCase() === targetPathNorm);
+        if (!actual) throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+        if (actual.type !== 'volume') throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+        const actualSource = (actual.name || actual.source).replace(/\\/g, '/');
+        if (actualSource !== target.volume && actual.name !== target.volume) {
+          throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+        }
+        if (!actual.rw) throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+      }
+    }
+
     if (this.config.platform === 'windows') {
       if (!resources.proxyAddress) throw new Error('CONTAINER_PROXY_ADDRESS_MISSING');
       await this.runtime.assertWindowsHyperVIsolation(resources.proxyContainer);
@@ -730,7 +1093,8 @@ export class ContainerAgentManager {
         resources.internalNetwork,
       );
       if (liveProxyAddress !== resources.proxyAddress) throw new Error('CONTAINER_PROXY_ADDRESS_CHANGED');
-      if (persisted.schema_version === 4) await this.configureWindowsProxyNetwork(resources);
+      if (persisted.schema_version === 4 || persisted.schema_version === 5)
+        await this.configureWindowsProxyNetwork(resources);
       const running = await this.runtime.isContainerRunning(resources.workerContainer);
       if (running) {
         await this.configureWindowsWorkerNetwork(resources);
@@ -854,6 +1218,7 @@ export class ContainerAgentManager {
         '--interactive',
         resources.workerContainer,
         this.config.codex_command === 'codex' ? layout.codexExecutable : this.config.codex_command,
+        '--strict-config',
         '-c',
         `model_providers.${worker.model_provider}.base_url=${JSON.stringify(
           relayedModelBaseUrl(worker.container_model_provider!.base_url, relayAuthority),
@@ -881,13 +1246,15 @@ export class ContainerAgentManager {
     network: string,
     labels: Record<string, string>,
     writable: boolean,
+    modelCatalogSource?: string,
   ): Promise<void> {
     const layout = containerLayout(this.config);
     await this.runtime.createContainer({
       name: container,
       image,
       network,
-      user: this.config.platform === 'windows' ? layout.administratorUser : this.config.worker_user,
+      user: layout.administratorUser,
+      capabilities: ['CHOWN'],
       labels,
       mounts: [`type=volume,src=${volume},dst=${layout.codexHome}`],
       command: layout.keepAliveCommand,
@@ -901,19 +1268,42 @@ export class ContainerAgentManager {
         container,
         joinContainerPath(this.config.platform, layout.codexHome, 'config.toml'),
       );
+      if (modelCatalogSource) {
+        await this.runtime.copyToContainer(
+          modelCatalogSource,
+          container,
+          joinContainerPath(this.config.platform, layout.codexHome, 'model-catalog.json'),
+        );
+      }
+      if (writable) {
+        const proxySidecarSource = fileURLToPath(new URL('../container/proxy-sidecar.mjs', import.meta.url));
+        if (existsSync(proxySidecarSource)) {
+          await this.runtime.copyToContainer(
+            proxySidecarSource,
+            container,
+            joinContainerPath(this.config.platform, layout.codexHome, 'proxy-sidecar.mjs'),
+          );
+        }
+      }
       if (this.config.platform === 'windows') {
         await this.runtime.execContainer(
           container,
           ['icacls.exe', layout.codexHome, '/grant:r', `*S-1-5-93-2-2:(OI)(CI)${writable ? 'M' : 'RX'}`, '/T', '/C'],
-          { user: layout.administratorUser },
+          { user: layout.administratorUser, workdir: layout.safeAdminWorkdir },
         );
         if (writable) {
           const tmpDir = joinContainerPath(this.config.platform, layout.codexHome, 'tmp');
           const arg0File = joinContainerPath(this.config.platform, layout.codexHome, 'tmp', 'arg0');
+          const configToml = joinContainerPath(this.config.platform, layout.codexHome, 'config.toml');
+          const modelCatalogJson = joinContainerPath(this.config.platform, layout.codexHome, 'model-catalog.json');
+          const catalogLock = modelCatalogSource
+            ? `Set-ItemProperty -Path "${modelCatalogJson}" -Name IsReadOnly -Value $true -ErrorAction SilentlyContinue; ` +
+              `icacls.exe "${modelCatalogJson}" /deny "*S-1-5-93-2-2:(D,WDAC,WO,WD,AD)" | Out-Null; `
+            : '';
           await this.runtime.execContainer(
             container,
             [
-              'powershell.exe',
+              layout.powershellExecutable,
               '-NoLogo',
               '-NoProfile',
               '-NonInteractive',
@@ -923,10 +1313,30 @@ export class ContainerAgentManager {
                 `New-Item -ItemType File -Force "${arg0File}" | Out-Null; ` +
                 `Set-ItemProperty -Path "${arg0File}" -Name IsReadOnly -Value $true; ` +
                 `icacls.exe "${tmpDir}" /deny "*S-1-5-93-2-2:(DC)" | Out-Null; ` +
-                `icacls.exe "${arg0File}" /deny "*S-1-5-93-2-2:(D,WDAC,WO)" | Out-Null`,
+                `icacls.exe "${arg0File}" /deny "*S-1-5-93-2-2:(D,WDAC,WO)" | Out-Null; ` +
+                catalogLock +
+                `Set-ItemProperty -Path "${configToml}" -Name IsReadOnly -Value $true -ErrorAction SilentlyContinue; ` +
+                `icacls.exe "${configToml}" /deny "*S-1-5-93-2-2:(D,WDAC,WO,WD,AD)" | Out-Null`,
             ],
-            { user: layout.administratorUser },
+            { user: layout.administratorUser, workdir: layout.safeAdminWorkdir },
           );
+        }
+      } else {
+        const configToml = joinContainerPath(this.config.platform, layout.codexHome, 'config.toml');
+        const modelCatalog = joinContainerPath(this.config.platform, layout.codexHome, 'model-catalog.json');
+        await this.runtime.execContainer(container, ['chown', '-R', this.config.worker_user, layout.codexHome], {
+          user: layout.administratorUser,
+          workdir: layout.safeAdminWorkdir,
+        });
+        await this.runtime.execContainer(container, ['chmod', writable ? '0644' : '0444', configToml], {
+          user: this.config.worker_user,
+          workdir: layout.safeAdminWorkdir,
+        });
+        if (modelCatalogSource) {
+          await this.runtime.execContainer(container, ['chmod', writable ? '0644' : '0444', modelCatalog], {
+            user: this.config.worker_user,
+            workdir: layout.safeAdminWorkdir,
+          });
         }
       }
     } finally {
@@ -966,6 +1376,7 @@ export class ContainerAgentManager {
           `${layout.dependencyRoot}/pip-cache`,
           `${layout.dependencyRoot}/npm-cache`,
           `${layout.dependencyRoot}/yarn-cache`,
+          `${layout.dependencyRoot}/pnpm-store`,
         ),
         {
           user: layout.administratorUser,
@@ -1032,6 +1443,7 @@ export class ContainerAgentManager {
     workerConfigPath: string,
     proxyConfigPath: string,
     labels: Record<string, string>,
+    modelCatalogPath?: string,
   ): Promise<void> {
     const layout = containerLayout(this.config);
     const proxyCodexHome = 'C:/local-engineer-proxy-codex-home';
@@ -1045,6 +1457,15 @@ export class ContainerAgentManager {
     const agentState = join(this.stateDir, 'container-agents', resources.agentId);
     const permittedWorkspacesRoot = join(agentState, 'workspaces');
     const aclTargets: string[] = [];
+
+    if (resources.privateInstallTargets) {
+      let depIndex = 0;
+      for (const target of resources.privateInstallTargets) {
+        const setupDepPath = `C:/setup-dep-volumes/dep-${depIndex++}`;
+        mounts.push(`type=volume,src=${target.volume},dst=${setupDepPath}`);
+        aclTargets.push(setupDepPath);
+      }
+    }
 
     if (resources.windowsRepositoryMounts) {
       let index = 0;
@@ -1084,11 +1505,26 @@ export class ContainerAgentManager {
         container,
         joinContainerPath(this.config.platform, layout.codexHome, 'config.toml'),
       );
+      if (modelCatalogPath) {
+        await this.runtime.copyToContainer(
+          modelCatalogPath,
+          container,
+          joinContainerPath(this.config.platform, layout.codexHome, 'model-catalog.json'),
+        );
+      }
       await this.runtime.copyToContainer(
         proxyConfigPath,
         container,
         joinContainerPath(this.config.platform, proxyCodexHome, 'config.toml'),
       );
+      const proxySidecarSource = fileURLToPath(new URL('../container/proxy-sidecar.mjs', import.meta.url));
+      if (existsSync(proxySidecarSource)) {
+        await this.runtime.copyToContainer(
+          proxySidecarSource,
+          container,
+          joinContainerPath(this.config.platform, proxyCodexHome, 'proxy-sidecar.mjs'),
+        );
+      }
 
       await this.runtime.execContainer(
         container,
@@ -1096,6 +1532,7 @@ export class ContainerAgentManager {
           `${layout.dependencyRoot}/pip-cache`,
           `${layout.dependencyRoot}/npm-cache`,
           `${layout.dependencyRoot}/yarn-cache`,
+          `${layout.dependencyRoot}/pnpm-store`,
         ),
         { user: layout.administratorUser, workdir: layout.safeAdminWorkdir },
       );
@@ -1131,6 +1568,12 @@ export class ContainerAgentManager {
 
       const tmpDir = joinContainerPath(this.config.platform, layout.codexHome, 'tmp');
       const arg0File = joinContainerPath(this.config.platform, layout.codexHome, 'tmp', 'arg0');
+      const configToml = joinContainerPath(this.config.platform, layout.codexHome, 'config.toml');
+      const modelCatalog = joinContainerPath(this.config.platform, layout.codexHome, 'model-catalog.json');
+      const catalogLock = modelCatalogPath
+        ? `Set-ItemProperty -Path "${modelCatalog}" -Name IsReadOnly -Value $true -ErrorAction SilentlyContinue; ` +
+          `icacls.exe "${modelCatalog}" /deny "*S-1-5-93-2-2:(D,WDAC,WO,WD,AD)" | Out-Null; `
+        : '';
       await this.runtime.execContainer(
         container,
         [
@@ -1144,7 +1587,12 @@ export class ContainerAgentManager {
             `New-Item -ItemType File -Force "${arg0File}" | Out-Null; ` +
             `Set-ItemProperty -Path "${arg0File}" -Name IsReadOnly -Value $true; ` +
             `icacls.exe "${tmpDir}" /deny "*S-1-5-93-2-2:(DC)" | Out-Null; ` +
-            `icacls.exe "${arg0File}" /deny "*S-1-5-93-2-2:(D,WDAC,WO)" | Out-Null`,
+            `icacls.exe "${arg0File}" /deny "*S-1-5-93-2-2:(D,WDAC,WO)" | Out-Null; ` +
+            `Set-ItemProperty -Path "${layout.fileToolsServer}" -Name IsReadOnly -Value $true -ErrorAction SilentlyContinue; ` +
+            `icacls.exe "${layout.fileToolsServer}" /deny "*S-1-5-93-2-2:(D,WDAC,WO,WD,AD)" | Out-Null; ` +
+            catalogLock +
+            `Set-ItemProperty -Path "${configToml}" -Name IsReadOnly -Value $true -ErrorAction SilentlyContinue; ` +
+            `icacls.exe "${configToml}" /deny "*S-1-5-93-2-2:(D,WDAC,WO,WD,AD)" | Out-Null`,
         ],
         { user: layout.administratorUser, workdir: layout.safeAdminWorkdir },
       );
@@ -1174,14 +1622,20 @@ export class ContainerAgentManager {
       user: layout.administratorUser,
       capabilities: ['CHOWN'],
       labels,
-      mounts:
-        this.config.platform === 'windows'
+      mounts: [
+        ...(this.config.platform === 'windows'
           ? [...resources.repositories.values()].map((repository) => {
               const volume = resources.repositoryVolumes.get(repository.runRepository.name);
               if (!volume) throw new Error('CONTAINER_REPOSITORY_VOLUME_MISSING');
               return `type=volume,src=${volume},dst=${repository.runRepository.containerPath}`;
             })
-          : [`type=volume,src=${resources.workspaceVolume},dst=${this.config.workspace_path}`],
+          : [`type=volume,src=${resources.workspaceVolume},dst=${this.config.workspace_path}`]),
+        ...(resources.dependencyMode === 'private-install' && resources.privateInstallTargets
+          ? resources.privateInstallTargets.map(
+              (target) => `type=volume,src=${target.volume},dst=${target.containerPath}`,
+            )
+          : []),
+      ],
       command: layout.keepAliveCommand,
     });
     try {
@@ -1252,7 +1706,7 @@ export class ContainerAgentManager {
                 '--eval',
                 "const fs=require('node:fs');fs.appendFileSync(process.argv[1],process.argv.slice(2).join('\\n')+'\\n')",
                 posix.join(privateGitDirectory, 'info', 'exclude'),
-                ...MANAGED_DEPENDENCY_PATHS.map((path) => `/${path}/`),
+                ...MANAGED_DEPENDENCY_EXCLUDE_PATTERNS,
               ]
             : [
                 'sh',
@@ -1260,7 +1714,7 @@ export class ContainerAgentManager {
                 'target=$1; shift; printf "%s\\n" "$@" >> "$target"',
                 'local-engineer-private-exclude',
                 posix.join(privateGitDirectory, 'info', 'exclude'),
-                ...MANAGED_DEPENDENCY_PATHS.map((path) => `/${path}/`),
+                ...MANAGED_DEPENDENCY_EXCLUDE_PATTERNS,
               ],
           { user: layout.administratorUser },
         );
@@ -1331,14 +1785,48 @@ export class ContainerAgentManager {
           });
         }
       }
+      if (resources.dependencyMode === 'private-install' && resources.privateInstallTargets) {
+        for (const target of resources.privateInstallTargets) {
+          if (this.config.platform !== 'windows') {
+            await this.runtime.execContainer(
+              container,
+              ['chown', '-R', this.config.worker_user, target.containerPath],
+              { user: layout.administratorUser },
+            );
+            await this.runtime.execContainer(container, ['chmod', '-R', 'u+rwX', target.containerPath], {
+              user: this.config.worker_user,
+            });
+          } else {
+            await this.runtime.execContainer(
+              container,
+              [
+                layout.powershellExecutable,
+                '-NoLogo',
+                '-NoProfile',
+                '-NonInteractive',
+                '-Command',
+                `& icacls '${target.containerPath}' /grant "*S-1-5-87-*:M" /t /c /q`,
+              ],
+              { user: layout.administratorUser, workdir: layout.safeAdminWorkdir },
+            );
+          }
+        }
+      }
     } finally {
       await this.runtime.removeContainer(container, true).catch(() => undefined);
     }
   }
 
   private workerRepositoryMounts(resources: ContainerAgentResources): string[] {
-    if (this.config.platform !== 'windows')
-      return [`type=volume,src=${resources.workspaceVolume},dst=${this.config.workspace_path}`];
+    if (this.config.platform !== 'windows') {
+      const mounts = [`type=volume,src=${resources.workspaceVolume},dst=${this.config.workspace_path}`];
+      if (resources.dependencyMode === 'private-install' && resources.privateInstallTargets) {
+        for (const target of resources.privateInstallTargets) {
+          mounts.push(`type=volume,src=${target.volume},dst=${target.containerPath}`);
+        }
+      }
+      return mounts;
+    }
 
     if (resources.windowsWorkspaceMode === 'isolated-bind' || resources.windowsRepositoryMounts !== undefined) {
       const mounts: string[] = [];
@@ -1360,31 +1848,51 @@ export class ContainerAgentManager {
           }),
         );
 
-        // 2. Nested dependency mounts, sorted by target path depth (length) ascending
-        const depMounts = (repoMount?.dependencyMounts ?? repository.dependencyMounts ?? [])
-          .slice()
-          .sort((a, b) => a.containerPath.length - b.containerPath.length);
-        for (const dep of depMounts) {
-          mounts.push(
-            this.runtime.buildBindMount({
-              source: dep.hostPath,
-              target: dep.containerPath,
-              readOnly: true,
-              permittedSourceRoots: [repository.runRepository.parentPath],
-            }),
+        if (resources.dependencyMode === 'private-install' && repository.runRepository.access !== 'read-only') {
+          // Mount the agent-owned private install volumes for this writable repository
+          const targets = (resources.privateInstallTargets ?? []).filter(
+            (t) => t.repository === repository.runRepository.name,
           );
+          for (const target of targets) {
+            mounts.push(`type=volume,src=${target.volume},dst=${target.containerPath}`);
+          }
+        } else {
+          // 2. Nested dependency mounts, sorted by target path depth (length) ascending
+          const depMounts = (repoMount?.dependencyMounts ?? repository.dependencyMounts ?? [])
+            .slice()
+            .sort((a, b) => a.containerPath.length - b.containerPath.length);
+          for (const dep of depMounts) {
+            mounts.push(
+              this.runtime.buildBindMount({
+                source: dep.hostPath,
+                target: dep.containerPath,
+                readOnly: true,
+                permittedSourceRoots: [repository.runRepository.parentPath],
+              }),
+            );
+          }
         }
       }
       return mounts;
     }
 
-    return [...resources.repositories.values()].map((repository) => {
+    const mounts = [...resources.repositories.values()].map((repository) => {
       const volume = resources.repositoryVolumes.get(repository.runRepository.name);
       if (!volume) throw new Error('CONTAINER_REPOSITORY_VOLUME_MISSING');
       return `type=volume,src=${volume},dst=${repository.runRepository.containerPath}${
         repository.runRepository.access === 'read-only' ? ',readonly' : ''
       }`;
     });
+    if (resources.dependencyMode === 'private-install' && resources.privateInstallTargets) {
+      for (const repository of resources.repositories.values()) {
+        if (repository.runRepository.access === 'read-only') continue;
+        const targets = resources.privateInstallTargets.filter((t) => t.repository === repository.runRepository.name);
+        for (const target of targets) {
+          mounts.push(`type=volume,src=${target.volume},dst=${target.containerPath}`);
+        }
+      }
+    }
+    return mounts;
   }
 
   private async assertWindowsRepositoryMounts(resources: ContainerAgentResources): Promise<void> {
@@ -1415,27 +1923,56 @@ export class ContainerAgentManager {
       }
 
       if (isIsolatedBind) {
-        const depMounts = repository.dependencyMounts ?? [];
-        for (const dep of depMounts) {
-          const depProbe = joinContainerPath(
-            'windows',
-            dep.containerPath,
-            `.probe-${createHash('sha256')
-              .update(`${resources.agentId}\0${dep.relativePath}`)
-              .digest('hex')
-              .slice(0, 16)}`,
+        if (resources.dependencyMode === 'private-install' && repository.runRepository.access !== 'read-only') {
+          const targets = (resources.privateInstallTargets ?? []).filter(
+            (t) => t.repository === repository.runRepository.name,
           );
-          const result = await this.runtime.execContainer(
-            resources.workerContainer,
-            [
-              'node',
-              '--eval',
-              "const fs=require('node:fs');const p=process.argv[1];if(fs.existsSync(p)){process.stdout.write('COLLISION')}else{try{fs.writeFileSync(p,'x');fs.unlinkSync(p);process.stdout.write('WRITABLE')}catch(e){if(e&&['EACCES','EPERM','EROFS'].includes(e.code))process.stdout.write('LOCKED');else throw e}}",
-              depProbe,
-            ],
-            { user: this.config.worker_user },
-          );
-          if (result.stdout.trim() !== 'LOCKED') throw new Error('CONTAINER_DEPENDENCY_READ_ONLY_FAILED');
+          for (const target of targets) {
+            const probePath = joinContainerPath(
+              'windows',
+              target.containerPath,
+              `.probe-${createHash('sha256')
+                .update(`${resources.agentId}\0${target.relativePath}`)
+                .digest('hex')
+                .slice(0, 16)}`,
+            );
+            const result = await this.runtime.execContainer(
+              resources.workerContainer,
+              [
+                'node',
+                '--eval',
+                "/* private-install-target */ const fs=require('node:fs');const p=process.argv[1];if(fs.existsSync(p)){process.stdout.write('COLLISION')}else{try{fs.writeFileSync(p,'x');fs.unlinkSync(p);process.stdout.write('WRITABLE')}catch(e){if(e&&['EACCES','EPERM','EROFS'].includes(e.code))process.stdout.write('LOCKED');else throw e}}",
+                probePath,
+              ],
+              { user: this.config.worker_user },
+            );
+            if (result.stdout.trim() !== 'WRITABLE') {
+              throw new Error(`CONTAINER_PRIVATE_INSTALL_TARGET_NOT_WRITABLE:${target.containerPath}:${result.stdout}`);
+            }
+          }
+        } else {
+          const depMounts = repository.dependencyMounts ?? [];
+          for (const dep of depMounts) {
+            const depProbe = joinContainerPath(
+              'windows',
+              dep.containerPath,
+              `.probe-${createHash('sha256')
+                .update(`${resources.agentId}\0${dep.relativePath}`)
+                .digest('hex')
+                .slice(0, 16)}`,
+            );
+            const result = await this.runtime.execContainer(
+              resources.workerContainer,
+              [
+                'node',
+                '--eval',
+                "const fs=require('node:fs');const p=process.argv[1];if(fs.existsSync(p)){process.stdout.write('COLLISION')}else{try{fs.writeFileSync(p,'x');fs.unlinkSync(p);process.stdout.write('WRITABLE')}catch(e){if(e&&['EACCES','EPERM','EROFS'].includes(e.code))process.stdout.write('LOCKED');else throw e}}",
+                depProbe,
+              ],
+              { user: this.config.worker_user },
+            );
+            if (result.stdout.trim() !== 'LOCKED') throw new Error('CONTAINER_DEPENDENCY_READ_ONLY_FAILED');
+          }
         }
       }
     }
@@ -1473,6 +2010,14 @@ export class ContainerAgentManager {
     if (resources.egressNetwork !== 'nat' || !resources.proxyAddress)
       throw new Error('CONTAINER_WINDOWS_PROXY_NETWORK_INPUT_INVALID');
     const layout = containerLayout(this.config);
+    const proxyScript = fileURLToPath(new URL('../container/configure-proxy-network.ps1', import.meta.url));
+    if (existsSync(proxyScript)) {
+      await this.runtime.copyToContainer(
+        proxyScript,
+        resources.proxyContainer,
+        'C:/local-engineer/configure-proxy-network.ps1',
+      );
+    }
     const internal = await this.runtime.containerNetworkEndpoint(resources.proxyContainer, resources.internalNetwork);
     const egress = await this.runtime.containerNetworkEndpoint(resources.proxyContainer, 'nat');
     if (internal.address !== resources.proxyAddress) throw new Error('CONTAINER_PROXY_ADDRESS_CHANGED');
@@ -1633,16 +2178,10 @@ export class ContainerAgentManager {
             for (const entry of statusEntries) {
               const path = entry.slice(3);
               if (!path) continue;
-              const normalized = path.replace(/\\/g, '/');
-              const firstSegment = normalized.split('/')[0];
-              if (
-                !firstSegment ||
-                firstSegment === 'node_modules' ||
-                (MANAGED_DEPENDENCY_PATHS as readonly string[]).includes(firstSegment)
-              ) {
-                continue;
+              if (isManagedDependencyPath(path, this.config.platform)) {
+                throw new Error(`CONTAINER_PATCH_INVALID:managed_dependency_path_not_permitted:${path}`);
               }
-              validateRelativePath(path);
+              validateRelativePath(path, this.config.platform);
 
               const fullPath = join(workingClonePath, path);
               if (existsSync(fullPath)) {
@@ -1723,7 +2262,8 @@ export class ContainerAgentManager {
 
             const changes = changesFromOutput(patch, names, numstat);
             if (changes.changedPaths.length > 1000) throw new Error('CONTAINER_TOO_MANY_CHANGED_PATHS');
-            for (const path of changes.changedPaths) validateRelativePath(path);
+            assertNoManagedDependencyPaths(changes.changedPaths, this.config.platform);
+            for (const path of changes.changedPaths) validateRelativePath(path, this.config.platform);
 
             if (isDependencyManifestChanged(changes.changedPaths)) {
               revision.dependencyManifestStale = true;
@@ -1786,7 +2326,8 @@ export class ContainerAgentManager {
             );
 
             const deltaChanges = changesFromOutput(deltaPatch, deltaNames, deltaNumstat);
-            for (const path of deltaChanges.changedPaths) validateRelativePath(path);
+            assertNoManagedDependencyPaths(deltaChanges.changedPaths, this.config.platform);
+            for (const path of deltaChanges.changedPaths) validateRelativePath(path, this.config.platform);
 
             revision.changes = changes;
             revision.patchPath = join(
@@ -1932,7 +2473,8 @@ export class ContainerAgentManager {
         ).stdout;
         const changes = changesFromOutput(patch, names, numstat);
         if (changes.changedPaths.length > 1000) throw new Error('CONTAINER_TOO_MANY_CHANGED_PATHS');
-        for (const path of changes.changedPaths) validateRelativePath(path);
+        assertNoManagedDependencyPaths(changes.changedPaths, this.config.platform);
+        for (const path of changes.changedPaths) validateRelativePath(path, this.config.platform);
         const previousCommit = revision.reviewCommits.get(previousRevision);
         if (!previousCommit) throw new Error('CONTAINER_REVIEW_COMMIT_NOT_FOUND');
         const deltaPatch = (
@@ -1974,7 +2516,8 @@ export class ContainerAgentManager {
           ])
         ).stdout;
         const deltaChanges = changesFromOutput(deltaPatch, deltaNames, deltaNumstat);
-        for (const path of deltaChanges.changedPaths) validateRelativePath(path);
+        assertNoManagedDependencyPaths(deltaChanges.changedPaths, this.config.platform);
+        for (const path of deltaChanges.changedPaths) validateRelativePath(path, this.config.platform);
         revision.changes = changes;
         revision.patchPath = join(
           this.stateDir,
@@ -2151,7 +2694,7 @@ export class ContainerAgentManager {
   }
 
   async getFile(agentId: string, repository: string, path: string, maximumBytes: number): Promise<string> {
-    validateRelativePath(path);
+    validateRelativePath(path, this.config.platform);
     const resources = this.require(agentId);
     const revision = resources.repositories.get(repository);
     if (!revision) throw new Error('CONTAINER_REPOSITORY_NOT_FOUND');
@@ -2262,7 +2805,10 @@ export class ContainerAgentManager {
     }
     const locks = this.acquirePromotionLocks(changed);
     try {
-      for (const revision of changed) await checkRepositoryPromotion(revision.snapshot, revision.changes!);
+      for (const revision of changed) {
+        assertNoManagedDependencyPaths(revision.changes!.changedPaths, this.config.platform);
+        await checkRepositoryPromotion(revision.snapshot, revision.changes!);
+      }
       const applied: RepositoryRevision[] = [];
       const reversePatchFn = this.#promotionHooks?.reversePatch ?? reversePatch;
       try {
@@ -2334,6 +2880,7 @@ export class ContainerAgentManager {
         dependencyVolume: `${prefix}-dependencies`,
         repositories: new Map(),
         revision: 0,
+        dependencyMode: 'read-only',
       } satisfies ContainerAgentResources);
     await this.cleanupResources(resources);
     this.agents.delete(agentId);
@@ -2380,6 +2927,12 @@ export class ContainerAgentManager {
       await this.runtime.removeVolume(resources.proxySharedVolume).catch(() => undefined);
     if (await this.runtime.hasOwnershipLabels('volume', resources.dependencyVolume, labels))
       await this.runtime.removeVolume(resources.dependencyVolume).catch(() => undefined);
+    if (resources.privateInstallTargets) {
+      for (const target of resources.privateInstallTargets) {
+        if (await this.runtime.hasOwnershipLabels('volume', target.volume, labels))
+          await this.runtime.removeVolume(target.volume).catch(() => undefined);
+      }
+    }
     for (const volume of await this.runtime.listVolumesByLabels(labels).catch(() => []))
       await this.runtime.removeVolume(volume).catch(() => undefined);
   }
@@ -2451,7 +3004,7 @@ function changesFromOutput(patch: string, names: string, numstat: string): Repos
   };
 }
 
-function validateRelativePath(path: string): void {
+function validateRelativePath(path: string, platform?: 'windows' | 'linux'): void {
   if (
     !path ||
     /[\0\r\n]/.test(path) ||
@@ -2463,6 +3016,8 @@ function validateRelativePath(path: string): void {
     path.split(/[\\/]+/)[0]?.toLowerCase() === '.git'
   )
     throw new Error('CONTAINER_FILE_PATH_INVALID');
+  if (isManagedDependencyPath(path, platform))
+    throw new Error(`CONTAINER_PATCH_INVALID:managed_dependency_path_not_permitted:${path}`);
 }
 
 async function reversePatch(parentPath: string, patch: string): Promise<void> {
@@ -2537,6 +3092,9 @@ export function assertNoReparsePoints(rootDir: string, currentDir = rootDir): vo
     }
     if (stat.isSymbolicLink()) {
       throw new Error(`CONTAINER_PATCH_INVALID:reparse_point_detected:${relPath}`);
+    }
+    if (/^\..*?local-engineer-(?:backup|temp)-.*\.(?:bak|tmp)$/.test(entry.name)) {
+      throw new Error(`CONTAINER_PATCH_INVALID:recovery_artifact_present:${relPath}`);
     }
     if (entry.isDirectory() && entry.name !== '.git') {
       assertNoReparsePoints(rootDir, fullPath);

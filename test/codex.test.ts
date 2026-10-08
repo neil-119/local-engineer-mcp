@@ -227,4 +227,28 @@ describe('container Codex app-server bridge', () => {
     await expect(request).rejects.toThrow('CODEX_APP_SERVER_ERROR:spawn EACCES');
     await expect(waitingTurn).rejects.toThrow('CODEX_APP_SERVER_ERROR:spawn EACCES');
   });
+
+  it('sends turn/steer with expectedTurnId and text input', async () => {
+    const { adapter, writes } = writableAdapter();
+    const steerPromise = adapter.steer('thread-42', 'turn-99', 'Stop exploring, read deploy.yaml');
+    const writeMsg = JSON.parse(writes[0]!);
+    expect(writeMsg).toMatchObject({
+      jsonrpc: '2.0',
+      method: 'turn/steer',
+      params: {
+        threadId: 'thread-42',
+        expectedTurnId: 'turn-99',
+        input: [{ type: 'text', text: 'Stop exploring, read deploy.yaml', text_elements: [] }],
+      },
+    });
+
+    (adapter as unknown as { receive: (message: Record<string, unknown>) => void }).receive({
+      jsonrpc: '2.0',
+      id: writeMsg.id,
+      result: { turnId: 'turn-99' },
+    });
+
+    const result = await steerPromise;
+    expect(result).toBe('turn-99');
+  });
 });

@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs, {
   existsSync,
   mkdirSync,
@@ -13,6 +14,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { assertNoReparsePoints, ContainerAgentManager, type ContainerAgentResources } from '../src/container-agent.js';
 import { ContainerRuntime, type RuntimeCommandExecutor } from '../src/container-runtime.js';
+import { privateInstallVolumeName } from '../src/dependency-mount.js';
 import type { ContainerConfig, RunRepository, Worker } from '../src/domain.js';
 import * as repoSnapshot from '../src/repository-snapshot.js';
 
@@ -43,6 +45,8 @@ describe('container agent workspace seeding', () => {
 
     expect(appServer.args).toContain('model_providers.local-provider.base_url="http://local-engineer-proxy:8090/v1"');
     expect(appServer.args.slice(0, 3)).toEqual(['--context', 'default', 'exec']);
+    expect(appServer.args).toContain('--strict-config');
+    expect(appServer.args.indexOf('--strict-config')).toBeLessThan(appServer.args.indexOf('app-server'));
   });
 
   it('uses the fully qualified native Codex executable for Windows workers', () => {
@@ -68,6 +72,8 @@ describe('container agent workspace seeding', () => {
       'C:/npm/node_modules/@openai/codex/node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe',
     );
     expect(appServer.args).not.toContain('codex');
+    expect(appServer.args).toContain('--strict-config');
+    expect(appServer.args.indexOf('--strict-config')).toBeLessThan(appServer.args.indexOf('app-server'));
   });
 
   it('copies the immutable Git baseline, overlays ignored dependencies, and locks read-only repositories', async () => {
@@ -206,6 +212,306 @@ describe('container agent workspace seeding', () => {
     expect(removeWriteBits).toBeGreaterThan(assignRootOwnership);
     expect(configureSafeDirectory).toBeGreaterThan(removeWriteBits);
     expect(inspectReadOnlyAsOwner).toBeGreaterThan(configureSafeDirectory);
+  });
+
+  it('explicitly establishes safe ownership and read permissions for config.toml and model-catalog.json during Linux setup', async () => {
+    const root = mkdtempSync(join(testTemporaryDirectory(), 'container-agent-linux-seed-'));
+    temporaryRoots.push(root);
+    const parent = join(root, 'parent');
+    mkdirSync(parent);
+    git(parent, ['init']);
+    git(parent, ['config', 'user.name', 'Test']);
+    git(parent, ['config', 'user.email', 'test@example.invalid']);
+    writeFileSync(join(parent, 'source.ts'), 'export const value = 1;\n');
+    git(parent, ['add', 'source.ts']);
+    git(parent, ['commit', '-m', 'initial']);
+
+    const catalogPath = join(root, 'models.json');
+    writeFileSync(
+      catalogPath,
+      JSON.stringify({
+        models: [
+          {
+            slug: 'local-model',
+            capabilities: { function_calling: true },
+          },
+        ],
+      }),
+      'utf8',
+    );
+
+    const calls: string[][] = [];
+    const execute: RuntimeCommandExecutor = async (_executable, arguments_) => {
+      calls.push([...arguments_]);
+      return { exitCode: 0, stdout: '', stderr: '' };
+    };
+    const config = containerConfig();
+    const runtime = new ContainerRuntime('docker', execute);
+    const manager = new ContainerAgentManager(config, join(root, 'state'), runtime);
+
+    const workerWithCatalog: Worker = {
+      ...worker(),
+      model_catalog_json_file: catalogPath,
+    };
+
+    const resources = await manager.prepare('agt_linux_catalog', workerWithCatalog, [
+      {
+        name: 'application',
+        parentPath: parent,
+        containerPath: '/workspace/application',
+        access: 'read-write',
+      },
+    ]);
+
+    // Setup container worker-config-seed should be created with user: '0' (administratorUser) and CHOWN capability
+    const configSeedCreate = calls.find(
+      (args) => args.includes('create') && args.some((a) => a.includes('worker-config-seed')),
+    );
+    expect(configSeedCreate).toBeDefined();
+    expect(configSeedCreate).toContain('--user');
+    expect(configSeedCreate).toContain('0');
+    expect(configSeedCreate).toContain('CHOWN');
+
+    // config.toml and model-catalog.json copied into container
+    const configCopy = calls.find((args) => args[0] === 'cp' && args[2]?.endsWith(':/home/codex/.codex/config.toml'));
+    expect(configCopy).toBeDefined();
+
+    const catalogCopy = calls.find(
+      (args) => args[0] === 'cp' && args[2]?.endsWith(':/home/codex/.codex/model-catalog.json'),
+    );
+    expect(catalogCopy).toBeDefined();
+
+    // Verify chown and chmod were executed
+    const chownCodexHome = calls.find(
+      (args) =>
+        args.includes('chown') && args.includes('-R') && args.includes('codex') && args.includes('/home/codex/.codex'),
+    );
+    expect(chownCodexHome).toBeDefined();
+    expect(chownCodexHome).toContain('--user');
+    expect(chownCodexHome).toContain('0');
+    expect(chownCodexHome).toContain('--workdir');
+    expect(chownCodexHome).toContain('/');
+
+    const chmodConfig = calls.find(
+      (args) => args.includes('chmod') && args.includes('0644') && args.includes('/home/codex/.codex/config.toml'),
+    );
+    expect(chmodConfig).toBeDefined();
+    expect(chmodConfig).toContain('--workdir');
+    expect(chmodConfig).toContain('/');
+
+    const chmodCatalog = calls.find(
+      (args) =>
+        args.includes('chmod') && args.includes('0644') && args.includes('/home/codex/.codex/model-catalog.json'),
+    );
+    expect(chmodCatalog).toBeDefined();
+    expect(chmodCatalog).toContain('--workdir');
+    expect(chmodCatalog).toContain('/');
+
+    // Worker container must run as non-root codex
+    const workerCreate = calls.find((args) => args.includes(resources.workerContainer) && args.includes('create'));
+    expect(workerCreate).toBeDefined();
+    expect(workerCreate).toContain('--user');
+    expect(workerCreate).toContain('codex');
+  });
+
+  it('locks down model-catalog.json alongside config.toml in Windows volume-copy setup', async () => {
+    const root = mkdtempSync(join(testTemporaryDirectory(), 'container-agent-win-vol-'));
+    temporaryRoots.push(root);
+    const parent = join(root, 'parent');
+    mkdirSync(parent);
+    git(parent, ['init']);
+    git(parent, ['config', 'user.name', 'Test']);
+    git(parent, ['config', 'user.email', 'test@example.invalid']);
+    writeFileSync(join(parent, 'source.ts'), 'export const value = 1;\n');
+    git(parent, ['add', 'source.ts']);
+    git(parent, ['commit', '-m', 'initial']);
+
+    const catalogPath = join(root, 'models.json');
+    writeFileSync(
+      catalogPath,
+      JSON.stringify({
+        models: [
+          {
+            slug: 'local-model',
+            capabilities: { function_calling: true },
+          },
+        ],
+      }),
+      'utf8',
+    );
+
+    const calls: string[][] = [];
+    const execute: RuntimeCommandExecutor = async (_executable, arguments_) => {
+      const args = [...arguments_];
+      calls.push(args);
+      if (args.includes('{{.HostConfig.Isolation}}')) return { exitCode: 0, stdout: 'hyperv\n', stderr: '' };
+      if (args.includes('{{json .NetworkSettings.Networks}}')) {
+        const proxy = args.at(-1)!;
+        const addressCall = calls.find(
+          (call) => call.includes('connect') && call.includes('--ip') && call.at(-1) === proxy,
+        );
+        const privateAddress = addressCall?.[addressCall.indexOf('--ip') + 1] ?? '10.240.7.2';
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            nat: { IPAddress: '172.28.32.42', MacAddress: '00:15:5d:00:00:04' },
+            [proxy.replace(
+              /-(?:proxy|worker|proxy-shared-seed|worker-config-seed|dependency-seed|proxy-config-seed|workspace-seed)$/,
+              '-internal',
+            )]: {
+              IPAddress: proxy.endsWith('-proxy') ? privateAddress : '10.240.7.3',
+              MacAddress: proxy.endsWith('-proxy') ? '00:15:5d:00:00:02' : '00:15:5d:00:00:03',
+            },
+          }),
+          stderr: '',
+        };
+      }
+      if (args.some((a) => a.endsWith('/configure-worker-network.ps1')))
+        return { exitCode: 0, stdout: 'LOCAL_ENGINEER_NETWORK_OK\n', stderr: '' };
+      if (args.some((a) => a.endsWith('/configure-proxy-network.ps1')))
+        return { exitCode: 0, stdout: 'LOCAL_ENGINEER_PROXY_NETWORK_OK\n', stderr: '' };
+      if (args.some((a) => a.endsWith('whoami.exe')))
+        return { exitCode: 0, stdout: 'BUILTIN\\Users S-1-5-32-545 Enabled group\n', stderr: '' };
+      return { exitCode: 0, stdout: '', stderr: '' };
+    };
+
+    const config = windowsContainerConfig();
+    const runtime = new ContainerRuntime('docker', execute, config.context, config.platform, {
+      memoryLimit: config.windows_memory_limit!,
+      cpuCount: config.windows_cpu_count!,
+    });
+    const manager = new ContainerAgentManager(config, join(root, 'state'), runtime);
+
+    const workerWithCatalog: Worker = {
+      ...worker(),
+      model_catalog_json_file: catalogPath,
+    };
+
+    await manager.prepare('agt_win_vol_catalog', workerWithCatalog, [
+      {
+        name: 'application',
+        parentPath: parent,
+        containerPath: 'C:/workspace/application',
+        access: 'read-write',
+      },
+    ]);
+
+    const catalogCopy = calls.find((args) => {
+      const cpIndex = args.indexOf('cp');
+      return cpIndex !== -1 && args[cpIndex + 2]?.includes('C:/local-engineer/codex-home/model-catalog.json');
+    });
+    expect(catalogCopy).toBeDefined();
+
+    const lockdownCall = calls.find(
+      (args) =>
+        args.some((a) => a.includes('model-catalog.json')) &&
+        args.some((a) => a.includes('IsReadOnly')) &&
+        args.some((a) => a.includes('icacls.exe')),
+    );
+    expect(lockdownCall).toBeDefined();
+    expect(lockdownCall).toContain('--workdir');
+    expect(lockdownCall).toContain('C:/Windows/System32');
+    expect(lockdownCall).toContain('ContainerAdministrator');
+  });
+
+  it('locks down model-catalog.json in Windows consolidated isolated-bind setup', async () => {
+    const root = mkdtempSync(join(testTemporaryDirectory(), 'container-agent-win-iso-'));
+    temporaryRoots.push(root);
+    const parent = join(root, 'parent');
+    mkdirSync(parent);
+    git(parent, ['init']);
+    git(parent, ['config', 'user.name', 'Test']);
+    git(parent, ['config', 'user.email', 'test@example.invalid']);
+    writeFileSync(join(parent, 'source.ts'), 'export const value = 1;\n');
+    git(parent, ['add', 'source.ts']);
+    git(parent, ['commit', '-m', 'initial']);
+
+    const catalogPath = join(root, 'models.json');
+    writeFileSync(
+      catalogPath,
+      JSON.stringify({
+        models: [
+          {
+            slug: 'local-model',
+            capabilities: { function_calling: true },
+          },
+        ],
+      }),
+      'utf8',
+    );
+
+    const calls: string[][] = [];
+    const execute: RuntimeCommandExecutor = async (_executable, arguments_) => {
+      const args = [...arguments_];
+      calls.push(args);
+      if (args.includes('{{.HostConfig.Isolation}}')) return { exitCode: 0, stdout: 'hyperv\n', stderr: '' };
+      if (args.includes('{{json .NetworkSettings.Networks}}')) {
+        const proxy = args.at(-1)!;
+        const addressCall = calls.find(
+          (call) => call.includes('connect') && call.includes('--ip') && call.at(-1) === proxy,
+        );
+        const privateAddress = addressCall?.[addressCall.indexOf('--ip') + 1] ?? '10.240.7.2';
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            nat: { IPAddress: '172.28.32.42', MacAddress: '00:15:5d:00:00:04' },
+            [proxy.replace(
+              /-(?:proxy|worker|proxy-shared-seed|worker-config-seed|dependency-seed|proxy-config-seed|workspace-seed|consolidated-setup)$/,
+              '-internal',
+            )]: {
+              IPAddress: proxy.endsWith('-proxy') ? privateAddress : '10.240.7.3',
+              MacAddress: proxy.endsWith('-proxy') ? '00:15:5d:00:00:02' : '00:15:5d:00:00:03',
+            },
+          }),
+          stderr: '',
+        };
+      }
+      if (args.some((a) => a.endsWith('/configure-worker-network.ps1')))
+        return { exitCode: 0, stdout: 'LOCAL_ENGINEER_NETWORK_OK\n', stderr: '' };
+      if (args.some((a) => a.endsWith('/configure-proxy-network.ps1')))
+        return { exitCode: 0, stdout: 'LOCAL_ENGINEER_PROXY_NETWORK_OK\n', stderr: '' };
+      if (args.some((a) => a.endsWith('whoami.exe')))
+        return { exitCode: 0, stdout: 'BUILTIN\\Users S-1-5-32-545 Enabled group\n', stderr: '' };
+      return { exitCode: 0, stdout: '', stderr: '' };
+    };
+
+    const config = windowsIsolatedBindConfig();
+    const runtime = new ContainerRuntime('docker', execute, config.context, config.platform, {
+      memoryLimit: config.windows_memory_limit!,
+      cpuCount: config.windows_cpu_count!,
+    });
+    const manager = new ContainerAgentManager(config, join(root, 'state'), runtime);
+
+    const workerWithCatalog: Worker = {
+      ...worker(),
+      model_catalog_json_file: catalogPath,
+    };
+
+    await manager.prepare('agt_win_iso_catalog', workerWithCatalog, [
+      {
+        name: 'application',
+        parentPath: parent,
+        containerPath: 'C:/repos/application',
+        access: 'read-write',
+      },
+    ]);
+
+    const catalogCopy = calls.find((args) => {
+      const cpIndex = args.indexOf('cp');
+      return cpIndex !== -1 && args[cpIndex + 2]?.includes('C:/local-engineer/codex-home/model-catalog.json');
+    });
+    expect(catalogCopy).toBeDefined();
+
+    const lockdownCall = calls.find(
+      (args) =>
+        args.some((a) => a.includes('model-catalog.json')) &&
+        args.some((a) => a.includes('IsReadOnly')) &&
+        args.some((a) => a.includes('icacls.exe')),
+    );
+    expect(lockdownCall).toBeDefined();
+    expect(lockdownCall).toContain('--workdir');
+    expect(lockdownCall).toContain('C:/Windows/System32');
+    expect(lockdownCall).toContain('ContainerAdministrator');
   });
 
   it('allows deletion to be retried after setup already cleaned the agent resources', async () => {
@@ -653,8 +959,15 @@ describe('container agent workspace seeding', () => {
 
 describe('Windows isolated-bind workspace mode', () => {
   const temporaryRoots: string[] = [];
+  const mockResourceLabels = new Map<string, Record<string, string>>();
+  const mockContainerMounts = new Map<
+    string,
+    Array<{ Type: string; Name?: string; Source: string; Destination: string; RW: boolean }>
+  >();
 
   afterEach(() => {
+    mockResourceLabels.clear();
+    mockContainerMounts.clear();
     for (const path of temporaryRoots.splice(0)) rmSync(path, { recursive: true, force: true });
   });
 
@@ -670,6 +983,175 @@ describe('Windows isolated-bind workspace mode', () => {
       if (args[0] === 'start' || args.includes('start')) {
         const target = args.at(-1);
         if (target) stoppedContainers.delete(target);
+      }
+      if (args[0] === 'create' || args.includes('create')) {
+        let target = args.find((a) => a.startsWith('--name='))?.slice('--name='.length);
+        if (!target) {
+          const nameIdx = args.indexOf('--name');
+          if (nameIdx !== -1 && nameIdx + 1 < args.length) target = args[nameIdx + 1];
+        }
+        if (!target && (args[0] === 'volume' || args[0] === 'network') && args[1] === 'create') {
+          target = args.at(-1);
+        }
+        if (target) {
+          const labels: Record<string, string> = {};
+          for (let i = 0; i < args.length; i++) {
+            const arg = args[i]!;
+            if (arg === '--label' && i + 1 < args.length) {
+              const labelSpec = args[i + 1]!;
+              const eq = labelSpec.indexOf('=');
+              if (eq !== -1) labels[labelSpec.slice(0, eq)] = labelSpec.slice(eq + 1);
+            } else if (arg.startsWith('--label=')) {
+              const labelSpec = arg.slice('--label='.length);
+              const eq = labelSpec.indexOf('=');
+              if (eq !== -1) labels[labelSpec.slice(0, eq)] = labelSpec.slice(eq + 1);
+            }
+          }
+          mockResourceLabels.set(target, labels);
+
+          const mounts: Array<{ Type: string; Name?: string; Source: string; Destination: string; RW: boolean }> = [];
+          for (let i = 0; i < args.length; i++) {
+            const arg = args[i]!;
+            let spec: string | undefined;
+            if (arg === '--mount' && i + 1 < args.length) {
+              spec = args[i + 1];
+            } else if (arg.startsWith('--mount=')) {
+              spec = arg.slice('--mount='.length);
+            }
+            if (spec) {
+              const parts = Object.fromEntries(
+                spec.split(',').map((p) => {
+                  const eq = p.indexOf('=');
+                  return eq === -1 ? [p, 'true'] : [p.slice(0, eq), p.slice(eq + 1)];
+                }),
+              );
+              if (parts.type === 'volume') {
+                mounts.push({
+                  Type: 'volume',
+                  Name: parts.src,
+                  Source: parts.src,
+                  Destination: parts.dst,
+                  RW: parts.readonly !== 'true',
+                });
+              } else if (parts.type === 'bind') {
+                mounts.push({
+                  Type: 'bind',
+                  Source: parts.source || parts.src,
+                  Destination: parts.target || parts.dst,
+                  RW: parts.readonly !== 'true',
+                });
+              }
+            }
+          }
+          if (mounts.length > 0) {
+            mockContainerMounts.set(target, mounts);
+          }
+        }
+      }
+      if (args.includes('{{json .Config.Labels}}') || args.includes('{{json .Labels}}')) {
+        const target = args.at(-1)!;
+        const labels: Record<string, string> = { ...(mockResourceLabels.get(target) ?? {}) };
+        if (Object.keys(labels).length === 0) {
+          const createCall = calls.find(
+            (c) =>
+              (c[0] === 'create' || c.includes('create')) && c.some((a) => a === target || a === `--name=${target}`),
+          );
+          if (createCall) {
+            for (let i = 0; i < createCall.length; i++) {
+              const arg = createCall[i]!;
+              if (arg === '--label' && i + 1 < createCall.length) {
+                const labelSpec = createCall[i + 1]!;
+                const eq = labelSpec.indexOf('=');
+                if (eq !== -1) {
+                  labels[labelSpec.slice(0, eq)] = labelSpec.slice(eq + 1);
+                }
+              } else if (arg.startsWith('--label=')) {
+                const labelSpec = arg.slice('--label='.length);
+                const eq = labelSpec.indexOf('=');
+                if (eq !== -1) {
+                  labels[labelSpec.slice(0, eq)] = labelSpec.slice(eq + 1);
+                }
+              }
+            }
+          }
+        }
+        if (Object.keys(labels).length === 0) {
+          for (const root of temporaryRoots) {
+            const agentsDir = join(root, 'state', 'container-agents');
+            if (existsSync(agentsDir)) {
+              for (const agentId of readdirSync(agentsDir)) {
+                const suffix = createHash('sha256').update(agentId).digest('hex').slice(0, 20);
+                if (target.includes(suffix)) {
+                  labels['local-engineer.agent-id'] = agentId;
+                  labels['local-engineer.managed'] = 'true';
+                  break;
+                }
+              }
+            }
+          }
+        }
+        if (Object.keys(labels).length === 0) {
+          const agentMatch = target.match(/(agt_[a-zA-Z0-9_-]+)/);
+          const agentId = agentMatch ? agentMatch[1] : 'agt_default';
+          labels['local-engineer.agent-id'] = agentId;
+          labels['local-engineer.managed'] = 'true';
+        }
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify(labels),
+          stderr: '',
+        };
+      }
+      if (args.includes('{{json .Mounts}}')) {
+        const target = args.at(-1)!;
+        let mounts = mockContainerMounts.get(target);
+        if (!mounts) {
+          const createCall = calls.find(
+            (c) =>
+              (c[0] === 'create' || c.includes('create')) && c.some((a) => a === target || a === `--name=${target}`),
+          );
+          if (createCall) {
+            mounts = [];
+            for (let i = 0; i < createCall.length; i++) {
+              const arg = createCall[i]!;
+              let spec: string | undefined;
+              if (arg === '--mount' && i + 1 < createCall.length) {
+                spec = createCall[i + 1];
+              } else if (arg.startsWith('--mount=')) {
+                spec = arg.slice('--mount='.length);
+              }
+              if (spec) {
+                const parts = Object.fromEntries(
+                  spec.split(',').map((p) => {
+                    const eq = p.indexOf('=');
+                    return eq === -1 ? [p, 'true'] : [p.slice(0, eq), p.slice(eq + 1)];
+                  }),
+                );
+                if (parts.type === 'volume') {
+                  mounts.push({
+                    Type: 'volume',
+                    Name: parts.src,
+                    Source: parts.src,
+                    Destination: parts.dst,
+                    RW: parts.readonly !== 'true',
+                  });
+                } else if (parts.type === 'bind') {
+                  mounts.push({
+                    Type: 'bind',
+                    Source: parts.source || parts.src,
+                    Destination: parts.target || parts.dst,
+                    RW: parts.readonly !== 'true',
+                  });
+                }
+              }
+            }
+          }
+        }
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify(mounts ?? []),
+          stderr: '',
+        };
       }
       if (args.includes('{{.HostConfig.Isolation}}')) return { exitCode: 0, stdout: 'hyperv\n', stderr: '' };
       if (args.includes('{{.State.Running}}')) {
@@ -706,6 +1188,8 @@ describe('Windows isolated-bind workspace mode', () => {
         return { exitCode: 0, stdout: 'LOCAL_ENGINEER_PROXY_NETWORK_OK\n', stderr: '' };
       if (args.some((argument) => argument.endsWith('whoami.exe')))
         return { exitCode: 0, stdout: 'BUILTIN\\Users S-1-5-32-545 Enabled group\n', stderr: '' };
+      if (args.some((argument) => argument.includes('private-install-target')))
+        return { exitCode: 0, stdout: 'WRITABLE', stderr: '' };
       if (args.some((argument) => argument.includes('read-only-probe') || argument.includes('.probe-')))
         return { exitCode: 0, stdout: 'LOCKED', stderr: '' };
       if (args.some((a) => a.includes("require('node:fs').readFileSync"))) {
@@ -933,6 +1417,81 @@ describe('Windows isolated-bind workspace mode', () => {
     expect(calls.filter((c) => c.includes('create'))).toHaveLength(0);
   });
 
+  it('skips host dependency validation for private-install writable repositories with broken/escaping junctions', async () => {
+    const root = mkdtempSync(join(testTemporaryDirectory(), 'iso-escape-private-install-'));
+    temporaryRoots.push(root);
+    const parent = setupTestRepo(root, 'parent');
+    const state = join(root, 'state');
+
+    const { symlinkSync } = await import('node:fs');
+    symlinkSync(root, join(parent, 'node_modules', 'escape'), 'junction');
+
+    const calls: string[][] = [];
+    const config = windowsIsolatedBindConfig();
+    const manager = new ContainerAgentManager(config, state, createWindowsRuntime(config, calls));
+
+    // 1. Default read-only dependency mode fails closed on escaping junction
+    await expect(
+      manager.prepare('agt_iso_escape_ro', worker(), [
+        { name: 'app', parentPath: parent, containerPath: 'C:/repos/app', access: 'read-write' },
+      ]),
+    ).rejects.toThrow(/CONTAINER_DEPENDENCY_MOUNT_UNSAFE/);
+
+    // 2. Private-install mode on writable repository skips host dependency discovery/validation and succeeds
+    const resources = await manager.prepare(
+      'agt_iso_escape_pi',
+      worker(),
+      [{ name: 'app', parentPath: parent, containerPath: 'C:/repos/app', access: 'read-write' }],
+      undefined,
+      undefined,
+      'private-install',
+    );
+
+    expect(resources.dependencyMode).toBe('private-install');
+    expect(resources.repositories.get('app')?.dependencyMounts).toEqual([]);
+    expect(resources.windowsRepositoryMounts?.get('app')?.dependencyMounts).toEqual([]);
+    expect(resources.privateInstallTargets).toHaveLength(1);
+    expect(resources.privateInstallTargets![0]).toMatchObject({
+      repository: 'app',
+      relativePath: 'node_modules',
+      containerPath: 'C:/repos/app/node_modules',
+    });
+
+    // Verify worker container create call contains named volume for private-install target, but NO host bind for node_modules
+    const workerCreate = calls.find(
+      (c) =>
+        c.includes('create') &&
+        c.some((a) => a === resources.workerContainer || a === `--name=${resources.workerContainer}`),
+    );
+    expect(workerCreate).toBeDefined();
+    const mountSpecs: string[] = [];
+    for (let i = 0; i < workerCreate!.length; i++) {
+      const arg = workerCreate![i]!;
+      if (arg === '--mount' && i + 1 < workerCreate!.length) {
+        mountSpecs.push(workerCreate![i + 1]!);
+      } else if (arg.startsWith('--mount=')) {
+        mountSpecs.push(arg.slice('--mount='.length));
+      }
+    }
+    expect(mountSpecs.some((s) => s.includes(resources.privateInstallTargets![0]!.volume))).toBe(true);
+    expect(mountSpecs.some((s) => s.includes(join(parent, 'node_modules')))).toBe(false);
+
+    // 3. Private-install mode with read-only repository still validates host dependencies and fails closed
+    await expect(
+      manager.prepare(
+        'agt_iso_escape_ro_repo',
+        worker(),
+        [
+          { name: 'app', parentPath: parent, containerPath: 'C:/repos/app', access: 'read-write' },
+          { name: 'readonly_repo', parentPath: parent, containerPath: 'C:/repos/ro', access: 'read-only' },
+        ],
+        undefined,
+        undefined,
+        'private-install',
+      ),
+    ).rejects.toThrow(/CONTAINER_DEPENDENCY_MOUNT_UNSAFE/);
+  });
+
   it('recovery rejects tampered paths in resources.json', async () => {
     const root = mkdtempSync(join(testTemporaryDirectory(), 'iso-recover-'));
     temporaryRoots.push(root);
@@ -1027,6 +1586,84 @@ describe('Windows isolated-bind workspace mode', () => {
 
     const content = await manager.getFile(resources.agentId, 'app', 'source.ts', 1000);
     expect(content).toBe('export const value = 999;\n');
+  });
+
+  it('rejects capture if uncleaned recovery backup artifact is present in working clone', async () => {
+    const root = mkdtempSync(join(testTemporaryDirectory(), 'iso-recovery-artifact-'));
+    temporaryRoots.push(root);
+    const parent = setupTestRepo(root, 'parent');
+    const state = join(root, 'state');
+
+    const config = windowsIsolatedBindConfig();
+    const manager = new ContainerAgentManager(config, state, createWindowsRuntime(config));
+
+    const resources = await manager.prepare('agt_iso_recov', worker(), [
+      { name: 'app', parentPath: parent, containerPath: 'C:/repos/app', access: 'read-write' },
+    ]);
+
+    const workingClone = join(state, 'container-agents', resources.agentId, 'workspaces', 'app');
+    writeFileSync(join(workingClone, '.source.ts.local-engineer-backup-abcdef.bak'), 'recovery backup\n', 'utf8');
+
+    await expect(manager.capture(resources.agentId)).rejects.toThrow(
+      'CONTAINER_PATCH_INVALID:recovery_artifact_present:.source.ts.local-engineer-backup-abcdef.bak',
+    );
+  });
+
+  it('rejects capture if an ignored recovery backup or temp artifact is present in working clone', async () => {
+    const root = mkdtempSync(join(testTemporaryDirectory(), 'iso-ignored-recovery-'));
+    temporaryRoots.push(root);
+    const parent = setupTestRepo(root, 'parent');
+
+    // Add .gitignore ignoring *.bak and *.tmp
+    writeFileSync(join(parent, '.gitignore'), '*.bak\n*.tmp\n', 'utf8');
+    git(parent, ['add', '.gitignore']);
+    git(parent, ['commit', '-m', 'ignore backups and temps']);
+
+    const state = join(root, 'state');
+    const config = windowsIsolatedBindConfig();
+    const manager = new ContainerAgentManager(config, state, createWindowsRuntime(config));
+
+    const resources = await manager.prepare('agt_iso_recov_ignored', worker(), [
+      { name: 'app', parentPath: parent, containerPath: 'C:/repos/app', access: 'read-write' },
+    ]);
+
+    const workingClone = join(state, 'container-agents', resources.agentId, 'workspaces', 'app');
+
+    // 1. Ignored recovery backup artifact
+    const backupPath = join(workingClone, '.source.ts.local-engineer-backup-abcdef.bak');
+    writeFileSync(backupPath, 'recovery backup\n', 'utf8');
+
+    // Confirm git status would omit this file because of .gitignore
+    const gitStatus1 = execFileSync('git', ['status', '--porcelain=v1', '-z', '--untracked-files=all'], {
+      cwd: workingClone,
+      encoding: 'utf8',
+    });
+    expect(gitStatus1).not.toContain('.source.ts.local-engineer-backup-abcdef.bak');
+
+    // Confirm capture still rejects it via filesystem walk
+    await expect(manager.capture(resources.agentId)).rejects.toThrow(
+      'CONTAINER_PATCH_INVALID:recovery_artifact_present:.source.ts.local-engineer-backup-abcdef.bak',
+    );
+
+    rmSync(backupPath);
+
+    // 2. Ignored recovery temp artifact in a nested directory
+    const nestedDir = join(workingClone, 'subdir');
+    mkdirSync(nestedDir, { recursive: true });
+    const tempPath = join(nestedDir, '.source.ts.local-engineer-temp-123456.tmp');
+    writeFileSync(tempPath, 'temp content\n', 'utf8');
+
+    // Confirm git status would omit this nested file too
+    const gitStatus2 = execFileSync('git', ['status', '--porcelain=v1', '-z', '--untracked-files=all'], {
+      cwd: workingClone,
+      encoding: 'utf8',
+    });
+    expect(gitStatus2).not.toContain('.source.ts.local-engineer-temp-123456.tmp');
+
+    // Confirm capture still rejects it via filesystem walk at any depth
+    await expect(manager.capture(resources.agentId)).rejects.toThrow(
+      'CONTAINER_PATCH_INVALID:recovery_artifact_present:subdir/.source.ts.local-engineer-temp-123456.tmp',
+    );
   });
 
   it('marks dependency validation stale when worker changes package.json', async () => {
@@ -1456,6 +2093,663 @@ describe('Windows isolated-bind workspace mode', () => {
     });
     expect(() => assertNoReparsePoints(join(root, 'nonexistent'))).toThrow(/CONTAINER_PATCH_INVALID:unreadable_path/);
     lstatRootSpy.mockRestore();
+
+    // 7. Recovery backup artifact fails closed
+    writeFileSync(join(validDir, '.source.ts.local-engineer-backup-abcdef.bak'), 'backup');
+    expect(() => assertNoReparsePoints(validDir)).toThrow(
+      'CONTAINER_PATCH_INVALID:recovery_artifact_present:.source.ts.local-engineer-backup-abcdef.bak',
+    );
+    rmSync(join(validDir, '.source.ts.local-engineer-backup-abcdef.bak'));
+
+    // 8. Nested recovery temp artifact fails closed
+    const nestedDir = join(validDir, 'nested');
+    mkdirSync(nestedDir);
+    writeFileSync(join(nestedDir, '.source.ts.local-engineer-temp-123456.tmp'), 'temp');
+    expect(() => assertNoReparsePoints(validDir)).toThrow(
+      'CONTAINER_PATCH_INVALID:recovery_artifact_present:nested/.source.ts.local-engineer-temp-123456.tmp',
+    );
+    rmSync(join(nestedDir, '.source.ts.local-engineer-temp-123456.tmp'));
+    rmSync(nestedDir, { recursive: true, force: true });
+  });
+
+  it('prepare throws PRIVATE_INSTALL_NO_WRITABLE_REPOSITORIES when private-install mode has no writable repositories', async () => {
+    const root = mkdtempSync(join(testTemporaryDirectory(), 'iso-ro-only-'));
+    temporaryRoots.push(root);
+    const parent = setupTestRepo(root, 'parent');
+    const state = join(root, 'state');
+
+    const config = windowsIsolatedBindConfig();
+    const manager = new ContainerAgentManager(config, state, createWindowsRuntime(config));
+
+    await expect(
+      manager.prepare(
+        'agt_no_writable',
+        worker(),
+        [{ name: 'app', parentPath: parent, containerPath: 'C:/repos/app', access: 'read-only' }],
+        undefined,
+        undefined,
+        'private-install',
+      ),
+    ).rejects.toThrow('PRIVATE_INSTALL_NO_WRITABLE_REPOSITORIES');
+  });
+
+  it('prepare in private-install mode sets up targets, writes schema 5 resources.json, and recover restores state', async () => {
+    const root = mkdtempSync(join(testTemporaryDirectory(), 'iso-priv-install-'));
+    temporaryRoots.push(root);
+    const parent = setupTestRepo(root, 'parent');
+    const state = join(root, 'state');
+
+    const config = windowsIsolatedBindConfig();
+    const manager = new ContainerAgentManager(config, state, createWindowsRuntime(config));
+
+    const resources = await manager.prepare(
+      'agt_priv_install',
+      worker(),
+      [{ name: 'app', parentPath: parent, containerPath: 'C:/repos/app', access: 'read-write' }],
+      undefined,
+      undefined,
+      'private-install',
+    );
+
+    expect(resources.dependencyMode).toBe('private-install');
+    expect(resources.privateInstallTargets).toBeDefined();
+    expect(resources.privateInstallTargets!.length).toBeGreaterThan(0);
+    expect(resources.privateInstallTargets![0]?.repository).toBe('app');
+
+    const resourcePath = join(state, 'container-agents', resources.agentId, 'resources.json');
+    const data = JSON.parse(readFileSync(resourcePath, 'utf8'));
+    expect(data.schema_version).toBe(5);
+    expect(data.dependency_mode).toBe('private-install');
+    expect(data.private_install_targets).toBeDefined();
+
+    const recoverManager = new ContainerAgentManager(
+      config,
+      state,
+      createWindowsRuntime(config, [], resources.proxyAddress),
+    );
+    const recovered = await recoverManager.recover({
+      agentId: resources.agentId,
+      image: resources.image,
+      repositories: [
+        {
+          name: 'app',
+          parentPath: parent,
+          containerPath: 'C:/repos/app',
+          access: 'read-write',
+          baselineCommit: resources.repositories.get('app')!.snapshot.baselineCommit,
+          parentHead: resources.repositories.get('app')!.snapshot.parentHead,
+        },
+      ],
+    });
+
+    expect(recovered.dependencyMode).toBe('private-install');
+    expect(recovered.privateInstallTargets).toEqual(resources.privateInstallTargets);
+  });
+
+  it('recovery rejects invalid, forged, or inconsistent private-install states with CONTAINER_AGENT_RETAINED_STATE_INVALID', async () => {
+    const root = mkdtempSync(join(testTemporaryDirectory(), 'iso-recovery-invalid-'));
+    temporaryRoots.push(root);
+    const parent = setupTestRepo(root, 'parent');
+    const state = join(root, 'state');
+
+    const config = windowsIsolatedBindConfig();
+    const manager = new ContainerAgentManager(config, state, createWindowsRuntime(config));
+
+    const resources = await manager.prepare(
+      'agt_recovery_base',
+      worker(),
+      [{ name: 'app', parentPath: parent, containerPath: 'C:/repos/app', access: 'read-write' }],
+      undefined,
+      undefined,
+      'private-install',
+    );
+
+    const resourcePath = join(state, 'container-agents', resources.agentId, 'resources.json');
+    const originalJson = readFileSync(resourcePath, 'utf8');
+
+    const baseRecoverInput = {
+      agentId: resources.agentId,
+      image: resources.image,
+      dependencyMode: 'private-install' as const,
+      repositories: [
+        {
+          name: 'app',
+          parentPath: parent,
+          containerPath: 'C:/repos/app',
+          access: 'read-write' as const,
+          baselineCommit: resources.repositories.get('app')!.snapshot.baselineCommit,
+          parentHead: resources.repositories.get('app')!.snapshot.parentHead,
+        },
+      ],
+    };
+
+    const recoverManager = new ContainerAgentManager(
+      config,
+      state,
+      createWindowsRuntime(config, [], resources.proxyAddress),
+    );
+
+    // 1. Malformed or unknown dependency_mode
+    const malformedMode = JSON.parse(originalJson);
+    malformedMode.dependency_mode = 'invalid-mode';
+    writeFileSync(resourcePath, JSON.stringify(malformedMode, null, 2));
+    await expect(recoverManager.recover(baseRecoverInput)).rejects.toThrow('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+
+    // 2. Mode mismatch: persisted private-install vs input read-only
+    writeFileSync(resourcePath, originalJson);
+    await expect(recoverManager.recover({ ...baseRecoverInput, dependencyMode: 'read-only' })).rejects.toThrow(
+      'CONTAINER_AGENT_RETAINED_STATE_INVALID',
+    );
+
+    // 3. Unknown repo in private_install_targets
+    const unknownRepo = JSON.parse(originalJson);
+    unknownRepo.private_install_targets[0].repository = 'nonexistent';
+    writeFileSync(resourcePath, JSON.stringify(unknownRepo, null, 2));
+    await expect(recoverManager.recover(baseRecoverInput)).rejects.toThrow('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+
+    // 4. Read-only repo in private_install_targets
+    writeFileSync(resourcePath, originalJson);
+    await expect(
+      recoverManager.recover({
+        ...baseRecoverInput,
+        repositories: [{ ...baseRecoverInput.repositories[0]!, access: 'read-only' }],
+      }),
+    ).rejects.toThrow('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+
+    // 5. Escaped destination paths: .., leading slash, NTFS stream colon, current dir, non-node_modules
+    for (const badPath of [
+      '../node_modules',
+      '/node_modules',
+      'foo/../../node_modules',
+      'stream:data/node_modules',
+      './node_modules',
+      'not_node_modules',
+    ]) {
+      const escaped = JSON.parse(originalJson);
+      escaped.private_install_targets[0].relative_path = badPath;
+      writeFileSync(resourcePath, JSON.stringify(escaped, null, 2));
+      await expect(recoverManager.recover(baseRecoverInput)).rejects.toThrow('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+    }
+
+    // 6. Foreign or tampered volume name
+    const forgedVolume = JSON.parse(originalJson);
+    forgedVolume.private_install_targets[0].volume = 'forged-volume-name';
+    writeFileSync(resourcePath, JSON.stringify(forgedVolume, null, 2));
+    await expect(recoverManager.recover(baseRecoverInput)).rejects.toThrow('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+
+    // 7. Tampered containerPath
+    const forgedContainerPath = JSON.parse(originalJson);
+    forgedContainerPath.private_install_targets[0].container_path = 'C:/other/node_modules';
+    writeFileSync(resourcePath, JSON.stringify(forgedContainerPath, null, 2));
+    await expect(recoverManager.recover(baseRecoverInput)).rejects.toThrow('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+
+    // 8. Duplicate targets
+    const duplicateTargets = JSON.parse(originalJson);
+    duplicateTargets.private_install_targets.push({ ...duplicateTargets.private_install_targets[0] });
+    writeFileSync(resourcePath, JSON.stringify(duplicateTargets, null, 2));
+    await expect(recoverManager.recover(baseRecoverInput)).rejects.toThrow('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+
+    // 9. Overlapping targets
+    const overlappingTargets = JSON.parse(originalJson);
+    const existingTarget = overlappingTargets.private_install_targets[0];
+    overlappingTargets.private_install_targets.push({
+      repository: existingTarget.repository,
+      relative_path: `${existingTarget.relative_path}/nested/node_modules`,
+      container_path: `${existingTarget.container_path}/nested/node_modules`,
+      volume: 'extra-volume',
+    });
+    writeFileSync(resourcePath, JSON.stringify(overlappingTargets, null, 2));
+    await expect(recoverManager.recover(baseRecoverInput)).rejects.toThrow('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+
+    // 10. Schema 4 regression with schema 5 fields
+    const schema4WithFields = JSON.parse(originalJson);
+    schema4WithFields.schema_version = 4;
+    writeFileSync(resourcePath, JSON.stringify(schema4WithFields, null, 2));
+    await expect(recoverManager.recover(baseRecoverInput)).rejects.toThrow('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+
+    // 11. Schema 4 regression with private-install input mode
+    const schema4Clean = JSON.parse(originalJson);
+    schema4Clean.schema_version = 4;
+    delete schema4Clean.dependency_mode;
+    delete schema4Clean.private_install_targets;
+    writeFileSync(resourcePath, JSON.stringify(schema4Clean, null, 2));
+    await expect(recoverManager.recover({ ...baseRecoverInput, dependencyMode: 'private-install' })).rejects.toThrow(
+      'CONTAINER_AGENT_RETAINED_STATE_INVALID',
+    );
+
+    // 12. Fabricated coherent tampered record: .git/node_modules with matching volume hash
+    const dotGitTarget = JSON.parse(originalJson);
+    const gitVol = privateInstallVolumeName(`le-${resources.agentId}`, 'app', '.git/node_modules');
+    dotGitTarget.private_install_targets = [
+      {
+        repository: 'app',
+        relative_path: '.git/node_modules',
+        container_path: 'C:/repos/app/.git/node_modules',
+        volume: gitVol,
+      },
+    ];
+    writeFileSync(resourcePath, JSON.stringify(dotGitTarget, null, 2));
+    await expect(recoverManager.recover(baseRecoverInput)).rejects.toThrow('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+
+    // 13. Fabricated coherent tampered record: not_node_modules with matching volume hash
+    const notNodeModules = JSON.parse(originalJson);
+    const notVol = privateInstallVolumeName(`le-${resources.agentId}`, 'app', 'not_node_modules');
+    notNodeModules.private_install_targets = [
+      {
+        repository: 'app',
+        relative_path: 'not_node_modules',
+        container_path: 'C:/repos/app/not_node_modules',
+        volume: notVol,
+      },
+    ];
+    writeFileSync(resourcePath, JSON.stringify(notNodeModules, null, 2));
+    await expect(recoverManager.recover(baseRecoverInput)).rejects.toThrow('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+
+    // 14. Missing required targets from baseline manifest (empty array)
+    const emptyTargets = JSON.parse(originalJson);
+    emptyTargets.private_install_targets = [];
+    writeFileSync(resourcePath, JSON.stringify(emptyTargets, null, 2));
+    await expect(recoverManager.recover(baseRecoverInput)).rejects.toThrow('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+
+    // 15. Coherent extra target under an existing non-package src directory in both resources and authorized-targets
+    const authorizedPath = join(state, 'container-agents', resources.agentId, 'authorized-targets.json');
+    const extraSrcTarget = JSON.parse(originalJson);
+    const srcVol = privateInstallVolumeName(`le-${resources.agentId}`, 'app', 'src/node_modules');
+    const extraTargetObj = {
+      repository: 'app',
+      relative_path: 'src/node_modules',
+      container_path: 'C:/repos/app/src/node_modules',
+      volume: srcVol,
+    };
+    extraSrcTarget.private_install_targets.push(extraTargetObj);
+    writeFileSync(resourcePath, JSON.stringify(extraSrcTarget, null, 2));
+    const authorizedWithExtra = [
+      ...JSON.parse(readFileSync(authorizedPath, 'utf8')),
+      {
+        repository: 'app',
+        relativePath: 'src/node_modules',
+        containerPath: 'C:/repos/app/src/node_modules',
+        volume: srcVol,
+      },
+    ];
+    writeFileSync(authorizedPath, JSON.stringify(authorizedWithExtra, null, 2));
+    await expect(recoverManager.recover(baseRecoverInput)).rejects.toThrow('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+
+    // 16. Missing authorized-targets.json file
+    rmSync(authorizedPath, { force: true });
+    writeFileSync(resourcePath, originalJson);
+    await expect(recoverManager.recover(baseRecoverInput)).rejects.toThrow('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+  });
+
+  it('rejects recovery when container mounts or ownership labels are swapped, foreign, or missing', async () => {
+    const root = mkdtempSync(join(testTemporaryDirectory(), 'mount-label-rejection-'));
+    temporaryRoots.push(root);
+    const parent = setupTestRepo(root, 'parent');
+    const state = join(root, 'state');
+
+    const config = windowsIsolatedBindConfig();
+    const calls: string[][] = [];
+    const baseMock = createWindowsMock(calls);
+
+    let mountOverride: Array<{ Type: string; Name?: string; Source: string; Destination: string; RW: boolean }> | null =
+      null;
+    let labelOverride: Record<string, string> | null = null;
+
+    const execute: RuntimeCommandExecutor = async (executable, arguments_, options) => {
+      const args = [...arguments_];
+      if (args.includes('{{json .Mounts}}') && mountOverride !== null) {
+        return { exitCode: 0, stdout: JSON.stringify(mountOverride), stderr: '' };
+      }
+      if ((args.includes('{{json .Config.Labels}}') || args.includes('{{json .Labels}}')) && labelOverride !== null) {
+        return { exitCode: 0, stdout: JSON.stringify(labelOverride), stderr: '' };
+      }
+      return baseMock(executable, arguments_, options);
+    };
+
+    const runtime = new ContainerRuntime('docker', execute, config.context, config.platform);
+    const manager = new ContainerAgentManager(config, state, runtime);
+
+    const resources = await manager.prepare(
+      'agt_mount_test',
+      worker(),
+      [{ name: 'app', parentPath: parent, containerPath: 'C:/repos/app', access: 'read-write' }],
+      undefined,
+      undefined,
+      'private-install',
+    );
+
+    const recoverInput = {
+      agentId: resources.agentId,
+      image: resources.image,
+      dependencyMode: 'private-install' as const,
+      repositories: [
+        {
+          name: 'app',
+          parentPath: parent,
+          containerPath: 'C:/repos/app',
+          access: 'read-write' as const,
+          baselineCommit: resources.repositories.get('app')!.snapshot.baselineCommit,
+          parentHead: resources.repositories.get('app')!.snapshot.parentHead,
+        },
+      ],
+    };
+
+    const recoverRuntime = new ContainerRuntime('docker', execute, config.context, config.platform);
+    const recoverManager = new ContainerAgentManager(config, state, recoverRuntime);
+
+    const target = resources.privateInstallTargets![0]!;
+
+    // 1. Missing mount
+    mountOverride = [];
+    await expect(recoverManager.recover(recoverInput)).rejects.toThrow('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+
+    // 2. Swapped mount (points to another volume name)
+    mountOverride = [
+      {
+        Type: 'volume',
+        Name: 'le-swapped-volume',
+        Source: 'le-swapped-volume',
+        Destination: target.containerPath,
+        RW: true,
+      },
+    ];
+    await expect(recoverManager.recover(recoverInput)).rejects.toThrow('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+
+    // 3. Foreign mount (from foreign agent)
+    mountOverride = [
+      {
+        Type: 'volume',
+        Name: 'le-agt_foreign-app-node_modules',
+        Source: 'le-agt_foreign-app-node_modules',
+        Destination: target.containerPath,
+        RW: true,
+      },
+    ];
+    await expect(recoverManager.recover(recoverInput)).rejects.toThrow('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+
+    // 4. Bind mount instead of volume
+    mountOverride = [
+      {
+        Type: 'bind',
+        Source: 'C:/host/node_modules',
+        Destination: target.containerPath,
+        RW: true,
+      },
+    ];
+    await expect(recoverManager.recover(recoverInput)).rejects.toThrow('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+
+    // 5. Read-only mount instead of read-write
+    mountOverride = [
+      {
+        Type: 'volume',
+        Name: target.volume,
+        Source: target.volume,
+        Destination: target.containerPath,
+        RW: false,
+      },
+    ];
+    await expect(recoverManager.recover(recoverInput)).rejects.toThrow('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+
+    // 6. Missing / foreign ownership labels
+    mountOverride = null;
+    labelOverride = {
+      'local-engineer.agent-id': 'agt_foreign',
+      'local-engineer.managed': 'true',
+    };
+    await expect(recoverManager.recover(recoverInput)).rejects.toThrow('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+
+    // 7. When mounts and labels are valid, recovery succeeds
+    labelOverride = null;
+    await expect(recoverManager.recover(recoverInput)).resolves.toBeDefined();
+  });
+
+  it('recovers successfully from immutable retained baseline snapshot even if parent checkout is mutated or deleted', async () => {
+    const root = mkdtempSync(join(testTemporaryDirectory(), 'iso-recovery-parent-divergence-'));
+    temporaryRoots.push(root);
+    const parent = setupTestRepo(root, 'parent');
+    const state = join(root, 'state');
+
+    const config = windowsIsolatedBindConfig();
+    const manager = new ContainerAgentManager(config, state, createWindowsRuntime(config));
+
+    const resources = await manager.prepare(
+      'agt_recovery_div',
+      worker(),
+      [{ name: 'app', parentPath: parent, containerPath: 'C:/repos/app', access: 'read-write' }],
+      undefined,
+      undefined,
+      'private-install',
+    );
+
+    // Mutate parent checkout: delete package.json and create new untracked files
+    rmSync(join(parent, 'package.json'), { force: true });
+    writeFileSync(join(parent, 'diverged.txt'), 'diverged parent\n');
+
+    const recoverManager = new ContainerAgentManager(
+      config,
+      state,
+      createWindowsRuntime(config, [], resources.proxyAddress),
+    );
+
+    // Recovery succeeds from immutable retained baseline snapshot
+    const recovered = await recoverManager.recover({
+      agentId: resources.agentId,
+      image: resources.image,
+      dependencyMode: 'private-install',
+      repositories: [
+        {
+          name: 'app',
+          parentPath: parent,
+          containerPath: 'C:/repos/app',
+          access: 'read-write',
+          baselineCommit: resources.repositories.get('app')!.snapshot.baselineCommit,
+          parentHead: resources.repositories.get('app')!.snapshot.parentHead,
+        },
+      ],
+    });
+
+    expect(recovered.dependencyMode).toBe('private-install');
+    expect(recovered.privateInstallTargets).toEqual(resources.privateInstallTargets);
+  });
+
+  it('provisions private-install targets and ownership ACLs in Linux workspace copy mode', async () => {
+    const root = mkdtempSync(join(testTemporaryDirectory(), 'linux-prov-'));
+    temporaryRoots.push(root);
+    const parent = setupTestRepo(root, 'parent');
+    const state = join(root, 'state');
+
+    const config = containerConfig();
+    const calls: string[][] = [];
+    const execute: RuntimeCommandExecutor = async (_executable, arguments_) => {
+      calls.push([...arguments_]);
+      return { exitCode: 0, stdout: '', stderr: '' };
+    };
+    const runtime = new ContainerRuntime('docker', execute);
+    const manager = new ContainerAgentManager(config, state, runtime);
+
+    const resources = await manager.prepare(
+      'agt_linux_priv',
+      worker(),
+      [{ name: 'app', parentPath: parent, containerPath: '/workspace/app', access: 'read-write' }],
+      undefined,
+      undefined,
+      'private-install',
+    );
+
+    expect(resources.dependencyMode).toBe('private-install');
+    expect(resources.privateInstallTargets?.length).toBe(1);
+    const target = resources.privateInstallTargets![0]!;
+    expect(target.containerPath).toBe('/workspace/app/node_modules');
+
+    // Check setup container creation mounts the target volume
+    const setupCreate = calls.find(
+      (args) => args[0] === 'create' && args.includes(`type=volume,src=${target.volume},dst=${target.containerPath}`),
+    );
+    expect(setupCreate).toBeDefined();
+
+    // Check ownership setup via chown (as admin 0:0) and chmod (as worker_user codex)
+    const chownCall = calls.find(
+      (args) =>
+        args.includes('chown') &&
+        args.includes('-R') &&
+        args.includes(config.worker_user) &&
+        args.includes(target.containerPath),
+    );
+    expect(chownCall).toBeDefined();
+    expect(chownCall).toContain('0');
+
+    const chmodCall = calls.find(
+      (args) =>
+        args.includes('chmod') && args.includes('-R') && args.includes('u+rwX') && args.includes(target.containerPath),
+    );
+    expect(chmodCall).toBeDefined();
+    expect(chmodCall).toContain(config.worker_user);
+    expect(calls.indexOf(chownCall!)).toBeLessThan(calls.indexOf(chmodCall!));
+
+    // Check config volume ownership order and users
+    const configChown = calls.find((args) => args.includes('chown') && args.includes('/home/codex'));
+    if (configChown) {
+      expect(configChown).toContain('0');
+    }
+    const configChmod = calls.find((args) => args.includes('chmod') && args.some((a) => a.includes('config.toml')));
+    if (configChmod) {
+      expect(configChmod).toContain(config.worker_user);
+      if (configChown) {
+        expect(calls.indexOf(configChown)).toBeLessThan(calls.indexOf(configChmod));
+      }
+    }
+  });
+
+  it('provisions private-install targets and ownership ACLs in Windows volume-copy mode', async () => {
+    const root = mkdtempSync(join(testTemporaryDirectory(), 'win-vc-prov-'));
+    temporaryRoots.push(root);
+    const parent = setupTestRepo(root, 'parent');
+    const state = join(root, 'state');
+
+    const config = windowsContainerConfig();
+    const calls: string[][] = [];
+    const runtime = createWindowsRuntime(config, calls);
+    const manager = new ContainerAgentManager(config, state, runtime);
+
+    const resources = await manager.prepare(
+      'agt_win_vc_priv',
+      worker(),
+      [{ name: 'app', parentPath: parent, containerPath: 'C:/repos/app', access: 'read-write' }],
+      undefined,
+      undefined,
+      'private-install',
+    );
+
+    expect(resources.dependencyMode).toBe('private-install');
+    expect(resources.privateInstallTargets?.length).toBe(1);
+    const target = resources.privateInstallTargets![0]!;
+    expect(target.containerPath).toBe('C:/repos/app/node_modules');
+
+    // Check setup container creation mounts the target volume
+    const setupCreate = calls.find(
+      (args) =>
+        args.includes('create') && args.includes(`type=volume,src=${target.volume},dst=${target.containerPath}`),
+    );
+    expect(setupCreate).toBeDefined();
+
+    // Check ownership setup via icacls command
+    const icaclsCall = calls.find(
+      (args) => args.some((arg) => arg.includes('icacls')) && args.some((arg) => arg.includes(target.containerPath)),
+    );
+    expect(icaclsCall).toBeDefined();
+
+    // Check worker container receives npm_config_store_dir inside authorized node_modules volume
+    const workerCreate = calls.find((args) => args.includes('create') && args.includes(resources.workerContainer));
+    expect(workerCreate).toBeDefined();
+    expect(workerCreate).toContain('npm_config_store_dir=C:/repos/app/node_modules/.pnpm-store');
+    expect(workerCreate).toContain('npm_config_node_linker=hoisted');
+  });
+
+  it('keeps npm_config_store_dir under dependencyRoot in default read-only dependency mode on Windows', async () => {
+    const root = mkdtempSync(join(testTemporaryDirectory(), 'win-ro-store-'));
+    temporaryRoots.push(root);
+    const parent = setupTestRepo(root, 'parent');
+    const state = join(root, 'state');
+
+    const config = windowsContainerConfig();
+    const calls: string[][] = [];
+    const runtime = createWindowsRuntime(config, calls);
+    const manager = new ContainerAgentManager(config, state, runtime);
+
+    const resources = await manager.prepare(
+      'agt_win_ro_store',
+      worker(),
+      [{ name: 'app', parentPath: parent, containerPath: 'C:/repos/app', access: 'read-write' }],
+      undefined,
+      undefined,
+      'read-only',
+    );
+
+    const workerCreate = calls.find((args) => args.includes('create') && args.includes(resources.workerContainer));
+    expect(workerCreate).toBeDefined();
+    expect(workerCreate).toContain('npm_config_store_dir=C:/local-engineer/dependencies/pnpm-store');
+    expect(workerCreate).not.toContain('npm_config_node_linker=hoisted');
+  });
+
+  it('selects non-first working repository pnpm store on Windows in multi-repo private-install mode', async () => {
+    const root = mkdtempSync(join(testTemporaryDirectory(), 'win-mr-store-'));
+    temporaryRoots.push(root);
+    const parent1 = setupTestRepo(root, 'parent1');
+    const parent2 = setupTestRepo(root, 'parent2');
+    const state = join(root, 'state');
+
+    const config = windowsContainerConfig();
+    const calls: string[][] = [];
+    const runtime = createWindowsRuntime(config, calls);
+    const manager = new ContainerAgentManager(config, state, runtime);
+
+    const resources = await manager.prepare(
+      'agt_win_mr_store',
+      worker(),
+      [
+        { name: 'repo1', parentPath: parent1, containerPath: 'C:/repos/repo1', access: 'read-write' },
+        { name: 'repo2', parentPath: parent2, containerPath: 'C:/repos/repo2', access: 'read-write' },
+      ],
+      undefined,
+      undefined,
+      'private-install',
+      'C:/repos/repo2',
+    );
+
+    const workerCreate = calls.find((args) => args.includes('create') && args.includes(resources.workerContainer));
+    expect(workerCreate).toBeDefined();
+    expect(workerCreate).toContain('npm_config_store_dir=C:/repos/repo2/node_modules/.pnpm-store');
+  });
+
+  it('preserves layout dependencyRoot pnpm-store on Linux in private-install mode', async () => {
+    const root = mkdtempSync(join(testTemporaryDirectory(), 'linux-store-'));
+    temporaryRoots.push(root);
+    const parent = setupTestRepo(root, 'parent');
+    const state = join(root, 'state');
+
+    const config = containerConfig();
+    const calls: string[][] = [];
+    const execute: RuntimeCommandExecutor = async (_executable, arguments_) => {
+      calls.push([...arguments_]);
+      return { exitCode: 0, stdout: '', stderr: '' };
+    };
+    const runtime = new ContainerRuntime('docker', execute);
+    const manager = new ContainerAgentManager(config, state, runtime);
+
+    const resources = await manager.prepare(
+      'agt_linux_priv_store',
+      worker(),
+      [{ name: 'app', parentPath: parent, containerPath: '/workspace/app', access: 'read-write' }],
+      undefined,
+      undefined,
+      'private-install',
+      '/workspace/app',
+    );
+
+    const workerCreate = calls.find((args) => args.includes('create') && args.includes(resources.workerContainer));
+    expect(workerCreate).toBeDefined();
+    expect(workerCreate).toContain('npm_config_store_dir=/local-engineer-dependencies/pnpm-store');
+    expect(workerCreate).toContain('npm_config_node_linker=hoisted');
   });
 });
 

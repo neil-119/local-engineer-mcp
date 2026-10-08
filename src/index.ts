@@ -48,7 +48,7 @@ export function createServer(engine: LocalEngineer): McpServer {
   server.tool(
     'local_engineer_start',
     toolDescription(
-      'Start an autonomous disposable container worker asynchronously. Prefer the repository image_profile documented in AGENTS.md. A missing or stale profile fails closed with exact local_engineer_build_image planning instructions; do not silently fall back or build without user approval. Workers have no direct Internet or external DNS route: allowed dependency requests use injected HTTP_PROXY/HTTPS_PROXY or explicit client proxy settings. A failed direct DNS or unproxied request alone does not mean an allowlisted domain is unavailable; have the worker verify through its proxy before reporting a network blocker.',
+      "Start an autonomous disposable container worker asynchronously. Prefer the repository image_profile documented in AGENTS.md. A missing or stale profile fails closed with exact local_engineer_build_image planning instructions; do not silently fall back or build without user approval. Set dependency_mode to 'private-install' when the worker must execute in-container package installations (e.g. npm/pnpm install/add) in agent-owned disposable volumes for writable repositories; default is 'read-only' where repository dependencies are immutable and installations are blocked. Workers have no direct Internet or external DNS route: allowed dependency requests use injected HTTP_PROXY/HTTPS_PROXY or explicit client proxy settings. A failed direct DNS or unproxied request alone does not mean an allowlisted domain is unavailable; have the worker verify through its proxy before reporting a network blocker.",
     ),
     {
       title: z.string(),
@@ -64,6 +64,12 @@ export function createServer(engine: LocalEngineer): McpServer {
         .regex(/^[a-z0-9][a-z0-9-]{0,62}$/)
         .optional(),
       timeout_seconds: z.number().int().positive().optional(),
+      dependency_mode: z
+        .enum(['read-only', 'private-install'])
+        .describe(
+          'Dependency isolation mode. Default is read-only. Use private-install to allow package installations into agent-owned disposable volumes on writable repositories.',
+        )
+        .optional(),
     },
     async (input) => {
       try {
@@ -79,6 +85,7 @@ export function createServer(engine: LocalEngineer): McpServer {
             worker: input.worker,
             imageProfile: input.image_profile,
             timeoutSeconds: input.timeout_seconds,
+            dependencyMode: input.dependency_mode,
           }),
         );
       } catch (cause) {
@@ -183,6 +190,20 @@ export function createServer(engine: LocalEngineer): McpServer {
     async (input) => {
       try {
         return asText({ schema_version: 1, runs: engine.status(input.run_ids, input.agent_ids) });
+      } catch (cause) {
+        return error(cause);
+      }
+    },
+  );
+  server.tool(
+    'local_engineer_summarize_run',
+    toolDescription(
+      'Generate an advisory executive summary for a container run, analyzing command history, roadblocks, errors, files changed, and recommended next steps using the configured local model or deterministic fallback. The trusted host control plane sends bounded stored run evidence directly to the configured model endpoint (not through the worker dependency proxy). Returned commands_count and failed_commands_count represent exact totals when history_truncated is false and observed lower bounds when history_truncated is true. All model-generated summary text is advisory and untrusted.',
+    ),
+    { run_id: z.string().regex(/^run_[A-Za-z0-9_-]{1,128}$/) },
+    async (input) => {
+      try {
+        return asText(await engine.summarizeRun(input.run_id));
       } catch (cause) {
         return error(cause);
       }
@@ -459,7 +480,7 @@ async function main(): Promise<void> {
       console.log(monitorUsage());
       return;
     }
-    const { server, url } = createMonitorServer(store, options);
+    const { server, url } = createMonitorServer(store, options, engine);
     await new Promise<void>((done, fail) => {
       server.once('error', fail);
       server.listen({ port: options.port, host: '127.0.0.1' }, () => {

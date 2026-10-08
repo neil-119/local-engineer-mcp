@@ -40,10 +40,15 @@ When the `local_engineer_*` MCP tools are available, ALWAYS use configured Local
   disposable container and its network policy: model requests use the
   fixed-target relay, and only explicitly configured dependency hosts receive
   `GET`, `HEAD`, or `OPTIONS` through the limited proxy.
-- Tell workers to keep temporary dependency state in
-  `LOCAL_ENGINEER_DEPENDENCY_ROOT`, never in the repository. Generated
-  dependency paths are excluded from review and cannot be promoted; do not
-  treat that exclusion as authorization to write arbitrary files there.
+- In default `read-only` dependency mode, tell workers to keep temporary dependency state in
+  `LOCAL_ENGINEER_DEPENDENCY_ROOT`, never in the repository. In `private-install` mode,
+  workers may install dependencies into agent-owned disposable named volumes mounted at
+  designated install roots (`node_modules`) on writable repositories, while global/package
+  caches remain outside the repository (with the narrow exception of `npm_config_store_dir`
+  pre-configured inside the disposable `node_modules` volume on Windows to satisfy pnpm store
+  locality without elevated privileges). Generated dependency paths are excluded from review
+  and cannot be promoted; do not treat that exclusion as authorization to write arbitrary files there.
+- Under Windows `isolated-bind` environments, file-system-sensitive databases (such as workerd SQLite runtime state) encounter fatal disk I/O errors (`SQLITE_IOERR`) when stored on the repository bind mount; direct persistent state to an agent-specific subdirectory of `LOCAL_ENGINEER_DEPENDENCY_ROOT` via `--persist-to`. Long package installations must be bounded with explicit native exit code checks. Background process cleanup must track and terminate only the specific spawned process PID and its descendants; never terminate all Node or workerd processes, which breaks the container MCP file tools server.
 - If `local_engineer_start` reports a missing or stale image profile, do not
   silently fall back. Plan it first, show the user the exact dependency inputs
   and read-only domains, and build only with explicit approval.

@@ -27,6 +27,7 @@ describe('shared worker image contract', () => {
     expect(dockerfile).toContain('libwebkit2gtk-4.1-dev');
     expect(dockerfile).toContain('libayatana-appindicator3-dev');
     expect(dockerfile).toContain('pkg-config');
+    expect(dockerfile).toContain('COPY file-tools-server.mjs /usr/local/lib/local-engineer/file-tools-server.mjs');
     expect(dockerfile).toContain('COPY apply_patch /usr/local/bin/apply_patch');
     expect(dockerfile).toContain('COPY apply_patch.mjs /usr/local/lib/local-engineer/apply_patch.mjs');
     expect(dockerfile).toContain('COPY rust-path.sh /etc/profile.d/local-engineer-rust.sh');
@@ -41,15 +42,31 @@ describe('shared worker image contract', () => {
     expect(dockerfile).toContain('ARG RUST_TOOLCHAIN_VERSION=1.98.1');
     expect(dockerfile).toContain('ARG GIT_SHA256=');
     expect(dockerfile).toContain('ARG TERRAFORM_VERSION=1.12.2');
+    expect(dockerfile).toContain('ARG PYTHON_VERSION=3.14.7');
+    expect(dockerfile).toContain('ARG PYTHON_SHA256=');
+    expect(dockerfile).toContain('Python installer checksum mismatch');
+    expect(dockerfile).not.toContain('COPY --from=python-runtime C:\\Python C:\\Python');
     expect(dockerfile).toContain(
       'ARG TERRAFORM_SHA256=0a1565ace9da37c2778868c2e97452d8fc25e40e530bafbbab97231e69b0a201',
     );
     expect(dockerfile).toContain('Terraform archive checksum mismatch');
     expect(dockerfile).toContain("'C:\\Terraform'");
+    expect(dockerfile).toContain('ARG DOTNET_VERSION=10.0.401');
+    expect(dockerfile).toContain('ARG DOTNET_SHA512=');
+    expect(dockerfile).toContain('Dotnet SDK archive checksum mismatch');
+    expect(dockerfile).toContain('ARG PNPM_VERSION=10.34.5');
+    expect(dockerfile).toContain('npm install --global --ignore-scripts --prefix C:\\npm "pnpm@$env:PNPM_VERSION"');
+    expect(dockerfile).toContain("'C:\\DotNet'");
+    expect(dockerfile).toContain("$toolRoots = @('C:\\BuildTools','C:\\Rust','C:\\src')");
+    expect(dockerfile).toContain(
+      "$toolRoots = @('C:\\local-engineer','C:\\npm','C:\\Python','C:\\MinGit','C:\\Terraform','C:\\DotNet')",
+    );
+    expect(dockerfile).not.toContain('icacls.exe "$toolRoot\\*" /reset /T /C /Q');
     expect(dockerfile).toContain('ARG CODEX_SOURCE_SHA256=');
     expect(dockerfile).toContain('Codex source archive checksum mismatch');
     expect(dockerfile).toContain("$env:RUSTUP_TOOLCHAIN = 'stable'");
     expect(dockerfile).toContain('Get-AuthenticodeSignature C:\\vs_BuildTools.exe');
+    expect(dockerfile).toContain('COPY file-tools-server.mjs C:\\local-engineer\\file-tools-server.mjs');
     expect(dockerfile).toContain('COPY configure-worker-network.ps1');
     expect(dockerfile).toContain(
       "& 'C:\\npm\\node_modules\\@openai\\codex\\node_modules\\@openai\\codex-win32-x64\\vendor\\x86_64-pc-windows-msvc\\bin\\codex.exe' --version",
@@ -69,14 +86,15 @@ describe('shared worker image contract', () => {
     expect(network).toContain("Write-Output 'LOCAL_ENGINEER_NETWORK_OK'");
   });
 
-  it('tells workers to use the provided helper, not an unavailable host tool', () => {
-    expect(DEFAULT_WORKER_POLICY).toContain('`apply_patch` command');
-    expect(DEFAULT_WORKER_POLICY).toContain('`*** Begin Patch`');
-    expect(DEFAULT_WORKER_POLICY).toContain('`apply_patch --check`');
-    expect(DEFAULT_WORKER_POLICY).toContain('manipulate headers');
-    expect(DEFAULT_WORKER_POLICY).toContain('error-masking shell logic');
-    expect(DEFAULT_WORKER_POLICY).toContain('do not guess patch filenames');
-    expect(DEFAULT_WORKER_POLICY).toContain('$patch | apply_patch --check');
+  it('tells workers to use the container MCP file tools for file modifications', () => {
+    expect(DEFAULT_WORKER_POLICY).toContain('`read_file`');
+    expect(DEFAULT_WORKER_POLICY).toContain('`edit_file`');
+    expect(DEFAULT_WORKER_POLICY).toContain('`write_file`');
+    expect(DEFAULT_WORKER_POLICY).toContain('`delete_file`');
+    expect(DEFAULT_WORKER_POLICY).toContain('`move_file`');
+    expect(DEFAULT_WORKER_POLICY).toContain('`copy_file`');
+    expect(DEFAULT_WORKER_POLICY).toContain('`grep_files`');
+    expect(DEFAULT_WORKER_POLICY).toContain('`list_dir`');
   });
 
   it('ensures Windows apply_patch.ps1 accepts pipeline input and remaining arguments', () => {

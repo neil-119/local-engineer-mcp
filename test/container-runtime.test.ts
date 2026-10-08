@@ -597,4 +597,207 @@ describe('container runtime adapter', () => {
     ]);
     await expect(runtime.isContainerRunning('bad/name')).rejects.toThrow('CONTAINER_RESOURCE_NAME_INVALID');
   });
+
+  it('retries removeNetwork when endpoints are temporarily active and succeeds on release', async () => {
+    let attempts = 0;
+    const runtime = new ContainerRuntime(
+      'docker',
+      async (_exe, args) => {
+        if (args.includes('rm')) {
+          attempts++;
+          if (attempts < 3) {
+            return {
+              exitCode: 1,
+              stdout: '',
+              stderr: 'Error response from daemon: network le-test-internal has active endpoints',
+            };
+          }
+          return { exitCode: 0, stdout: 'le-test-internal', stderr: '' };
+        }
+        return { exitCode: 0, stdout: '', stderr: '' };
+      },
+      undefined,
+      'windows',
+    );
+
+    const result = await runtime.removeNetwork('le-test-internal', 3, 5);
+    expect(result.exitCode).toBe(0);
+    expect(attempts).toBe(3);
+  });
+
+  it('prunes only stale unattached managed networks and skips system networks, recent networks, and active agents', async () => {
+    const removed: string[] = [];
+    const runtime = new ContainerRuntime(
+      'docker',
+      async (_exe, args) => {
+        if (args.includes('network') && args.includes('ls')) {
+          return {
+            exitCode: 0,
+            stdout:
+              'le-stale-internal\nle-recent-internal\nle-busy-internal\nle-active-internal\nnat\nDefault Switch\n',
+            stderr: '',
+          };
+        }
+        if (args.includes('inspect') && args.includes('{{.Created}}')) {
+          const target = args.at(-1);
+          if (target === 'le-recent-internal') {
+            return { exitCode: 0, stdout: new Date().toISOString(), stderr: '' };
+          }
+          return { exitCode: 0, stdout: new Date(Date.now() - 3600_000).toISOString(), stderr: '' };
+        }
+        if (args.includes('inspect') && args.includes('{{json .Containers}}')) {
+          const target = args.at(-1);
+          if (target === 'le-busy-internal') {
+            return { exitCode: 0, stdout: '{"c1":{"Name":"busy-worker"}}', stderr: '' };
+          }
+          return { exitCode: 0, stdout: '{}', stderr: '' };
+        }
+        if (args.includes('inspect') && args.includes('{{index .Labels "local-engineer.agent-id"}}')) {
+          const target = args.at(-1);
+          if (target === 'le-active-internal') {
+            return { exitCode: 0, stdout: 'agt_active_123', stderr: '' };
+          }
+          return { exitCode: 0, stdout: 'agt_stale_999', stderr: '' };
+        }
+        if (args.includes('network') && args.includes('rm')) {
+          removed.push(args.at(-1)!);
+          return { exitCode: 0, stdout: args.at(-1)!, stderr: '' };
+        }
+        return { exitCode: 0, stdout: '', stderr: '' };
+      },
+      undefined,
+      'windows',
+    );
+
+    const activeAgents = new Set(['agt_active_123']);
+    const pruned = await runtime.pruneStaleManagedNetworks({ activeAgentIds: activeAgents, minAgeMs: 900_000 });
+    expect(pruned).toEqual(['le-stale-internal']);
+    expect(removed).toEqual(['le-stale-internal']);
+  });
+
+  it('networkConnectedContainers fails closed on inspect errors, malformed JSON, or non-object payloads', async () => {
+    const runtime = new ContainerRuntime(
+      'docker',
+      async (_exe, args) => {
+        const target = args.at(-1);
+        if (target === 'le-ok') return { exitCode: 0, stdout: '{"c1":{"Name":"w1"}}\n', stderr: '' };
+        if (target === 'le-empty') return { exitCode: 0, stdout: '{}\n', stderr: '' };
+        if (target === 'le-null') return { exitCode: 0, stdout: 'null\n', stderr: '' };
+        if (target === 'le-whitespace') return { exitCode: 0, stdout: '   \n', stderr: '' };
+        if (target === 'le-error') return { exitCode: 1, stdout: '', stderr: 'daemon inspect failed' };
+        if (target === 'le-malformed') return { exitCode: 0, stdout: 'not json {', stderr: '' };
+        if (target === 'le-array') return { exitCode: 0, stdout: '["c1", "c2"]\n', stderr: '' };
+        if (target === 'le-scalar') return { exitCode: 0, stdout: '123\n', stderr: '' };
+        return { exitCode: 0, stdout: '{}\n', stderr: '' };
+      },
+      undefined,
+      'windows',
+    );
+
+    expect(await runtime.networkConnectedContainers('le-ok')).toEqual(['c1']);
+    expect(await runtime.networkConnectedContainers('le-empty')).toEqual([]);
+    expect(await runtime.networkConnectedContainers('le-null')).toEqual([]);
+    expect(await runtime.networkConnectedContainers('le-whitespace')).toEqual([]);
+
+    await expect(runtime.networkConnectedContainers('le-error')).rejects.toThrow('CONTAINER_RUNTIME_COMMAND_FAILED');
+    await expect(runtime.networkConnectedContainers('le-malformed')).rejects.toThrow(
+      'CONTAINER_NETWORK_INSPECT_MALFORMED',
+    );
+    await expect(runtime.networkConnectedContainers('le-array')).rejects.toThrow('CONTAINER_NETWORK_INSPECT_INVALID');
+    await expect(runtime.networkConnectedContainers('le-scalar')).rejects.toThrow('CONTAINER_NETWORK_INSPECT_INVALID');
+  });
+
+  it('skips deletion without calling network rm when inspect fails or returns malformed/ambiguous JSON', async () => {
+    const removed: string[] = [];
+    const runtime = new ContainerRuntime(
+      'docker',
+      async (_exe, args) => {
+        if (args.includes('network') && args.includes('ls')) {
+          return {
+            exitCode: 0,
+            stdout: 'le-inspect-error\nle-malformed-json\nle-array-json\nle-valid-empty\n',
+            stderr: '',
+          };
+        }
+        if (args.includes('inspect') && args.includes('{{.Created}}')) {
+          return { exitCode: 0, stdout: new Date(Date.now() - 3600_000).toISOString(), stderr: '' };
+        }
+        if (args.includes('inspect') && args.includes('{{index .Labels "local-engineer.agent-id"}}')) {
+          return { exitCode: 0, stdout: 'agt_stale_999', stderr: '' };
+        }
+        if (args.includes('inspect') && args.includes('{{json .Containers}}')) {
+          const target = args.at(-1);
+          if (target === 'le-inspect-error') {
+            return { exitCode: 1, stdout: '', stderr: 'Error response from daemon: network inspect failed' };
+          }
+          if (target === 'le-malformed-json') {
+            return { exitCode: 0, stdout: '<<< corrupted json payload >>>', stderr: '' };
+          }
+          if (target === 'le-array-json') {
+            return { exitCode: 0, stdout: '["container-1"]', stderr: '' };
+          }
+          if (target === 'le-valid-empty') {
+            return { exitCode: 0, stdout: '{}', stderr: '' };
+          }
+          return { exitCode: 0, stdout: '{}', stderr: '' };
+        }
+        if (args.includes('network') && args.includes('rm')) {
+          removed.push(args.at(-1)!);
+          return { exitCode: 0, stdout: args.at(-1)!, stderr: '' };
+        }
+        return { exitCode: 0, stdout: '', stderr: '' };
+      },
+      undefined,
+      'windows',
+    );
+
+    const pruned = await runtime.pruneStaleManagedNetworks({ minAgeMs: 900_000 });
+    expect(pruned).toEqual(['le-valid-empty']);
+    expect(removed).toEqual(['le-valid-empty']);
+    expect(removed).not.toContain('le-inspect-error');
+    expect(removed).not.toContain('le-malformed-json');
+    expect(removed).not.toContain('le-array-json');
+  });
+
+  it('skips deletion when creation time or agent ownership is missing or malformed', async () => {
+    const removed: string[] = [];
+    const runtime = new ContainerRuntime(
+      'docker',
+      async (_exe, args) => {
+        if (args.includes('network') && args.includes('ls')) {
+          return {
+            exitCode: 0,
+            stdout: 'le-no-created\nle-bad-created\nle-no-agent\nle-bad-agent\nle-valid-stale\n',
+            stderr: '',
+          };
+        }
+        if (args.includes('inspect') && args.includes('{{.Created}}')) {
+          const target = args.at(-1);
+          if (target === 'le-no-created') return { exitCode: 0, stdout: '', stderr: '' };
+          if (target === 'le-bad-created') return { exitCode: 0, stdout: 'not-a-timestamp', stderr: '' };
+          return { exitCode: 0, stdout: new Date(Date.now() - 3600_000).toISOString(), stderr: '' };
+        }
+        if (args.includes('inspect') && args.includes('{{index .Labels "local-engineer.agent-id"}}')) {
+          const target = args.at(-1);
+          if (target === 'le-no-agent') return { exitCode: 0, stdout: '', stderr: '' };
+          if (target === 'le-bad-agent') return { exitCode: 0, stdout: 'agt_bad\r\nsecond-line', stderr: '' };
+          return { exitCode: 0, stdout: 'agt_stale_999', stderr: '' };
+        }
+        if (args.includes('inspect') && args.includes('{{json .Containers}}')) {
+          return { exitCode: 0, stdout: '{}', stderr: '' };
+        }
+        if (args.includes('network') && args.includes('rm')) {
+          removed.push(args.at(-1)!);
+          return { exitCode: 0, stdout: args.at(-1)!, stderr: '' };
+        }
+        return { exitCode: 0, stdout: '', stderr: '' };
+      },
+      undefined,
+      'windows',
+    );
+
+    const pruned = await runtime.pruneStaleManagedNetworks({ minAgeMs: 900_000 });
+    expect(pruned).toEqual(['le-valid-stale']);
+    expect(removed).toEqual(['le-valid-stale']);
+  });
 });

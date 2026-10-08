@@ -49,6 +49,16 @@ describe('worker prompt', () => {
     expect(prompt).toContain('retry the same read-only request once');
     expect(prompt).toContain('never bypass the proxy, change routing, or disable certificate checks');
   });
+
+  it('enforces Windows SQLite persistence, bounded install timeouts, and targeted PID cleanup even when a custom worker policy replaces the default', () => {
+    const prompt = buildPrompt('Persistence test', 'run_5', 'Run workerd.', undefined, 'Custom policy only.');
+    expect(prompt).toContain('LOCAL_ENGINEER_DEPENDENCY_ROOT');
+    expect(prompt).toContain('--persist-to');
+    expect(prompt).toContain('$LASTEXITCODE');
+    expect(prompt).toContain('minutes-scale bounded tool timeout');
+    expect(prompt).toContain('track and stop only the specific spawned process PID and its descendants');
+    expect(prompt).toContain('never execute broad process termination (such as killing all Node or workerd processes)');
+  });
 });
 
 describe('result normalization', () => {

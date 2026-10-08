@@ -1,4 +1,4 @@
-import { existsSync, realpathSync, readFileSync } from 'node:fs';
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, resolve } from 'node:path';
 import YAML from 'yaml';
@@ -41,6 +41,7 @@ const workerSchema = z
       .object({
         base_url: z.string().url(),
         wire_api: z.enum(['responses', 'chat']).default('responses'),
+        wire_api_compatibility: z.enum(['standard', 'flatten_namespaces']).default('standard'),
         api_key_environment_variable: z
           .string()
           .regex(/^[A-Z_][A-Z0-9_]*$/)
@@ -50,6 +51,8 @@ const workerSchema = z
       .strict()
       .optional(),
     container_codex_config_file: z.string().min(1).optional(),
+    auto_compact_token_limit: z.number().int().positive().optional(),
+    model_catalog_json_file: z.string().min(1).optional(),
   })
   .strict();
 const containerSchema = z
@@ -155,6 +158,7 @@ const schema = z
   .object({
     version: z.literal(1),
     default_worker: z.string().optional(),
+    default_dependency_mode: z.enum(['read-only', 'private-install']).default('read-only'),
     server: z
       .object({
         state_dir: z.string().default('~/.local-engineer'),
@@ -207,8 +211,25 @@ export function loadConfig(path = configPath()): Config {
       if (!existsSync(codexConfig)) throw new Error(`CONFIG_CONTAINER_CODEX_CONFIG_NOT_FOUND:${worker.name}`);
       worker.container_codex_config_file = codexConfig;
     }
+    if (worker.container_model_provider?.wire_api_compatibility === 'flatten_namespaces') {
+      if (worker.container_model_provider.wire_api !== 'responses') {
+        throw new Error(
+          `CONFIG_WIRE_API_COMPATIBILITY_INVALID:${worker.name}:flatten_namespaces requires wire_api=responses`,
+        );
+      }
+    }
+    if (worker.model_catalog_json_file) {
+      const catalogFile = expandHome(worker.model_catalog_json_file);
+      try {
+        validateAndReadModelCatalog(catalogFile, worker.model);
+      } catch (e) {
+        throw new Error(`${worker.name}:${e instanceof Error ? e.message : String(e)}`);
+      }
+      worker.model_catalog_json_file = catalogFile;
+    }
     const reservedContainerEnvironment = new Set([
       'CODEX_HOME',
+      'LOCAL_ENGINEER_RESPONSES_COMPATIBILITY',
       'HTTP_PROXY',
       'HTTPS_PROXY',
       'WS_PROXY',
@@ -320,4 +341,154 @@ export function canonicalWorkspace(input: string, config: Config): string {
   if (!allowed.some((root) => actual === root || actual.startsWith(`${root}\\`) || actual.startsWith(`${root}/`)))
     throw new Error('WORKING_DIRECTORY_NOT_ALLOWED');
   return actual;
+}
+
+export interface ModelCatalogEntry {
+  slug: string;
+  apply_patch_tool_type?: 'function' | 'freeform';
+  supports_parallel_tool_calls?: boolean;
+  supports_search_tool?: boolean;
+  context_window?: number;
+  max_context_window?: number;
+  auto_compact_token_limit?: number;
+  tool_mode?: 'direct' | 'nested' | 'none';
+  web_search_tool_type?: 'text' | 'function';
+  [key: string]: unknown;
+}
+
+export interface ValidatedModelCatalog {
+  contents: string;
+  matchedModel: ModelCatalogEntry;
+}
+
+export function validateAndReadModelCatalog(
+  catalogPath: string,
+  expectedModelSlug: string,
+  maximumBytes = 5 * 1024 * 1024,
+): ValidatedModelCatalog {
+  if (!isAbsolute(catalogPath)) {
+    throw new Error('CONFIG_MODEL_CATALOG_NOT_ABSOLUTE');
+  }
+
+  let fd: number;
+  try {
+    fd = openSync(catalogPath, 'r');
+  } catch {
+    throw new Error('CONFIG_MODEL_CATALOG_NOT_FOUND');
+  }
+
+  let raw: string;
+  try {
+    const stats = fstatSync(fd);
+    if (!stats.isFile()) {
+      throw new Error('CONFIG_MODEL_CATALOG_NOT_REGULAR_FILE');
+    }
+    if (stats.size > maximumBytes) {
+      throw new Error('CONFIG_MODEL_CATALOG_TOO_LARGE');
+    }
+
+    const buffer = Buffer.alloc(maximumBytes + 1);
+    let totalRead = 0;
+    while (totalRead <= maximumBytes) {
+      const bytesRead = readSync(fd, buffer, totalRead, buffer.length - totalRead, null);
+      if (bytesRead === 0) break;
+      totalRead += bytesRead;
+    }
+    if (totalRead > maximumBytes) {
+      throw new Error('CONFIG_MODEL_CATALOG_TOO_LARGE');
+    }
+    raw = buffer.subarray(0, totalRead).toString('utf8');
+  } finally {
+    try {
+      closeSync(fd);
+    } catch {
+      // ignore errors closing fd
+    }
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    throw new Error(`CONFIG_MODEL_CATALOG_INVALID_JSON:${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  if (
+    typeof parsed !== 'object' ||
+    parsed === null ||
+    !('models' in parsed) ||
+    !Array.isArray((parsed as Record<string, unknown>).models)
+  ) {
+    throw new Error('CONFIG_MODEL_CATALOG_MISSING_MODELS');
+  }
+
+  const catalogModels = (parsed as { models: unknown[] }).models;
+  const matches: ModelCatalogEntry[] = [];
+  for (const model of catalogModels) {
+    if (typeof model !== 'object' || model === null) {
+      throw new Error('CONFIG_MODEL_CATALOG_INVALID_MODEL_ENTRY');
+    }
+    const entry = model as Record<string, unknown>;
+    if (typeof entry.slug !== 'string' || !entry.slug.trim()) {
+      throw new Error('CONFIG_MODEL_CATALOG_MODEL_MISSING_SLUG');
+    }
+
+    if (entry.apply_patch_tool_type !== undefined) {
+      if (
+        typeof entry.apply_patch_tool_type !== 'string' ||
+        !['function', 'freeform'].includes(entry.apply_patch_tool_type)
+      ) {
+        throw new Error(`CONFIG_MODEL_CATALOG_INVALID_APPLY_PATCH:${entry.slug}`);
+      }
+    }
+    if (entry.supports_parallel_tool_calls !== undefined && typeof entry.supports_parallel_tool_calls !== 'boolean') {
+      throw new Error(`CONFIG_MODEL_CATALOG_INVALID_PARALLEL_TOOL_CALLS:${entry.slug}`);
+    }
+    if (entry.supports_search_tool !== undefined && typeof entry.supports_search_tool !== 'boolean') {
+      throw new Error(`CONFIG_MODEL_CATALOG_INVALID_SEARCH_TOOL:${entry.slug}`);
+    }
+    if (
+      entry.context_window !== undefined &&
+      (!Number.isInteger(entry.context_window) || (entry.context_window as number) <= 0)
+    ) {
+      throw new Error(`CONFIG_MODEL_CATALOG_INVALID_CONTEXT_WINDOW:${entry.slug}`);
+    }
+    if (
+      entry.max_context_window !== undefined &&
+      (!Number.isInteger(entry.max_context_window) || (entry.max_context_window as number) <= 0)
+    ) {
+      throw new Error(`CONFIG_MODEL_CATALOG_INVALID_MAX_CONTEXT_WINDOW:${entry.slug}`);
+    }
+    if (
+      entry.auto_compact_token_limit !== undefined &&
+      (!Number.isInteger(entry.auto_compact_token_limit) || (entry.auto_compact_token_limit as number) <= 0)
+    ) {
+      throw new Error(`CONFIG_MODEL_CATALOG_INVALID_AUTO_COMPACT:${entry.slug}`);
+    }
+    if (
+      entry.tool_mode !== undefined &&
+      (typeof entry.tool_mode !== 'string' || !['direct', 'nested', 'none'].includes(entry.tool_mode))
+    ) {
+      throw new Error(`CONFIG_MODEL_CATALOG_INVALID_TOOL_MODE:${entry.slug}`);
+    }
+    if (
+      entry.web_search_tool_type !== undefined &&
+      (typeof entry.web_search_tool_type !== 'string' || !['text', 'function'].includes(entry.web_search_tool_type))
+    ) {
+      throw new Error(`CONFIG_MODEL_CATALOG_INVALID_WEB_SEARCH:${entry.slug}`);
+    }
+
+    if (entry.slug === expectedModelSlug) {
+      matches.push(entry as unknown as ModelCatalogEntry);
+    }
+  }
+
+  if (matches.length === 0) {
+    throw new Error(`CONFIG_MODEL_CATALOG_MODEL_NOT_FOUND:${expectedModelSlug}`);
+  }
+  if (matches.length > 1) {
+    throw new Error(`CONFIG_MODEL_CATALOG_DUPLICATE_MODEL:${expectedModelSlug}`);
+  }
+
+  return { contents: raw, matchedModel: matches[0]! };
 }

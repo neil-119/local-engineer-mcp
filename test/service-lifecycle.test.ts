@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { Config, Run } from '../src/domain.js';
 import {
   LocalEngineer,
@@ -71,6 +71,56 @@ describe('agent lifecycle history', () => {
       grounding_characters: objective.length + 'Do not edit files.'.length,
       characters: title.length + task.length + objective.length + 'Do not edit files.'.length,
     });
+  });
+
+  it('records dependencyMode in start and projects it through SafeRun and reply continuations', async () => {
+    const stateDirectory = mkdtempSync(join(testTemporaryDirectory(), 'service-dep-mode-'));
+    const testConfig = config(stateDirectory);
+    testConfig.security.allowed_roots = [stateDirectory];
+    const store = new RunStore(stateDirectory);
+    const engine = new LocalEngineer(testConfig, store, 'owner_test');
+    Object.defineProperty(engine, 'queue', { value: () => undefined });
+
+    const started = engine.start({
+      title: 'Private install run',
+      task: 'Install deps and test.',
+      workingDirectory: stateDirectory,
+      dependencyMode: 'private-install',
+    });
+
+    expect(started.dependency_mode).toBe('private-install');
+    const runInStore = store.get(started.run_id);
+    expect(runInStore?.dependencyMode).toBe('private-install');
+
+    // Simulate run completing to ready_for_review
+    store.setStatus(
+      started.run_id,
+      'ready_for_review',
+      {
+        completedAt: new Date().toISOString(),
+        workerThreadId: 'thread_test_1',
+        changeSet: {
+          revision: 1,
+          previous_revision: 0,
+          digest: 'sha256:' + 'a'.repeat(64),
+          repositories: [],
+        },
+      },
+      { ownerId: 'owner_test' },
+    );
+
+    // Reply inherits dependencyMode
+    vi.spyOn(
+      engine as unknown as { restoreContainerAgent: () => Promise<void> },
+      'restoreContainerAgent',
+    ).mockResolvedValue(undefined);
+    const replied = await engine.reply({
+      agentId: started.agent_id,
+      title: 'Follow-up turn',
+      message: 'Run verification tests.',
+    });
+    expect(replied.dependency_mode).toBe('private-install');
+    expect(store.get(replied.run_id)?.dependencyMode).toBe('private-install');
   });
 
   it('projects safe failure codes and actionable diagnostics to the parent', () => {
@@ -1708,5 +1758,587 @@ describe('isMissingRecoveredThread', () => {
     expect(isMissingRecoveredThread(new Error('something else'))).toBe(false);
     expect(isMissingRecoveredThread(null)).toBe(false);
     expect(isMissingRecoveredThread(undefined)).toBe(false);
+  });
+});
+
+describe('steering fenced delivery and failure semantics', () => {
+  it('reports failed delivery when accepted guidance is closed before the dispatch path starts', async () => {
+    const stateDirectory = mkdtempSync(join(testTemporaryDirectory(), 'service-steer-undelivered-'));
+    const store = new RunStore(stateDirectory);
+    const engine = new LocalEngineer(config(stateDirectory), store, 'owner_test', undefined, 30_000, 0);
+    store.add({ ...run('run_steer_undelivered', 'running', 0), workerThreadId: 'thread_test' });
+    const enqueue = store.enqueueSteer.bind(store);
+    vi.spyOn(store, 'enqueueSteer').mockImplementation((runId, message, fence) => {
+      const accepted = enqueue(runId, message, fence);
+      store.setStatus(runId, 'ready_for_review');
+      return accepted;
+    });
+    try {
+      await expect(engine.steer('run_steer_undelivered', 'Correction')).rejects.toThrow(
+        'STEER_RPC_FAILED: run_ready_for_review_before_dispatch',
+      );
+      expect(store.get('run_steer_undelivered')?.steeringMessages?.[0]?.status).toBe('failed');
+    } finally {
+      store.close();
+    }
+  });
+
+  it('rejects guidance rather than silently queueing when the run finishes just before enqueue', async () => {
+    const stateDirectory = mkdtempSync(join(testTemporaryDirectory(), 'service-steer-settle-race-'));
+    const store = new RunStore(stateDirectory);
+    const engine = new LocalEngineer(config(stateDirectory), store, 'owner_test', undefined, 30_000, 0);
+    store.add({ ...run('run_steer_settle_race', 'running', 0), workerThreadId: 'thread_test' });
+    const enqueue = store.enqueueSteer.bind(store);
+    vi.spyOn(store, 'enqueueSteer').mockImplementation((runId, message, fence) => {
+      store.setStatus(runId, 'ready_for_review');
+      return enqueue(runId, message, fence);
+    });
+    try {
+      await expect(engine.steer('run_steer_settle_race', 'Late correction')).rejects.toThrow('STEER_RUN_NOT_ACTIVE');
+      expect(store.get('run_steer_settle_race')?.steeringQueue).toBeUndefined();
+    } finally {
+      store.close();
+    }
+  });
+
+  it('marks steering uncertain when a run completes before its in-flight RPC returns, without logging delivery', async () => {
+    const stateDirectory = mkdtempSync(join(testTemporaryDirectory(), 'service-steer-complete-'));
+    const store = new RunStore(stateDirectory);
+    const engine = new LocalEngineer(config(stateDirectory), store, 'owner_test', undefined, 30_000, 0);
+    const current = {
+      ...run('run_steer_complete', 'running', 0),
+      workerThreadId: 'thread_test',
+      workerTurnId: 'turn_test',
+    };
+    store.add(current);
+    const adapter = {
+      steer: vi.fn().mockImplementation(async () => {
+        store.setStatus(current.runId, 'ready_for_review');
+      }),
+    };
+    (engine as unknown as { adapters: Map<string, unknown> }).adapters.set(current.agentId, adapter);
+    try {
+      await engine.steer(current.runId, 'Possibly delivered correction');
+      expect(adapter.steer).toHaveBeenCalledTimes(1);
+      const settled = store.get(current.runId)!;
+      expect(settled.status).toBe('ready_for_review');
+      expect(settled.steeringMessages?.[0]?.status).toBe('uncertain');
+      expect(settled.pendingSteer).toBeUndefined();
+      const rawPath = join(stateDirectory, 'runs', current.runId, 'harness', 'raw-events.jsonl');
+      expect(existsSync(rawPath)).toBe(false);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('enforces MutationFence on enqueueSteer and dequeueSteer', () => {
+    const stateDirectory = mkdtempSync(join(testTemporaryDirectory(), 'service-fence-'));
+    const store = new RunStore(stateDirectory);
+    const runId = 'run_fence_1';
+    store.add({
+      runId,
+      agentId: 'agt_fence_1',
+      ownerId: 'owner_a',
+      fenceToken: 5,
+      title: 'Fence Test',
+      task: 'Task',
+      workingDirectory: 'C:/work/example',
+      worker: 'local-container',
+      status: 'running',
+      continuationIndex: 0,
+      createdAt: '2026-07-22T00:00:00.000Z',
+      requiresUserAction: false,
+    });
+
+    const steerMsg = {
+      id: 'steer_1',
+      message: 'test direction',
+      status: 'pending' as const,
+      queuedAt: new Date().toISOString(),
+    };
+
+    // Mismatched owner fails
+    expect(() => store.enqueueSteer(runId, steerMsg, { ownerId: 'owner_wrong', expectedFenceToken: 5 })).toThrow(
+      'MUTATION_FENCE_OWNER_MISMATCH',
+    );
+
+    // Stale fence token fails
+    expect(() => store.enqueueSteer(runId, steerMsg, { ownerId: 'owner_a', expectedFenceToken: 4 })).toThrow(
+      'MUTATION_FENCE_TOKEN_MISMATCH',
+    );
+
+    // Correct fence succeeds and preserves fenceToken while advancing steeringVersion
+    const enqueued = store.enqueueSteer(runId, steerMsg, { ownerId: 'owner_a', expectedFenceToken: 5 });
+    expect(enqueued.fenceToken).toBe(5);
+    expect(enqueued.steeringVersion).toBe(1);
+    expect(enqueued.steeringQueue).toHaveLength(1);
+
+    // Claim steer before dequeue
+    const claim = store.claimNextSteer(runId, { ownerId: 'owner_a', expectedFenceToken: 5 });
+    expect(claim?.message.id).toBe('steer_1');
+    expect(claim?.fenceToken).toBe(5);
+
+    // Dequeue with stale token fails
+    expect(() =>
+      store.dequeueSteer(runId, 'steer_1', 'delivered', undefined, { ownerId: 'owner_a', expectedFenceToken: 4 }),
+    ).toThrow('MUTATION_FENCE_TOKEN_MISMATCH');
+
+    // Dequeue with correct token succeeds
+    const dequeued = store.dequeueSteer(runId, 'steer_1', 'delivered', undefined, {
+      ownerId: 'owner_a',
+      expectedFenceToken: 5,
+    });
+    expect(dequeued.fenceToken).toBe(5);
+    expect(dequeued.steeringVersion).toBe(3);
+    expect(dequeued.steeringMessages).toHaveLength(1);
+    expect(dequeued.steeringMessages?.[0]?.status).toBe('delivered');
+  });
+
+  it('fails closed and records failed status on adapter RPC failure without replaying', async () => {
+    const stateDirectory = mkdtempSync(join(testTemporaryDirectory(), 'service-rpc-fail-'));
+    const store = new RunStore(stateDirectory);
+    const cfg = config(stateDirectory);
+    cfg.security.allowed_roots = [stateDirectory];
+    const engine = new LocalEngineer(cfg, store, 'owner_test');
+
+    const runId = 'run_rpc_fail_1';
+    const agentId = 'agt_rpc_fail_1';
+    store.add({
+      runId,
+      agentId,
+      ownerId: 'owner_test',
+      fenceToken: 1,
+      title: 'RPC Fail Test',
+      task: 'Task',
+      workingDirectory: stateDirectory,
+      worker: 'local-container',
+      status: 'running',
+      workerThreadId: 'thread_1',
+      workerTurnId: 'turn_1',
+      continuationIndex: 0,
+      createdAt: '2026-07-22T00:00:00.000Z',
+      requiresUserAction: false,
+    });
+
+    const mockAdapter = {
+      steer: vi.fn().mockRejectedValue(new Error('adapter connection reset')),
+    };
+    (engine as unknown as { adapters: Map<string, unknown> }).adapters.set(agentId, mockAdapter);
+
+    await expect(engine.steer(runId, 'redirect agent')).rejects.toThrow('STEER_RPC_FAILED: adapter connection reset');
+
+    const updated = store.get(runId);
+    expect(updated?.steeringMessages).toHaveLength(1);
+    expect(updated?.steeringMessages?.[0]?.status).toBe('failed');
+    expect(updated?.steeringMessages?.[0]?.error).toContain('adapter connection reset');
+    expect(updated?.pendingSteer).toBeUndefined();
+  });
+
+  it('rejects steering when run is in recovery_required state', async () => {
+    const stateDirectory = mkdtempSync(join(testTemporaryDirectory(), 'service-rec-steer-'));
+    const store = new RunStore(stateDirectory);
+    const cfg = config(stateDirectory);
+    cfg.security.allowed_roots = [stateDirectory];
+    const engine = new LocalEngineer(cfg, store, 'owner_test');
+
+    const runId = 'run_rec_1';
+    store.add({
+      runId,
+      agentId: 'agt_rec_1',
+      ownerId: 'owner_test',
+      fenceToken: 1,
+      title: 'Recovery Test',
+      task: 'Task',
+      workingDirectory: stateDirectory,
+      worker: 'local-container',
+      status: 'recovery_required',
+      continuationIndex: 0,
+      createdAt: '2026-07-22T00:00:00.000Z',
+      requiresUserAction: true,
+    });
+
+    await expect(engine.steer(runId, 'hello')).rejects.toThrow('RUN_RECOVERY_REQUIRED');
+  });
+
+  it('drops stale dispatch and raw logging when fence advances while adapter RPC is in flight', async () => {
+    const stateDirectory = mkdtempSync(join(testTemporaryDirectory(), 'service-rpc-fence-'));
+    const store = new RunStore(stateDirectory);
+    const cfg = config(stateDirectory);
+    cfg.security.allowed_roots = [stateDirectory];
+    const engine = new LocalEngineer(cfg, store, 'owner_test');
+
+    const runId = 'run_fence_adv_1';
+    const agentId = 'agt_fence_adv_1';
+    store.add({
+      runId,
+      agentId,
+      ownerId: 'owner_test',
+      fenceToken: 1,
+      title: 'Fence Advance In Flight',
+      task: 'Task',
+      workingDirectory: stateDirectory,
+      worker: 'local-container',
+      status: 'running',
+      workerThreadId: 'thread_1',
+      workerTurnId: 'turn_1',
+      continuationIndex: 0,
+      createdAt: '2026-07-22T00:00:00.000Z',
+      requiresUserAction: false,
+    });
+
+    let resolveRpc!: () => void;
+    const rpcPromise = new Promise<void>((r) => {
+      resolveRpc = r;
+    });
+    const mockAdapter = {
+      steer: vi.fn().mockImplementation(async () => {
+        await rpcPromise;
+      }),
+    };
+    (engine as unknown as { adapters: Map<string, unknown> }).adapters.set(agentId, mockAdapter);
+
+    const steerPromise = engine.steer(runId, 'deferred msg');
+    await new Promise((r) => setTimeout(r, 25));
+
+    // Advance fence token from 1 to 2 while RPC is in flight
+    store.update(runId, { fenceToken: 2 }, 'test.bump_fence', {
+      ownerId: 'owner_test',
+      expectedFenceToken: 1,
+    });
+
+    resolveRpc();
+    await steerPromise;
+
+    const after = store.get(runId);
+    expect(after?.fenceToken).toBe(2);
+    // The steer message was claimed at fence 1 so finalizing at fence 1 was rejected.
+    // It must NOT be marked delivered under the new fence token.
+    expect(after?.steeringMessages?.find((m) => m.status === 'delivered')).toBeUndefined();
+    // Raw events must not contain the item/started log
+    const rawPath = join(stateDirectory, 'runs', runId, 'harness', 'raw-events.jsonl');
+    if (existsSync(rawPath)) {
+      expect(readFileSync(rawPath, 'utf8')).not.toContain('deferred msg');
+    }
+  });
+
+  it('stops without mutating or raw logging when owner changes while adapter RPC is in flight', async () => {
+    const stateDirectory = mkdtempSync(join(testTemporaryDirectory(), 'service-rpc-owner-'));
+    const store = new RunStore(stateDirectory);
+    const cfg = config(stateDirectory);
+    cfg.security.allowed_roots = [stateDirectory];
+    const engine = new LocalEngineer(cfg, store, 'owner_test');
+
+    const runId = 'run_owner_chg_1';
+    const agentId = 'agt_owner_chg_1';
+    store.add({
+      runId,
+      agentId,
+      ownerId: 'owner_test',
+      fenceToken: 1,
+      title: 'Owner Change In Flight',
+      task: 'Task',
+      workingDirectory: stateDirectory,
+      worker: 'local-container',
+      status: 'running',
+      workerThreadId: 'thread_1',
+      workerTurnId: 'turn_1',
+      continuationIndex: 0,
+      createdAt: '2026-07-22T00:00:00.000Z',
+      requiresUserAction: false,
+    });
+
+    let resolveRpc!: () => void;
+    const rpcPromise = new Promise<void>((r) => {
+      resolveRpc = r;
+    });
+    const mockAdapter = {
+      steer: vi.fn().mockImplementation(async () => {
+        await rpcPromise;
+      }),
+    };
+    (engine as unknown as { adapters: Map<string, unknown> }).adapters.set(agentId, mockAdapter);
+
+    const steerPromise = engine.steer(runId, 'msg for old owner');
+    await new Promise((r) => setTimeout(r, 25));
+
+    // Another process adopts the run
+    store.update(runId, { ownerId: 'owner_new', fenceToken: 2 }, 'test.adopt', {
+      expectedFenceToken: 1,
+    });
+
+    resolveRpc();
+    await steerPromise;
+
+    const after = store.get(runId);
+    expect(after?.ownerId).toBe('owner_new');
+    expect(after?.fenceToken).toBe(2);
+    expect(after?.steeringMessages?.find((m) => m.status === 'delivered')).toBeUndefined();
+    const rawPath = join(stateDirectory, 'runs', runId, 'harness', 'raw-events.jsonl');
+    if (existsSync(rawPath)) {
+      expect(readFileSync(rawPath, 'utf8')).not.toContain('msg for old owner');
+    }
+  });
+
+  it('preserves cancelled status and does not allow stale completion when cancelled while RPC in flight', async () => {
+    const stateDirectory = mkdtempSync(join(testTemporaryDirectory(), 'service-rpc-cancel-'));
+    const store = new RunStore(stateDirectory);
+    const cfg = config(stateDirectory);
+    cfg.security.allowed_roots = [stateDirectory];
+    const engine = new LocalEngineer(cfg, store, 'owner_test');
+
+    const runId = 'run_cancel_inflight_1';
+    const agentId = 'agt_cancel_inflight_1';
+    store.add({
+      runId,
+      agentId,
+      ownerId: 'owner_test',
+      fenceToken: 1,
+      title: 'Cancel In Flight',
+      task: 'Task',
+      workingDirectory: stateDirectory,
+      worker: 'local-container',
+      status: 'running',
+      workerThreadId: 'thread_1',
+      workerTurnId: 'turn_1',
+      continuationIndex: 0,
+      createdAt: '2026-07-22T00:00:00.000Z',
+      requiresUserAction: false,
+    });
+
+    let resolveRpc!: () => void;
+    const rpcPromise = new Promise<void>((r) => {
+      resolveRpc = r;
+    });
+    const mockAdapter = {
+      steer: vi.fn().mockImplementation(async () => {
+        await rpcPromise;
+      }),
+      interrupt: vi.fn().mockResolvedValue(undefined),
+      stop: vi.fn().mockResolvedValue(undefined),
+    };
+    (engine as unknown as { adapters: Map<string, unknown> }).adapters.set(agentId, mockAdapter);
+
+    const steerPromise = engine.steer(runId, 'msg to be cancelled');
+    await new Promise((r) => setTimeout(r, 25));
+
+    // Cancel the run while steer RPC is in flight
+    await engine.cancel(runId);
+
+    resolveRpc();
+    await steerPromise;
+
+    const after = store.get(runId);
+    expect(after?.status).toBe('cancelled');
+    // The steer item must be marked uncertain, never delivered
+    expect(after?.steeringMessages?.find((m) => m.status === 'delivered')).toBeUndefined();
+    const steerMsg = after?.steeringMessages?.find((m) => m.message === 'msg to be cancelled');
+    expect(steerMsg?.status).toBe('uncertain');
+    const rawPath = join(stateDirectory, 'runs', runId, 'harness', 'raw-events.jsonl');
+    if (existsSync(rawPath)) {
+      expect(readFileSync(rawPath, 'utf8')).not.toContain('msg to be cancelled');
+    }
+  });
+
+  it('does not automatically second-send on bookkeeping failure after successful RPC', async () => {
+    const stateDirectory = mkdtempSync(join(testTemporaryDirectory(), 'service-rpc-bk-fail-'));
+    const store = new RunStore(stateDirectory);
+    const cfg = config(stateDirectory);
+    cfg.security.allowed_roots = [stateDirectory];
+    const engine = new LocalEngineer(cfg, store, 'owner_test');
+
+    const runId = 'run_bk_fail_1';
+    const agentId = 'agt_bk_fail_1';
+    store.add({
+      runId,
+      agentId,
+      ownerId: 'owner_test',
+      fenceToken: 1,
+      title: 'Bookkeeping Fail Test',
+      task: 'Task',
+      workingDirectory: stateDirectory,
+      worker: 'local-container',
+      status: 'running',
+      workerThreadId: 'thread_1',
+      workerTurnId: 'turn_1',
+      continuationIndex: 0,
+      createdAt: '2026-07-22T00:00:00.000Z',
+      requiresUserAction: false,
+    });
+
+    const mockAdapter = {
+      steer: vi.fn().mockResolvedValue(undefined),
+    };
+    (engine as unknown as { adapters: Map<string, unknown> }).adapters.set(agentId, mockAdapter);
+
+    // Spy on finalizeSteerDispatch to throw
+    const originalFinalize = store.finalizeSteerDispatch.bind(store);
+    vi.spyOn(store, 'finalizeSteerDispatch').mockImplementation(() => {
+      throw new Error('DISK_IO_ERROR_DURING_FINALIZATION');
+    });
+
+    // Steer call must catch the error in dispatch and not replay
+    await engine.steer(runId, 'msg single dispatch');
+
+    expect(mockAdapter.steer).toHaveBeenCalledTimes(1);
+
+    // Restore spy
+    vi.spyOn(store, 'finalizeSteerDispatch').mockImplementation(originalFinalize);
+  });
+
+  it('preserves strict FIFO ordering across multiple queued steering messages', async () => {
+    const stateDirectory = mkdtempSync(join(testTemporaryDirectory(), 'service-fifo-steer-'));
+    const store = new RunStore(stateDirectory);
+    const cfg = config(stateDirectory);
+    cfg.security.allowed_roots = [stateDirectory];
+    const engine = new LocalEngineer(cfg, store, 'owner_test');
+
+    const runId = 'run_fifo_1';
+    const agentId = 'agt_fifo_1';
+    store.add({
+      runId,
+      agentId,
+      ownerId: 'owner_test',
+      fenceToken: 1,
+      title: 'FIFO Steer Test',
+      task: 'Task',
+      workingDirectory: stateDirectory,
+      worker: 'local-container',
+      status: 'running',
+      workerThreadId: 'thread_1',
+      workerTurnId: 'turn_1',
+      continuationIndex: 0,
+      createdAt: '2026-07-22T00:00:00.000Z',
+      requiresUserAction: false,
+    });
+
+    const received: string[] = [];
+    const mockAdapter = {
+      steer: vi.fn().mockImplementation(async (_th: string, _tu: string, msg: string) => {
+        received.push(msg);
+      }),
+    };
+    (engine as unknown as { adapters: Map<string, unknown> }).adapters.set(agentId, mockAdapter);
+
+    // Steer two messages in sequence
+    await engine.steer(runId, 'first message');
+    await engine.steer(runId, 'second message');
+
+    expect(received).toEqual(['first message', 'second message']);
+
+    const finalRun = store.get(runId);
+    expect(finalRun?.steeringMessages).toHaveLength(2);
+    expect(finalRun?.steeringMessages?.[0]?.message).toBe('first message');
+    expect(finalRun?.steeringMessages?.[0]?.status).toBe('delivered');
+    expect(finalRun?.pendingSteer).toBeUndefined();
+    expect(finalRun?.steeringQueue?.filter((m) => m.status === 'pending')).toHaveLength(0);
+  });
+
+  it('does not advance fence token when enqueueing steer during starting status', async () => {
+    const stateDirectory = mkdtempSync(join(testTemporaryDirectory(), 'service-start-steer-'));
+    const store = new RunStore(stateDirectory);
+    const cfg = config(stateDirectory);
+    cfg.security.allowed_roots = [stateDirectory];
+    const engine = new LocalEngineer(cfg, store, 'owner_test');
+
+    const runId = 'run_start_steer_1';
+    const agentId = 'agt_start_steer_1';
+    store.add({
+      runId,
+      agentId,
+      ownerId: 'owner_test',
+      fenceToken: 3,
+      title: 'Starting Steer Test',
+      task: 'Task',
+      workingDirectory: stateDirectory,
+      worker: 'local-container',
+      status: 'starting',
+      continuationIndex: 0,
+      createdAt: '2026-07-22T00:00:00.000Z',
+      requiresUserAction: false,
+    });
+
+    await engine.steer(runId, 'message enqueued during startup');
+
+    const updated = store.get(runId);
+    expect(updated?.status).toBe('starting');
+    expect(updated?.fenceToken).toBe(3);
+    expect(updated?.steeringVersion).toBe(1);
+    expect(updated?.steeringQueue).toHaveLength(1);
+    expect(updated?.steeringQueue?.[0]?.message).toBe('message enqueued during startup');
+    expect(updated?.steeringQueue?.[0]?.status).toBe('pending');
+  });
+
+  it('preserves live command activity and counters updated while steer RPC is in flight', async () => {
+    const stateDirectory = mkdtempSync(join(testTemporaryDirectory(), 'service-rpc-diag-'));
+    const store = new RunStore(stateDirectory);
+    const cfg = config(stateDirectory);
+    cfg.security.allowed_roots = [stateDirectory];
+    const engine = new LocalEngineer(cfg, store, 'owner_test');
+
+    const runId = 'run_diag_inflight_1';
+    const agentId = 'agt_diag_inflight_1';
+    store.add({
+      runId,
+      agentId,
+      ownerId: 'owner_test',
+      fenceToken: 1,
+      title: 'Diagnostics In Flight',
+      task: 'Task',
+      workingDirectory: stateDirectory,
+      worker: 'local-container',
+      status: 'running',
+      workerThreadId: 'thread_1',
+      workerTurnId: 'turn_1',
+      continuationIndex: 0,
+      createdAt: '2026-07-22T00:00:00.000Z',
+      requiresUserAction: false,
+      diagnostics: {
+        last_phase: 'running',
+        last_activity_at: '2026-07-22T00:00:00.000Z',
+        commands_active_count: 1,
+        commands_completed_count: 0,
+      },
+    });
+
+    let resolveRpc!: () => void;
+    const rpcPromise = new Promise<void>((r) => {
+      resolveRpc = r;
+    });
+    const mockAdapter = {
+      steer: vi.fn().mockImplementation(async () => {
+        await rpcPromise;
+      }),
+    };
+    (engine as unknown as { adapters: Map<string, unknown> }).adapters.set(agentId, mockAdapter);
+
+    const steerPromise = engine.steer(runId, 'steer with concurrent worker progress');
+    await new Promise((r) => setTimeout(r, 25));
+
+    // While RPC is in flight, worker completes a command and updates diagnostics in the store
+    const currentRun = store.get(runId)!;
+    store.update(
+      runId,
+      {
+        diagnostics: {
+          ...currentRun.diagnostics,
+          commands_active_count: 0,
+          commands_completed_count: 42,
+          last_tool: 'bash',
+        },
+      },
+      'worker.command_completed',
+      { ownerId: 'owner_test', expectedFenceToken: 1 },
+    );
+
+    resolveRpc();
+    await steerPromise;
+
+    const after = store.get(runId);
+    expect(after?.status).toBe('running');
+    expect(after?.fenceToken).toBe(1);
+    expect(after?.diagnostics?.last_phase).toBe('steered');
+    expect(after?.diagnostics?.commands_completed_count).toBe(42);
+    expect(after?.diagnostics?.commands_active_count).toBe(0);
+    expect(after?.diagnostics?.last_tool).toBe('bash');
   });
 });

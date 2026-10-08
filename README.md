@@ -191,10 +191,15 @@ When the `local_engineer_*` MCP tools are available, ALWAYS use configured Local
   disposable container and its network policy: model requests use the
   fixed-target relay, and only explicitly configured dependency hosts receive
   `GET`, `HEAD`, or `OPTIONS` through the limited proxy.
-- Tell workers to keep temporary dependency state in
-  `LOCAL_ENGINEER_DEPENDENCY_ROOT`, never in the repository. Generated
-  dependency paths are excluded from review and cannot be promoted; do not
-  treat that exclusion as authorization to write arbitrary files there.
+- In default `read-only` dependency mode, tell workers to keep temporary dependency state in
+  `LOCAL_ENGINEER_DEPENDENCY_ROOT`, never in the repository. In `private-install` mode,
+  workers may install dependencies into agent-owned disposable named volumes mounted at
+  designated install roots (`node_modules`) on writable repositories, while global/package
+  caches remain outside the repository (with the narrow exception of `npm_config_store_dir`
+  pre-configured inside the disposable `node_modules` volume on Windows to satisfy pnpm store
+  locality without elevated privileges). Generated dependency paths are excluded from review
+  and cannot be promoted; do not treat that exclusion as authorization to write arbitrary files there.
+- Under Windows `isolated-bind` environments, file-system-sensitive databases (such as workerd SQLite runtime state) encounter fatal disk I/O errors (`SQLITE_IOERR`) when stored on the repository bind mount; direct persistent state to an agent-specific subdirectory of `LOCAL_ENGINEER_DEPENDENCY_ROOT` via `--persist-to`. Long package installations must be bounded with explicit native exit code checks. Background process cleanup must track and terminate only the specific spawned process PID and its descendants; never terminate all Node or workerd processes, which breaks the container MCP file tools server.
 - If `local_engineer_start` reports a missing or stale image profile, do not
   silently fall back. Plan it first, show the user the exact dependency inputs
   and read-only domains, and build only with explicit approval.
@@ -331,9 +336,15 @@ worker also receives an agent-scoped writable dependency volume
 at `$LOCAL_ENGINEER_DEPENDENCY_ROOT`, outside every repository. Python
 virtual environments and package caches belong there when pre-existing
 dependencies are missing or incompatible. Local Engineer excludes its managed
-dependency paths from Git capture as a backstop, so generated package trees such
-as `.local-pkgs`, `.venv`, and `node_modules` cannot inflate a review patch or be
-promoted accidentally.
+dependency directories from git status, review diffs, and promotion so generated
+artifacts cannot be promoted accidentally.
+
+#### Dependency Modes
+
+Local Engineer supports two dependency modes configurable via `default_dependency_mode` (in configuration) or per-run `dependency_mode` in `local_engineer_start`:
+
+- **`read-only` (default)**: Fast, secure dependency sharing. Discovered host dependency directories (`node_modules`) are mounted read-only into worker containers. Workers cannot mutate host dependencies or install packages directly into the repository.
+- **`private-install`**: Disposable, isolated in-container package installations supported across Linux, Windows `isolated-bind`, and Windows `volume-copy` workspace modes. For writable repositories, agent-owned disposable container volumes are mounted at authorized install roots (`node_modules`). Workers can run `pnpm install`, `pnpm add`, or `npm install` without elevation; package managers install into disposable container storage and update `package.json`/lockfiles. Global tool and package caches remain outside repositories in `$LOCAL_ENGINEER_DEPENDENCY_ROOT` (with the narrow exception of `npm_config_store_dir` pre-configured inside the disposable `node_modules` volume on Windows to satisfy pnpm store locality without elevated privileges). Under Windows `isolated-bind` environments, file-system-sensitive databases (such as workerd SQLite runtime state) encounter fatal disk I/O errors (`SQLITE_IOERR`) when stored on the repository bind mount; direct persistent state to an agent-specific subdirectory of `$LOCAL_ENGINEER_DEPENDENCY_ROOT` via `--persist-to`. Long package installations must be bounded with explicit native exit code checks. Background process cleanup must track and terminate only the specific spawned process PID and its descendants; never terminate all Node or workerd processes, which breaks the container MCP file tools server. All managed dependency directories (`node_modules`, `.pnpm-store`, `.venv`, `.local-pkgs`, `.local-engineer-dependencies`, `__pypackages__`) at any directory depth are strictly excluded from staging, review diffs, and host promotion.
 
 ### 2. Create an isolated worker
 
@@ -724,13 +735,28 @@ workers:
     container_model_provider:
       base_url: https://model-provider.example/v1
       wire_api: responses
+      # Optional compatibility adapter for model endpoints (e.g. GLM, vLLM, Ollama)
+      # that do not support Codex v1/responses namespace tool wrappers.
+      # Supported: 'standard' (default) or 'flatten_namespaces'.
+      wire_api_compatibility: flatten_namespaces
       api_key_environment_variable: LOCAL_MODEL_API_KEY
       requires_openai_auth: false
+    # Optional path to host model catalog JSON file defining custom models/capabilities.
+    # Copied into the ephemeral worker configuration volume.
+    # Windows: C:\secure\models.json; Linux: /etc/local-engineer/models.json
+    model_catalog_json_file: C:\secure\models.json
     environment_from_host: [LOCAL_MODEL_API_KEY]
+    auto_compact_token_limit: 120000
     max_concurrency: 2
     timeout_seconds: 3600
     idle_timeout_seconds: 600
 ```
+
+`auto_compact_token_limit` configures the token threshold at which Codex triggers context compaction. Local Engineer safely injects this as the root-level `model_auto_compact_token_limit` key in generated or custom Codex configs, validated under `codex --strict-config`.
+
+In default standard mode (`wire_api_compatibility: standard`), the relay streams requests and responses directly through as a lightweight passthrough without buffering. `wire_api_compatibility: flatten_namespaces` enables transparent compatibility with local inference engines (such as GLM-5.3-Flash, vLLM, or Ollama) that do not support Codex `v1/responses` namespace tool wrappers. When enabled for `/v1/responses`, requests and responses pass through bounded transformation buffers; the model relay sidecar flattens namespaced tools (e.g., `mcp__file_tools/read_file` -> `mcp__file_tools__ns__read_file`) on outbound requests, rewrites `tool_choice` and conversation history, and unrolls tool calls in responses and SSE event streams back to their expected namespace format. If the upstream model emits an unrecognized tool alias, the relay fails closed: returning generic HTTP 502 (`upstream_error`) before response headers are sent, or abruptly terminating/aborting established SSE streams after headers have been sent, ensuring unmapped or corrupt tool calls are never forwarded. In `flatten_namespaces` mode, tools must use standard function tool definitions; custom tool formats and web search inside namespaces are rejected with HTTP 400.
+
+`model_catalog_json_file` points to an optional trusted host JSON file defining custom model catalog entries and capabilities (e.g. `function_calling`, context limits). It is copied into the worker configuration directory. When used with `wire_api_compatibility: flatten_namespaces`, models must define function tools rather than custom or search tool shapes.
 
 To copy additional trusted Codex settings:
 
@@ -858,6 +884,7 @@ Restart Codex completely after changing MCP registration.
 | `local_engineer_build_image`         | Plan, then explicitly build, a reusable project dependency image profile.                      |
 | `local_engineer_wait_for_completion` | Wait for one or many runs with `all` or `any` semantics.                                       |
 | `local_engineer_status`              | Read bounded state for retained opaque run or agent IDs.                                       |
+| `local_engineer_summarize_run`       | Generate an advisory summary of run history, command blockers, and changed files.             |
 | `local_engineer_list`                | List recent owned runs; use `active_only: true` to hide terminal history.                      |
 | `local_engineer_cancel`              | Cancel a queued or active run.                                                                 |
 | `local_engineer_reply`               | Continue the same private session from `ready_for_review`.                                     |
@@ -872,11 +899,34 @@ and `timeout_seconds: 300`, inspect the settled result, then continue useful
 parent work between waits. `local_engineer_status` is a non-blocking snapshot,
 not a polling loop.
 
+### Run Summarization (`local_engineer_summarize_run`)
+
+`local_engineer_summarize_run` provides an advisory summary of a container run, analyzing command executions, failures, changed files, and duration using the configured model provider or deterministic fallback. The trusted host control plane sends bounded stored run evidence directly to the configured model endpoint (not through the worker dependency proxy). All model-generated summary content is advisory and untrusted. Deterministic execution metrics (`commands_count`, `failed_commands_count`, `key_blockers`, `files_changed`, `duration_seconds`) are computed separately and returned alongside the summary. When stream processing limits or file read errors occur, `history_truncated: true` is returned, and command and failure metrics represent observed lower bounds rather than total counts.
+
 Run listing is private to the current MCP connection. Retain the opaque
 `run_id` and `agent_id` returned by `local_engineer_start`: an exact handle is
 a recovery capability for that one retained agent. This lets the creating
 parent continue review, follow-ups, promotion, or deletion when Codex replaces
 the STDIO MCP process, without exposing other agents through broad listing.
+
+### Container-Internal File Tools MCP Server
+
+Inside each worker container, Local Engineer registers a dedicated internal MCP server named `file_tools` (`[mcp_servers.file_tools]`) executing directly via absolute Node runtime (`C:/Node/node.exe` on Windows, `/usr/local/bin/node` on Linux) with immutable script placement (`C:/local-engineer/file-tools-server.mjs` on Windows, `/usr/local/lib/local-engineer/file-tools-server.mjs` on Linux). This provides workers with safe, deterministic primitives for workspace inspection and modification:
+
+| Tool | Description & Guarantees |
+| :--- | :--- |
+| `read_file` | Reads exact raw text slices (preserving exact text and line endings as UTF-8) and returns line metadata in `structuredContent`. Note: decodes content as UTF-8; non-UTF-8 encodings or binary files containing null bytes are not decoded as raw arbitrary bytes. Records freshness hashes and observed character/line ranges in the session read state. |
+| `edit_file` | Performs exact unique string replacement in previously read, fresh files. Enforces that edits fall wholly within observed ranges from prior reads (or requires complete file reads), handles CRLF/LF normalization, and updates read state atomically. |
+| `write_file` | Atomically creates new files or replaces completely read files using same-directory temporary files with automatic rollback on failure. Rejects partial reads or stale files. |
+| `delete_file` | Deletes a regular file within workspace boundaries. Requires a prior complete fresh read of the exact file during the session, using same-directory backup renaming with rollback protection on failure. Directory deletion is forbidden. |
+| `move_file` | Relocates regular files within workspace boundaries. Requires source freshness and destination freshness (if overwriting), using backup files with automatic rollback on failure. |
+| `copy_file` | Copies regular files within workspace boundaries with destination backup and rollback protection. |
+| `grep_files` | Fast workspace file search with literal substring matching by default and safe, timeout-bounded regex matching (terminating ReDoS patterns within 200ms). Enforces strict limits on max results, file size, and scanned bytes. |
+| `list_dir` | Traverses workspace directory trees up to bounded depths without shell command execution. |
+
+All operations strictly enforce workspace path confinement, fail closed on missing roots, reject symbolic links and NTFS junction points across all path components, and block access to `.git` repository metadata.
+
+Hard 10 MB (10,485,760 bytes) UTF-8 byte limits are enforced for write content, replacement strings, and final post-edit file sizes, preventing multibyte Unicode expansion bypasses. If a backup cleanup or rollback operation cannot be completed, an explicit error is emitted detailing the recovery path. Retained recovery artifacts remain visible in workspace tools and block host Git capture, ensuring failed mutations require human operator review and cannot be silently promoted.
 
 ## Review and promotion
 
@@ -944,7 +994,7 @@ local-engineer stats --since 7d `
   --baseline-parent-tokens 120000 `
   --delegated-parent-tokens 42000
 
-# Start the read-only localhost web monitor and open the default browser
+# Start the localhost web monitor and open the default browser
 local-engineer monitor
 
 # Bind a specific port on 127.0.0.1 without launching the browser
@@ -954,9 +1004,9 @@ local-engineer monitor --port 9000 --no-open
 The CLI intentionally has no session-resume command. Container workers are
 managed through their MCP lifecycle and review operations.
 
-`local-engineer monitor` starts a read-only localhost web interface that
-auto-refreshes a bounded, safe view of recent agent runs. It binds strictly to
-127.0.0.1, prints the URL it is serving, and opens the default browser unless
+`local-engineer monitor` starts a localhost web interface that provides live
+observability and interactive steering for recent agent runs. It binds strictly
+to 127.0.0.1, prints the URL it is serving, and opens the default browser unless
 `--no-open` is supplied. `--port <1-65535>` is strictly validated and defaults
 to 8899. The process runs until interrupted. See "Monitor web UI" under
 Observability for the security boundary.
@@ -994,57 +1044,67 @@ default). One previous file is retained.
 
 MCP projections include bounded lifecycle phases, timestamps, command counts,
 failure excerpts, structured report status, and captured change-set metadata.
-They exclude private Codex IDs, raw events, successful command output,
-credentials, and host artifact paths.
+Default projections strictly withhold internal container IDs, private tokens,
+and raw event streams, while scoped worker inspection tools (`read_message`,
+`get_file`, `get_diff`, `summarize_run`) intentionally return bounded,
+worker-derived content under explicit size limits.
 
 ### Monitor web UI
 
-`local-engineer monitor` renders the same bounded, read-only view on a localhost
-web page. The page auto-refreshes every few seconds against a single bounded
-JSON endpoint (`/api/runs`) and clearly distinguishes active, review, and
-terminal runs. It shows run and agent handles, title, worker, timestamps and
-activity, safe diagnostics, a structured result summary with verification and
-change counts, and delegation/token impact when present.
+`local-engineer monitor` renders a live observability and operator interface on
+a localhost web page. The page auto-refreshes against bounded JSON endpoints,
+distinguishes active, review, and terminal runs, streams live event timelines,
+renders exact unified diffs, and provides interactive steering capability.
 
-The monitor is deliberately read-only and local-only:
+The monitor operates under an intentional localhost operator capability model:
 
-- It binds strictly to 127.0.0.1 and offers no `--host` option.
-- Only `GET` and `HEAD` are accepted; all other methods receive `405` with an
-  `Allow` header. There are no cancel, reply, promotion, deletion, or raw-log
-  endpoints.
-- The projection never exposes owner IDs, the original task or grounding
-  payloads, host or container paths, Codex thread/turn IDs, environment or
-  configuration values, writer-state metadata, or raw event logs. Command
-  failure excerpts are excluded.
-- The page is self-contained local HTML/CSS/JS with no CDN or network assets;
-  it has an explicit empty state and a visible unreachable/error state.
-- The CLI keeps running until interrupted, so it is safe for short-lived
-  inspection and should be stopped when no longer needed.
+- **Loopback Authority & DNS Rebinding Protection**: Binds strictly to
+  `127.0.0.1` and offers no foreign `--host` option. Every incoming HTTP request
+  validates the `Host` authority against the exact loopback listener and port (rejecting
+  missing ports when port != 80), rejecting foreign hostnames (`403 Forbidden`) and DNS-rebinding probes.
+- **Origin & Fetch Metadata Validation**: Cross-site fetch metadata (`Sec-Fetch-Site:
+  cross-site`), foreign origins, and `null` origins are strictly rejected with
+  `403 Forbidden` before reading state or body payloads.
+- **CSRF Token Mutation & Content-Type Protection**: State-changing endpoints (such as
+  `POST /api/runs/:id/steer`) strictly require exact `Content-Type: application/json`
+  (rejecting `application/jsonp`) and a per-server cryptographically random
+  `X-CSRF-Token` capability token injected directly into same-origin HTML `<meta name="csrf-token">`.
+- **Safe DOM Rendering & Content Isolation**: Raw model outputs and worker logs
+  are treated as untrusted. Content is HTML-escaped (`esc()`) before markdown
+  formatting; DOM nodes are constructed via safe DOM APIs rather than
+  unconstrained `innerHTML` attribute interpolations; event handlers use
+  programmatic listeners without inline scripts; and dynamic item IDs are
+  sanitized via injective character escaping (`safeDomId`), guaranteeing no
+  collisions between distinct IDs. The Content-Security-Policy prohibits
+  external CDN assets.
+- **Bounded Ingestion, LRU Cache & Limits**: Raw-event log ingestion performs
+  bounded synchronous chunked reading (64 KiB chunks via `openSync`/`readSync`, 64 KiB line limit,
+  50 MiB file scan cap, 50,000 maximum events) with `StringDecoder` multibyte UTF-8 boundary preservation.
+  Oversized lines enter a discarding state to prevent forged command injection; trailing partial records
+  without newlines at EOF are discarded. An in-memory LRU cache (`RunStore.timelineCache`) caches up to 10
+  parsed timelines within a 20 MiB conservative UTF-16 budget, bypassing caching for oversized entries.
+  Per-command output is capped at 64 KiB, paginated timeline responses are capped at 2 MiB, query offsets
+  and limits are strictly validated with safe-integer checks, and diff reads are capped at 10 MiB per repository
+  and 20 MiB aggregate while preserving per-repo summaries.
+- **Atomic Fenced Steering Delivery**: Operator steer submissions enqueue into an
+  atomic FIFO queue with `MutationFence` validation, advancing a separate `steeringVersion` to reserve
+  `fenceToken` strictly for generation/owner changes. Background dispatch claims pending items atomically
+  (`pending -> dispatching`). Single-transaction dispatch finalization (`finalizeSteerDispatch`) re-validates
+  fence, status, thread, turn, and dispatch claim inside `BEGIN IMMEDIATE`, updating queue/history and appending
+  raw events/stderr while holding the write lock. `BEGIN IMMEDIATE` guarantees mutual exclusion across the database
+  and raw logs without claiming cross-filesystem rollback atomicity; reconciled orphan dispatches are classified
+  as `'uncertain'` without replaying.
+- **Exact Revision Isolation**: Diff views strictly isolate the requested
+  change-set revision and never fall back to newer or older revision patch
+  directories. Missing exact-revision patches return marked unavailable placeholders
+  (`patch_type: 'unavailable'`) rather than failing the endpoint. Multi-repository filenames preserve repository identity.
 
-The monitor drives both views through server-side pagination. `GET /api/runs`
+The monitor drives views through server-side pagination. `GET /api/runs`
 returns runs newest-first in pages (default 25, hard maximum 100) with an opaque
-`next_cursor` and a `has_more` flag; the page keeps a small previous-cursor stack
-so Previous/Next navigation never re-fetches the whole history. Run ordering is
-`createdAt` descending with `run_id` as a deterministic tie-breaker. Invalid
-limits or cursors fail closed with a safe `400` rather than silently broadening
-the request.
-
-Assistant messages are available read-only at
-`GET /api/runs/:run_id/messages`. The store persists only completed
-`agentMessage` text into a dedicated table as the MCP server processes it; it
-does not source messages from prompts, reasoning, command execution, tool output,
-or raw event logs, and it never exposes thread/turn IDs or internal item IDs.
-Assistant-message text is still untrusted model output and may repeat task or
-repository content, so keep the localhost monitor and its host appropriately
-secured. Messages are bounded
-(per-message text and per-run count), returned newest-first with the same opaque
-cursor pagination, and include only a timestamp, the text, and a `truncated`
-flag.
-
-Message capture begins only after the updated MCP server restarts. The monitor
-never scans or parses historical raw-event files, so runs that finished before
-the restart have no assistant messages even though their structured result
-summaries, change sets, and diagnostics remain available.
+`next_cursor` and a `has_more` flag. Assistant messages are available at
+`GET /api/runs/:run_id/messages`, and live session activity is available at
+`GET /api/runs/:run_id/timeline` with tail pagination that preserves prior
+scroll and expansion state.
 
 ### Token accounting
 

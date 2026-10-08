@@ -5,12 +5,14 @@ import {
   type Server,
   type ServerResponse,
 } from 'node:http';
+import { randomBytes } from 'node:crypto';
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import type { Run, RunStatus } from './domain.js';
 import type { RunStore, TimelineItem } from './store.js';
+import type { LocalEngineer } from './service.js';
 
 export const DEFAULT_PORT = 8899;
 export const MAX_RUNS = 200;
@@ -65,7 +67,7 @@ export function monitorUsage(): string {
   return [
     'Usage: local-engineer monitor [options]',
     '',
-    'Start a read-only localhost web interface for observing Local Engineer agent runs.',
+    'Start a localhost web interface for observing and steering Local Engineer agent runs.',
     '',
     'Options:',
     '  --port <1-65535>   Port to bind on 127.0.0.1 (default 8899)',
@@ -140,6 +142,13 @@ export interface ProjectedRun {
     parent_visible_review_tokens_estimate: number;
     estimated_savings_tokens: number;
   };
+  steering?: {
+    pending_count: number;
+    dispatching_count: number;
+    delivered_count: number;
+    failed_count: number;
+    last_status?: string;
+  };
 }
 
 export interface MonitorSnapshot {
@@ -172,6 +181,9 @@ export interface MonitorTimelineResponse {
   run_id: string;
   active: boolean;
   count: number;
+  total?: number;
+  has_more?: boolean;
+  history_truncated?: boolean;
   items: TimelineItem[];
 }
 
@@ -229,6 +241,16 @@ export function projectRun(run: Run): ProjectedRun {
   if (changeSet) projected.change_set = changeSet;
   const delegation = projectDelegation(run);
   if (delegation) projected.delegation_impact = delegation;
+  if (run.steeringMessages && run.steeringMessages.length > 0) {
+    const queue = run.steeringQueue ?? [];
+    projected.steering = {
+      pending_count: queue.filter((m) => m.status === 'pending').length,
+      dispatching_count: queue.filter((m) => m.status === 'dispatching').length,
+      delivered_count: run.steeringMessages.filter((m) => m.status === 'delivered').length,
+      failed_count: run.steeringMessages.filter((m) => m.status === 'failed').length,
+      last_status: run.steeringMessages.at(-1)?.status,
+    };
+  }
   return projected;
 }
 
@@ -331,9 +353,13 @@ let cachedHtml: string | undefined;
 function monitorHtmlPath(): string {
   return resolve(dirname(fileURLToPath(import.meta.url)), '..', 'assets', 'monitor.html');
 }
-export function monitorHtml(): string {
+export function monitorHtml(csrfToken?: string): string {
   if (cachedHtml === undefined) cachedHtml = readFileSync(monitorHtmlPath(), 'utf8');
-  return cachedHtml;
+  if (!csrfToken) return cachedHtml;
+  if (cachedHtml.includes('<meta name="csrf-token" content="">')) {
+    return cachedHtml.replace('<meta name="csrf-token" content="">', `<meta name="csrf-token" content="${csrfToken}">`);
+  }
+  return cachedHtml.replace('<head>', `<head>\n    <meta name="csrf-token" content="${csrfToken}">`);
 }
 
 const BASE_SECURITY_HEADERS: OutgoingHttpHeaders = {
@@ -375,18 +401,145 @@ function sendText(response: ServerResponse, statusCode: number, body: string, he
   response.end(head ? undefined : body);
 }
 
+export interface MonitorRequestContext {
+  csrfToken?: string;
+  port?: number;
+}
+
+export function generateCsrfToken(): string {
+  return randomBytes(24).toString('hex');
+}
+
+export function isAllowedLoopbackHost(hostHeader: string | undefined, expectedPort?: number): boolean {
+  if (!hostHeader) return false;
+  let hostname = hostHeader;
+  let port: string | undefined;
+
+  if (hostHeader.startsWith('[')) {
+    const closeBracket = hostHeader.indexOf(']');
+    if (closeBracket === -1) return false;
+    hostname = hostHeader.slice(0, closeBracket + 1);
+    if (hostHeader.length > closeBracket + 1) {
+      if (hostHeader[closeBracket + 1] !== ':') return false;
+      port = hostHeader.slice(closeBracket + 2);
+    }
+  } else {
+    const colonIndex = hostHeader.lastIndexOf(':');
+    if (colonIndex !== -1) {
+      hostname = hostHeader.slice(0, colonIndex);
+      port = hostHeader.slice(colonIndex + 1);
+    }
+  }
+
+  const allowedHosts = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
+  if (!allowedHosts.has(hostname.toLowerCase())) {
+    return false;
+  }
+
+  if (expectedPort !== undefined && expectedPort > 0) {
+    if (port !== undefined) {
+      if (!/^\d+$/.test(port)) return false;
+      const portNum = Number(port);
+      if (portNum < 1 || portNum > 65535) return false;
+      if (portNum !== expectedPort) return false;
+    } else {
+      if (expectedPort !== 80 && expectedPort !== 443) {
+        return false;
+      }
+    }
+  } else if (port !== undefined) {
+    if (!/^\d+$/.test(port)) return false;
+    const portNum = Number(port);
+    if (portNum < 1 || portNum > 65535) return false;
+  }
+  return true;
+}
+
+export function isAllowedLoopbackOrigin(originHeader: string | undefined, expectedPort?: number): boolean {
+  if (!originHeader) return true;
+  if (originHeader === 'null') return false;
+  try {
+    const parsed = new URL(originHeader);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+    const allowedHostnames = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
+    if (!allowedHostnames.has(parsed.hostname.toLowerCase())) return false;
+    if (expectedPort !== undefined && expectedPort > 0) {
+      const originPort = parsed.port ? Number(parsed.port) : parsed.protocol === 'https:' ? 443 : 80;
+      if (originPort !== expectedPort) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export interface MonitorServer {
   server: Server;
   url: string;
+  csrfToken: string;
+}
+
+export async function steerAgent(
+  store: RunStore,
+  runId: string,
+  message: string,
+  service?: LocalEngineer,
+): Promise<{
+  success: boolean;
+  run_id: string;
+  agent_id: string;
+  status: string;
+  steered_in_flight: boolean;
+  delivery_status: 'delivered' | 'queued' | 'continued' | 'uncertain';
+}> {
+  if (!service) {
+    throw new Error('MONITOR_STEERING_UNAVAILABLE');
+  }
+  const cleanMessage = message.trim();
+  if (!cleanMessage) {
+    throw new Error('STEER_MESSAGE_EMPTY');
+  }
+  const run = store.get(runId);
+  if (!run) {
+    throw new Error('RUN_NOT_FOUND');
+  }
+
+  const steered = await service.steer(run.runId, cleanMessage);
+  const updatedRun = store.get(runId);
+  const lastMsg = updatedRun?.steeringMessages?.at(-1);
+  if (steered.run_id === run.runId && lastMsg?.status === 'failed') {
+    throw new Error('STEER_RPC_FAILED');
+  }
+  const deliveryStatus: 'delivered' | 'queued' | 'continued' | 'uncertain' =
+    steered.run_id !== run.runId
+      ? 'continued'
+      : lastMsg?.status === 'delivered'
+        ? 'delivered'
+        : lastMsg?.status === 'uncertain'
+          ? 'uncertain'
+          : 'queued';
+
+  return {
+    success: true,
+    run_id: steered.run_id,
+    agent_id: steered.agent_id,
+    status: steered.status,
+    steered_in_flight: steered.run_id === run.runId,
+    delivery_status: deliveryStatus,
+  };
 }
 
 export function createMonitorServer(
   store: RunStore,
   options: MonitorOptions = { port: DEFAULT_PORT, open: false, help: false },
+  service?: LocalEngineer,
 ): MonitorServer {
+  const csrfToken = generateCsrfToken();
   const server = createServer((request, response) => {
     try {
-      handleRequest(store, request, response);
+      const address = server.address();
+      const actualPort = typeof address === 'object' && address ? address.port : options.port;
+      void handleRequest(store, request, response, service, { csrfToken, port: actualPort });
     } catch {
       if (!response.headersSent) {
         sendText(response, 500, 'Internal Server Error\n', (request.method ?? 'GET').toUpperCase() === 'HEAD');
@@ -396,12 +549,146 @@ export function createMonitorServer(
     }
   });
   const url = `http://127.0.0.1:${options.port}/`;
-  return { server, url };
+  return { server, url, csrfToken };
 }
 
-export function handleRequest(store: RunStore, request: IncomingMessage, response: ServerResponse): void {
+export function handleRequest(
+  store: RunStore,
+  request: IncomingMessage,
+  response: ServerResponse,
+  service?: LocalEngineer,
+  context?: MonitorRequestContext,
+): void {
   const method = (request.method ?? 'GET').toUpperCase();
-  const url = new URL(request.url ?? '/', 'http://127.0.0.1');
+  const host = request.headers.host;
+  if (!host) {
+    sendText(response, 400, 'Bad Request: Missing Host header\n', method === 'HEAD');
+    return;
+  }
+  if (!isAllowedLoopbackHost(host, context?.port)) {
+    sendText(response, 403, 'Forbidden: Invalid Host authority\n', method === 'HEAD');
+    return;
+  }
+
+  const secFetchSite = request.headers['sec-fetch-site'];
+  if (typeof secFetchSite === 'string' && secFetchSite.toLowerCase() === 'cross-site') {
+    sendText(response, 403, 'Forbidden: Cross-site request rejected\n', method === 'HEAD');
+    return;
+  }
+
+  const origin = request.headers.origin;
+  if (origin !== undefined && !isAllowedLoopbackOrigin(origin, context?.port)) {
+    sendText(response, 403, 'Forbidden: Cross-origin request rejected\n', method === 'HEAD');
+    return;
+  }
+
+  const url = new URL(request.url ?? '/', `http://${host}`);
+
+  const steerMatch = /^\/api\/runs\/([^/]+)\/steer$/.exec(url.pathname);
+  if (steerMatch) {
+    if (method !== 'POST') {
+      response.writeHead(
+        405,
+        responseHeaders('text/plain; charset=utf-8', Buffer.byteLength('Method Not Allowed\n'), {
+          Allow: 'POST',
+        }),
+      );
+      response.end('Method Not Allowed\n');
+      return;
+    }
+
+    const rawContentType = request.headers['content-type'];
+    const mimeType = rawContentType?.split(';')[0]?.trim().toLowerCase();
+    if (mimeType !== 'application/json') {
+      sendText(response, 415, 'Unsupported Media Type: Content-Type must be application/json\n', false);
+      return;
+    }
+
+    const clientToken = request.headers['x-csrf-token'];
+    if (!context?.csrfToken || !clientToken || clientToken !== context.csrfToken) {
+      sendJson(response, 403, { error: 'Forbidden: Invalid or missing CSRF token' });
+      return;
+    }
+
+    const runHandle = steerMatch[1]!;
+    if (!RUN_HANDLE.test(runHandle) || !store.hasRun(runHandle)) {
+      sendText(response, 404, 'Not Found\n', false);
+      return;
+    }
+    if (!service) {
+      sendJson(response, 503, { error: 'Steering unavailable: monitor running without service access' });
+      return;
+    }
+
+    const chunks: Buffer[] = [];
+    let receivedBytes = 0;
+    const MAX_STEER_BODY_BYTES = 64 * 1024;
+    let payloadExceeded = false;
+
+    request.on('data', (chunk: Buffer) => {
+      receivedBytes += chunk.length;
+      if (receivedBytes > MAX_STEER_BODY_BYTES) {
+        payloadExceeded = true;
+        request.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+
+    request.on('end', async () => {
+      if (payloadExceeded) {
+        sendJson(response, 413, { error: 'Payload Too Large' });
+        return;
+      }
+      try {
+        const bodyStr = Buffer.concat(chunks).toString('utf8');
+        let payload: { message?: string };
+        try {
+          payload = JSON.parse(bodyStr) as { message?: string };
+        } catch {
+          sendJson(response, 400, { error: 'Invalid JSON payload' });
+          return;
+        }
+        const msg = typeof payload.message === 'string' ? payload.message.trim() : '';
+        if (!msg) {
+          sendJson(response, 400, { error: 'Message must not be empty' });
+          return;
+        }
+        if (Buffer.byteLength(msg, 'utf8') > 10 * 1024) {
+          sendJson(response, 400, { error: 'Message exceeds maximum length' });
+          return;
+        }
+        const result = await steerAgent(store, runHandle, msg, service);
+        sendJson(response, 200, result);
+      } catch (cause) {
+        const rawMsg = cause instanceof Error ? cause.message : String(cause);
+        let safeError = 'Failed to steer agent';
+        let statusCode = 500;
+        if (rawMsg === 'STEER_MESSAGE_EMPTY') {
+          safeError = 'Message must not be empty';
+          statusCode = 400;
+        } else if (rawMsg === 'STEER_MESSAGE_TOO_LONG') {
+          safeError = 'Message exceeds maximum length';
+          statusCode = 400;
+        } else if (rawMsg === 'RUN_RECOVERY_REQUIRED') {
+          safeError = 'Run requires recovery before steering';
+          statusCode = 409;
+        } else if (rawMsg === 'STEER_RUN_NOT_ACTIVE') {
+          safeError = 'Run stopped accepting steering; refresh its status before resending';
+          statusCode = 409;
+        } else if (rawMsg === 'STEERING_QUEUE_FULL') {
+          safeError = 'Steering queue is full; please wait for earlier instructions to deliver';
+          statusCode = 429;
+        } else if (rawMsg.startsWith('STEER_RPC_FAILED')) {
+          safeError = 'Failed to dispatch steering instruction to container worker';
+          statusCode = 502;
+        }
+        sendJson(response, statusCode, { error: safeError });
+      }
+    });
+    return;
+  }
+
   if (method !== 'GET' && method !== 'HEAD') {
     response.writeHead(
       405,
@@ -413,7 +700,7 @@ export function handleRequest(store: RunStore, request: IncomingMessage, respons
     return;
   }
   if (url.pathname === '/' || url.pathname === '/index.html') {
-    const html = monitorHtml();
+    const html = monitorHtml(context?.csrfToken);
     sendHtml(response, html, method === 'HEAD');
     return;
   }
@@ -484,27 +771,64 @@ export function handleRequest(store: RunStore, request: IncomingMessage, respons
       sendText(response, 404, 'Not Found\n', method === 'HEAD');
       return;
     }
-    const limit = parsePageLimit(url.searchParams.get('limit')) ?? 200;
+    const hasLimit = url.searchParams.has('limit');
+    const limit = hasLimit ? parsePageLimit(url.searchParams.get('limit')) : 200;
+    if (limit === undefined) {
+      sendText(response, 400, 'Bad Request\n', method === 'HEAD');
+      return;
+    }
+    const hasOffset = url.searchParams.has('offset');
+    const offset = hasOffset ? parseOffset(url.searchParams.get('offset')) : 0;
+    if (offset === undefined) {
+      sendText(response, 400, 'Bad Request\n', method === 'HEAD');
+      return;
+    }
     const run = store.get(runHandle);
     const active = run ? ['queued', 'starting', 'running', 'cancel_requested'].includes(run.status) : false;
-    const items = store.readTimeline(runHandle, limit);
+    const timeline = store.readTimeline(runHandle, limit, offset);
     const body: MonitorTimelineResponse = {
       run_id: runHandle,
       active,
-      count: items.length,
-      items,
+      count: timeline.items.length,
+      total: timeline.total,
+      has_more: timeline.hasMore,
+      history_truncated: timeline.historyTruncated ?? false,
+      items: timeline.items,
     };
     sendJson(response, 200, body, method === 'HEAD');
     return;
   }
+  const diffsMatch = /^\/api\/runs\/([^/]+)\/diffs$/.exec(url.pathname);
+  if (diffsMatch) {
+    const runHandle = diffsMatch[1]!;
+    if (!RUN_HANDLE.test(runHandle) || !store.hasRun(runHandle)) {
+      sendText(response, 404, 'Not Found\n', method === 'HEAD');
+      return;
+    }
+    const diffs = store.readDiffs(runHandle);
+    if (!diffs) {
+      sendText(response, 404, 'Not Found\n', method === 'HEAD');
+      return;
+    }
+    sendJson(response, 200, diffs, method === 'HEAD');
+    return;
+  }
   sendText(response, 404, 'Not Found\n', method === 'HEAD');
+}
+
+function parseOffset(value: string | null): number | undefined {
+  if (value === null) return 0;
+  if (!/^\d+$/.test(value)) return undefined;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) return undefined;
+  return parsed;
 }
 
 function parsePageLimit(value: string | null): number | undefined {
   if (value === null) return DEFAULT_PAGE_LIMIT;
   if (!/^\d+$/.test(value)) return undefined;
   const parsed = Number(value);
-  if (!Number.isInteger(parsed) || parsed < 1) return undefined;
+  if (!Number.isSafeInteger(parsed) || parsed < 1) return undefined;
   return Math.min(parsed, MAX_PAGE_LIMIT);
 }
 
@@ -546,7 +870,7 @@ function parseMessageCursor(value: string | null): MessageCursorParse {
   const decoded = decodeCursor(value);
   if (!decoded) return { status: 'invalid' };
   const seq = decoded.seq;
-  if (typeof seq !== 'number' || !Number.isInteger(seq) || seq < 1) return { status: 'invalid' };
+  if (typeof seq !== 'number' || !Number.isSafeInteger(seq) || seq < 1) return { status: 'invalid' };
   return { status: 'ok', cursor: { seq } };
 }
 

@@ -16,13 +16,16 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   realpathSync,
   rmSync,
   statSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { tmpdir } from 'node:os';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { hasNtfsShortNameAlias, isManagedDependencyPath } from './dependency-mount.js';
 
 export interface RepositorySnapshot {
   parentPath: string;
@@ -219,6 +222,211 @@ export async function captureRepositoryChanges(snapshot: RepositorySnapshot): Pr
 }
 
 /**
+ * Unquotes and decodes Git C-style quoted pathnames (e.g. \156 to n, octal escapes, \", etc.).
+ */
+export function unquoteGitPath(path: string): string {
+  const trimmed = path.trim();
+  if (!trimmed.startsWith('"') || !trimmed.endsWith('"') || trimmed.length < 2) return trimmed;
+  const inner = trimmed.slice(1, -1);
+  return inner.replace(/\\(?:([0-7]{1,3})|([abtnvfr"\\]))/g, (_match, octal, char) => {
+    if (octal) return String.fromCharCode(parseInt(octal, 8));
+    switch (char) {
+      case 'a':
+        return '\x07';
+      case 'b':
+        return '\b';
+      case 't':
+        return '\t';
+      case 'n':
+        return '\n';
+      case 'v':
+        return '\v';
+      case 'f':
+        return '\f';
+      case 'r':
+        return '\r';
+      case '"':
+        return '"';
+      case '\\':
+        return '\\';
+      default:
+        return char;
+    }
+  });
+}
+
+/**
+ * Parses source and destination paths from a raw diff --git header line, decoding C-style quoting.
+ */
+export function parseDiffGitHeader(line: string): [string, string] | null {
+  if (!line.startsWith('diff --git ')) return null;
+  const rest = line.slice('diff --git '.length).trim();
+  let partA: string | undefined;
+  let partB: string | undefined;
+  if (rest.startsWith('"')) {
+    let i = 1;
+    while (i < rest.length) {
+      if (rest[i] === '\\') i += 2;
+      else if (rest[i] === '"') break;
+      else i++;
+    }
+    partA = rest.slice(0, i + 1);
+    partB = rest.slice(i + 1).trim();
+  } else {
+    if (rest.startsWith('a/')) {
+      const withoutA = rest.slice(2);
+      const halfLen = (withoutA.length - 3) / 2;
+      if (
+        halfLen > 0 &&
+        Number.isInteger(halfLen) &&
+        withoutA.slice(halfLen, halfLen + 3) === ' b/' &&
+        withoutA.slice(0, halfLen) === withoutA.slice(halfLen + 3)
+      ) {
+        partA = 'a/' + withoutA.slice(0, halfLen);
+        partB = 'b/' + withoutA.slice(halfLen + 3);
+      }
+    }
+    if (!partA) {
+      if (rest.endsWith('"')) {
+        const qIdx = rest.indexOf(' "');
+        if (qIdx !== -1) {
+          partA = rest.slice(0, qIdx);
+          partB = rest.slice(qIdx + 1).trim();
+        }
+      }
+      if (!partA) {
+        const bIdx = rest.lastIndexOf(' b/');
+        if (bIdx !== -1) {
+          partA = rest.slice(0, bIdx);
+          partB = rest.slice(bIdx + 1).trim();
+        } else {
+          const match = rest.match(/^(a\/\S+)\s+(.+)$/);
+          if (!match) return null;
+          partA = match[1]!;
+          partB = match[2]!;
+        }
+      }
+    }
+  }
+  if (!partA || !partB) return null;
+  const unquotedA = unquoteGitPath(partA);
+  const unquotedB = unquoteGitPath(partB);
+  const cleanA = unquotedA.startsWith('a/') ? unquotedA.slice(2) : unquotedA;
+  const cleanB = unquotedB.startsWith('b/') ? unquotedB.slice(2) : unquotedB;
+  return [cleanA, cleanB];
+}
+
+/**
+ * Parses path from directives like "rename from ", "--- ", etc., decoding C-style quoting.
+ */
+export function parsePathFromDirective(line: string, directive: string): string | null {
+  if (!line.startsWith(directive)) return null;
+  const raw = line.slice(directive.length).trim();
+  const unquoted = unquoteGitPath(raw);
+  if (unquoted === '/dev/null') return null;
+  if (unquoted.startsWith('a/')) return unquoted.slice(2);
+  if (unquoted.startsWith('b/')) return unquoted.slice(2);
+  return unquoted;
+}
+
+/**
+ * Independently extracts all affected relative paths from a unified diff patch.
+ * Uses trusted temporary index seeded from baselineCommit with --no-renames when available,
+ * as well as git apply --numstat -z, git apply --summary, and raw header inspection with C-style unquoting.
+ */
+export async function extractPatchPaths(
+  repositoryPath: string,
+  patch: string,
+  baselineCommit?: string,
+): Promise<string[]> {
+  if (!patch || !patch.trim()) return [];
+  const paths = new Set<string>();
+
+  // 1. Authoritative delta via trusted temporary index seeded from baselineCommit with --no-renames
+  if (baselineCommit) {
+    const tempIndexDir = mkdtempSync(join(tmpdir(), 'git-temp-index-'));
+    const tempIndexFile = join(tempIndexDir, 'index');
+    const env = { GIT_INDEX_FILE: tempIndexFile };
+    try {
+      await git(repositoryPath, ['read-tree', baselineCommit], undefined, env);
+      await git(repositoryPath, ['apply', '--cached', '--binary', '--whitespace=nowarn', '-'], patch, env);
+      const output = await git(
+        repositoryPath,
+        ['diff-index', '--cached', '--name-only', '-z', '--no-renames', baselineCommit],
+        undefined,
+        env,
+      );
+      for (const p of output.split('\0').filter(Boolean)) {
+        paths.add(p);
+      }
+      return [...paths];
+    } finally {
+      try {
+        rmSync(tempIndexDir, { recursive: true, force: true });
+      } catch {
+        // ignore cleanup error
+      }
+    }
+  }
+
+  // 2. Parse git apply --numstat -z
+  try {
+    const output = await git(repositoryPath, ['apply', '--numstat', '-z', '-'], patch);
+    for (const record of output.split('\0').filter(Boolean)) {
+      const parts = record.split('\t');
+      if (parts.length >= 3) {
+        const p = parts.slice(2).join('\t');
+        if (p) paths.add(p);
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  // 3. Parse git apply --summary for decoded rename/copy/create/delete paths
+  try {
+    const summary = await gitOptional(repositoryPath, ['apply', '--summary', '-'], patch);
+    if (summary) {
+      for (const line of summary.split(/\r?\n/)) {
+        const renameMatch = line.match(/^\s*(?:rename|copy)\s+(.+?)\s+=>\s+(.+?)(?:\s+\(\d+%\))?$/);
+        if (renameMatch) {
+          if (renameMatch[1]) paths.add(renameMatch[1].trim());
+          if (renameMatch[2]) paths.add(renameMatch[2].trim());
+        }
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  // 4. Raw header parsing with Git C-style unquoting, tracking header vs hunk state
+  let inHeader = false;
+  for (const line of patch.split(/\r?\n/)) {
+    if (line.startsWith('diff --git ')) {
+      inHeader = true;
+      const diffHdr = parseDiffGitHeader(line);
+      if (diffHdr) {
+        if (diffHdr[0]) paths.add(diffHdr[0]);
+        if (diffHdr[1]) paths.add(diffHdr[1]);
+      }
+      continue;
+    }
+    if (line.startsWith('@@')) {
+      inHeader = false;
+      continue;
+    }
+    if (inHeader) {
+      for (const directive of ['rename from ', 'rename to ', 'copy from ', 'copy to ', '--- ', '+++ ']) {
+        const p = parsePathFromDirective(line, directive);
+        if (p) paths.add(p);
+      }
+    }
+  }
+
+  return [...paths];
+}
+
+/**
  * Verifies that the host repository's HEAD, index, and affected working tree files
  * have not diverged since the snapshot was taken, and tests that the patch applies cleanly.
  */
@@ -226,16 +434,108 @@ export async function checkRepositoryPromotion(
   snapshot: RepositorySnapshot,
   changes: RepositoryChanges,
 ): Promise<void> {
+  // 1. If patch has content, enforce add/update/delete patch contract (no renames/copies)
+  if (changes.patch && changes.patch.trim()) {
+    const summary = await gitOptional(snapshot.snapshotPath, ['apply', '--summary', '-'], changes.patch);
+    if (summary) {
+      for (const line of summary.split(/\r?\n/)) {
+        const renameMatch = line.match(/^\s*(?:rename|copy)\s+(.+?)\s+=>\s+(.+?)(?:\s+\(\d+%\))?$/);
+        if (renameMatch) {
+          const src = renameMatch[1]?.trim() ?? '';
+          const dst = renameMatch[2]?.trim() ?? '';
+          if (isManagedDependencyPath(src) || hasNtfsShortNameAlias(src)) {
+            throw new Error(`PROMOTION_MANAGED_DEPENDENCY_PATH_NOT_PERMITTED:${src}`);
+          }
+          if (isManagedDependencyPath(dst) || hasNtfsShortNameAlias(dst)) {
+            throw new Error(`PROMOTION_MANAGED_DEPENDENCY_PATH_NOT_PERMITTED:${dst}`);
+          }
+          throw new Error('PROMOTION_PATCH_RENAME_NOT_PERMITTED');
+        }
+      }
+    }
+
+    let inHeader = false;
+    for (const line of changes.patch.split(/\r?\n/)) {
+      if (line.startsWith('diff --git ')) {
+        inHeader = true;
+        const diffHdr = parseDiffGitHeader(line);
+        if (diffHdr) {
+          if (isManagedDependencyPath(diffHdr[0]) || hasNtfsShortNameAlias(diffHdr[0])) {
+            throw new Error(`PROMOTION_MANAGED_DEPENDENCY_PATH_NOT_PERMITTED:${diffHdr[0]}`);
+          }
+          if (isManagedDependencyPath(diffHdr[1]) || hasNtfsShortNameAlias(diffHdr[1])) {
+            throw new Error(`PROMOTION_MANAGED_DEPENDENCY_PATH_NOT_PERMITTED:${diffHdr[1]}`);
+          }
+          if (diffHdr[0] !== diffHdr[1]) {
+            throw new Error('PROMOTION_PATCH_RENAME_NOT_PERMITTED');
+          }
+        }
+        continue;
+      }
+      if (line.startsWith('@@')) {
+        inHeader = false;
+        continue;
+      }
+      if (inHeader) {
+        for (const directive of ['rename from ', 'rename to ', 'copy from ', 'copy to ']) {
+          const p = parsePathFromDirective(line, directive);
+          if (p) {
+            if (isManagedDependencyPath(p) || hasNtfsShortNameAlias(p)) {
+              throw new Error(`PROMOTION_MANAGED_DEPENDENCY_PATH_NOT_PERMITTED:${p}`);
+            }
+            throw new Error('PROMOTION_PATCH_RENAME_NOT_PERMITTED');
+          }
+        }
+        for (const directive of ['--- ', '+++ ']) {
+          const p = parsePathFromDirective(line, directive);
+          if (p && (isManagedDependencyPath(p) || hasNtfsShortNameAlias(p))) {
+            throw new Error(`PROMOTION_MANAGED_DEPENDENCY_PATH_NOT_PERMITTED:${p}`);
+          }
+        }
+      }
+    }
+  }
+
+  // 2. Extract all affected paths independently using immutable snapshot baseline
+  const patchPaths = await extractPatchPaths(snapshot.snapshotPath, changes.patch, snapshot.baselineCommit);
+  for (const path of patchPaths) {
+    if (isManagedDependencyPath(path) || hasNtfsShortNameAlias(path)) {
+      throw new Error(`PROMOTION_MANAGED_DEPENDENCY_PATH_NOT_PERMITTED:${path}`);
+    }
+  }
+  for (const path of changes.changedPaths) {
+    if (isManagedDependencyPath(path) || hasNtfsShortNameAlias(path)) {
+      throw new Error(`PROMOTION_MANAGED_DEPENDENCY_PATH_NOT_PERMITTED:${path}`);
+    }
+  }
+
+  // 3. Metadata consistency check
+  const declaredSet = new Set(changes.changedPaths);
+  const patchSet = new Set(patchPaths);
+  if (
+    declaredSet.size !== changes.changedPaths.length ||
+    declaredSet.size !== patchSet.size ||
+    !changes.changedPaths.every((p) => patchSet.has(p))
+  ) {
+    throw new Error('PROMOTION_PATCH_INCONSISTENT_METADATA');
+  }
+
+  // 4. Verify parent HEAD
   const currentHead = (await git(snapshot.parentPath, ['rev-parse', '--verify', 'HEAD'])).trim();
   if (currentHead !== snapshot.parentHead) throw new Error('PROMOTION_PARENT_HEAD_CHANGED');
+
+  // 5. Verify index and worktree fingerprints for all affected paths
   const currentIndex = parseIndex(await git(snapshot.parentPath, ['ls-files', '--stage', '-z']));
-  for (const path of changes.changedPaths) {
+  const allAffected = new Set([...changes.changedPaths, ...patchPaths]);
+  for (const path of allAffected) {
+    assertCanonicalPathSafe(snapshot.parentPath, path);
     const parentFile = safeRepositoryPath(snapshot.parentPath, path);
     const currentFingerprint = existsSync(parentFile) ? worktreeFingerprint(parentFile) : undefined;
     if (currentFingerprint !== snapshot.parentWorktree[path]) throw new Error(`PROMOTION_PARENT_PATH_CHANGED:${path}`);
     if (currentIndex[path] !== snapshot.parentIndex[path]) throw new Error(`PROMOTION_PARENT_INDEX_CHANGED:${path}`);
   }
-  if (!changes.patch) return;
+
+  if (!changes.patch || !changes.patch.trim()) return;
   await git(snapshot.parentPath, ['apply', '--check', '--binary', '--whitespace=nowarn', '-'], changes.patch);
 }
 
@@ -269,14 +569,54 @@ export function readSnapshotFile(snapshot: RepositorySnapshot, path: string, max
   return readFileSync(file);
 }
 
-function safeRepositoryPath(root: string, path: string): string {
+export function safeRepositoryPath(root: string, path: string): string {
   if (!path || isAbsolute(path) || path.split(/[\\/]+/).includes('..') || path.includes('\0') || path.includes(':'))
     throw new Error('REPOSITORY_RELATIVE_PATH_INVALID');
+  if (process.platform === 'win32') {
+    const segments = path.split(/[\\/]+/);
+    for (const segment of segments) {
+      if (hasNtfsShortNameAlias(segment) || segment.endsWith(' ') || segment.endsWith('.')) {
+        throw new Error('REPOSITORY_RELATIVE_PATH_INVALID');
+      }
+    }
+  }
   const destination = resolve(root, path);
   const relativePath = relative(resolve(root), destination);
   if (!relativePath || relativePath === '..' || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath))
     throw new Error('REPOSITORY_PATH_ESCAPE');
   return destination;
+}
+
+export function assertCanonicalPathSafe(parentPath: string, targetRelPath: string): void {
+  if (isManagedDependencyPath(targetRelPath) || hasNtfsShortNameAlias(targetRelPath)) {
+    throw new Error(`PROMOTION_MANAGED_DEPENDENCY_PATH_NOT_PERMITTED:${targetRelPath}`);
+  }
+  safeRepositoryPath(parentPath, targetRelPath);
+
+  const canonicalParent = realpathSync.native(parentPath);
+  const hostTarget = resolve(parentPath, targetRelPath);
+
+  let current = hostTarget;
+  while (!existsSync(current)) {
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+
+  if (!existsSync(current)) {
+    throw new Error(`PROMOTION_PATH_ESCAPE:${targetRelPath}`);
+  }
+
+  const canonicalAncestor = realpathSync.native(current);
+  const relFromParent = relative(canonicalParent, canonicalAncestor).replace(/\\/g, '/');
+
+  if (relFromParent === '..' || relFromParent.startsWith('../') || isAbsolute(relFromParent)) {
+    throw new Error(`PROMOTION_PATH_ESCAPE:${targetRelPath}`);
+  }
+
+  if (relFromParent && isManagedDependencyPath(relFromParent)) {
+    throw new Error(`PROMOTION_MANAGED_DEPENDENCY_PATH_NOT_PERMITTED:${targetRelPath}`);
+  }
 }
 
 function nulPaths(value: string): string[] {
@@ -349,9 +689,14 @@ export function git(cwd: string, arguments_: string[], input?: string, env?: Rec
   });
 }
 
-async function gitOptional(cwd: string, arguments_: string[]): Promise<string> {
+async function gitOptional(
+  cwd: string,
+  arguments_: string[],
+  input?: string,
+  env?: Record<string, string>,
+): Promise<string> {
   try {
-    return await git(cwd, arguments_);
+    return await git(cwd, arguments_, input, env);
   } catch (cause) {
     if (cause instanceof Error && /GIT_COMMAND_FAILED:.*:1:/.test(cause.message)) return '';
     throw cause;

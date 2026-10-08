@@ -76,14 +76,25 @@ workers:
     container_model_provider:
       base_url: https://model-provider.example/v1
       wire_api: responses
+      # Optional compatibility adapter for model endpoints (e.g. GLM, vLLM, Ollama)
+      # that do not support Codex v1/responses namespace tool wrappers.
+      # Supported: 'standard' (default) or 'flatten_namespaces'.
+      # wire_api_compatibility: flatten_namespaces
       api_key_environment_variable: LOCAL_MODEL_API_KEY
       requires_openai_auth: false
+    # Optional path to host model catalog JSON file defining custom models/capabilities.
+    # Copied into the ephemeral worker configuration volume.
+    # Windows: C:\secure\models.json; Linux: /etc/local-engineer/models.json
+    # model_catalog_json_file: C:\secure\models.json
     # Instead of container_model_provider, use one trusted host file:
     # container_codex_config_file: C:\secure\local-engineer-config.toml
     environment_from_host: [LOCAL_MODEL_API_KEY]
     max_concurrency: 2
     timeout_seconds: 3600
     idle_timeout_seconds: 600
+    # Optional context compaction trigger threshold in tokens.
+    # Maps to Codex root key `model_auto_compact_token_limit`. Tested with Codex --strict-config.
+    # auto_compact_token_limit: 120000
     # Optional per-worker replacement for server.default_worker_prompt.
     # worker_prompt: |-
     #   Use narrow, reviewable patches and run targeted tests.

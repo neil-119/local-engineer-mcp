@@ -38,19 +38,19 @@ $internalIndex = Get-VerifiedInterface $InternalAddress $InternalMacAddress
 $egressIndex = Get-VerifiedInterface $EgressAddress $EgressMacAddress
 if ($internalIndex -eq $egressIndex) { throw 'LOCAL_ENGINEER_PROXY_NETWORK_INTERFACE_AMBIGUOUS' }
 
-$internalDefaults = @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $internalIndex)
+$internalDefaults = @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $internalIndex -ErrorAction SilentlyContinue)
 if ($internalDefaults.Count -gt 1) { throw 'LOCAL_ENGINEER_PROXY_NETWORK_DEFAULT_AMBIGUOUS' }
 if ($internalDefaults.Count -eq 1) {
     $internalDefaults[0] | Remove-NetRoute -Confirm:$false -ErrorAction Stop
 }
 
-$defaults = @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0')
+$defaults = @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue)
 if ($defaults.Count -ne 1 -or $defaults[0].InterfaceIndex -ne $egressIndex -or
     $defaults[0].NextHop -eq '0.0.0.0') {
     throw 'LOCAL_ENGINEER_PROXY_NETWORK_DEFAULT_UNSAFE'
 }
 $internalSubnet = ($InternalAddress -replace '\.2$', '.0/24')
-$privateRoutes = @(Get-NetRoute -AddressFamily IPv4 -InterfaceIndex $internalIndex)
+$privateRoutes = @(Get-NetRoute -AddressFamily IPv4 -InterfaceIndex $internalIndex -ErrorAction SilentlyContinue)
 $unexpected = @($privateRoutes | Where-Object {
         $_.DestinationPrefix -notin @(
             $internalSubnet,
