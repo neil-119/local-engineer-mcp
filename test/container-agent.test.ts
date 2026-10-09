@@ -929,7 +929,7 @@ describe('container agent workspace seeding', () => {
     const repo1Rev = resources.repositories.get('repo1')!;
     repo1Rev.changes = {
       patch: patch1,
-      patchDigest: 'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+      patchDigest: `sha256:${createHash('sha256').update(patch1).digest('hex')}`,
       changedPaths: ['file1.txt'],
       additions: 1,
       deletions: 1,
@@ -937,7 +937,7 @@ describe('container agent workspace seeding', () => {
     const repo2Rev = resources.repositories.get('repo2')!;
     repo2Rev.changes = {
       patch: patch2,
-      patchDigest: 'sha256:2222222222222222222222222222222222222222222222222222222222222222',
+      patchDigest: `sha256:${createHash('sha256').update(patch2).digest('hex')}`,
       changedPaths: ['file2.txt'],
       additions: 1,
       deletions: 1,
@@ -948,11 +948,18 @@ describe('container agent workspace seeding', () => {
       ['repo1', repo1Rev.changes.patchDigest],
       ['repo2', repo2Rev.changes.patchDigest],
     ];
-    const { createHash } = await import('node:crypto');
     const digest = `sha256:${createHash('sha256').update(JSON.stringify(summaries)).digest('hex')}`;
 
     await expect(manager.promote(resources.agentId, 1, digest)).rejects.toThrow(
       /^PROMOTION_ROLLBACK_INCOMPLETE: Promotion failed and rollback could not be completed cleanly for repository: repo1: SIMULATED_ROLLBACK_FAILURE_REPO1\. Original error: SIMULATED_PROMOTION_FAILURE_REPO2/,
+    );
+    expect(
+      JSON.parse(
+        readFileSync(join(root, 'state', 'container-agents', resources.agentId, 'promotion-checkpoint.json'), 'utf8'),
+      ).phase,
+    ).toBe('applying');
+    await expect(manager.promote(resources.agentId, 1, digest)).rejects.toThrow(
+      'PROMOTION_CHECKPOINT_RECOVERY_REQUIRED',
     );
   });
 });
@@ -1753,6 +1760,109 @@ describe('Windows isolated-bind workspace mode', () => {
 
     // Verify parent repo has the updated package.json
     expect(readFileSync(join(parent, 'package.json'), 'utf8')).toContain('"new-dep":"1.0.0"');
+  });
+
+  it('promotes multiple revisions across manager restart and still rejects external edits', async () => {
+    const root = mkdtempSync(join(testTemporaryDirectory(), 'iso-repeat-promote-'));
+    temporaryRoots.push(root);
+    const parent = setupTestRepo(root, 'parent');
+    const state = join(root, 'state');
+    const config = windowsIsolatedBindConfig();
+    const manager = new ContainerAgentManager(config, state, createWindowsRuntime(config));
+    const resources = await manager.prepare('agt_repeat_promote', worker(), [
+      { name: 'app', parentPath: parent, containerPath: 'C:/repos/app', access: 'read-write' },
+    ]);
+    const clone = join(state, 'container-agents', resources.agentId, 'workspaces', 'app');
+    writeFileSync(join(clone, 'SPEC.md'), 'first\n');
+    const first = await manager.capture(resources.agentId);
+    await manager.promote(resources.agentId, first.revision, first.digest);
+    const restarted = new ContainerAgentManager(
+      config,
+      state,
+      createWindowsRuntime(config, [], resources.proxyAddress),
+    );
+    await restarted.recover({
+      agentId: resources.agentId,
+      image: resources.image,
+      repositories: [...resources.repositories.values()].map((item) => item.runRepository),
+      changeSet: first,
+    });
+    writeFileSync(join(clone, 'SPEC.md'), 'second\n');
+    const second = await restarted.capture(resources.agentId);
+    await restarted.promote(resources.agentId, second.revision, second.digest);
+    expect(readFileSync(join(parent, 'SPEC.md'), 'utf8').replace(/\r\n/g, '\n')).toBe('second\n');
+    writeFileSync(join(clone, 'SPEC.md'), 'third\n');
+    const third = await restarted.capture(resources.agentId);
+    writeFileSync(join(parent, 'SPEC.md'), 'external\n');
+    await expect(restarted.promote(resources.agentId, third.revision, third.digest)).rejects.toThrow(
+      'PROMOTION_PARENT_PATH_CHANGED:SPEC.md',
+    );
+    expect(readFileSync(join(parent, 'SPEC.md'), 'utf8')).toBe('external\n');
+    expect(
+      JSON.parse(readFileSync(join(state, 'container-agents', resources.agentId, 'promotion-checkpoint.json'), 'utf8'))
+        .revision,
+    ).toBe(2);
+  });
+
+  it('promotes a revert to the original tree when the full review patch becomes empty', async () => {
+    const root = mkdtempSync(join(testTemporaryDirectory(), 'iso-revert-promote-'));
+    temporaryRoots.push(root);
+    const parent = setupTestRepo(root, 'parent');
+    const state = join(root, 'state');
+    const config = windowsIsolatedBindConfig();
+    const manager = new ContainerAgentManager(config, state, createWindowsRuntime(config));
+    const resources = await manager.prepare('agt_revert_promote', worker(), [
+      { name: 'app', parentPath: parent, containerPath: 'C:/repos/app', access: 'read-write' },
+    ]);
+    const clone = join(state, 'container-agents', resources.agentId, 'workspaces', 'app');
+    writeFileSync(join(clone, 'SPEC.md'), 'added\n');
+    const first = await manager.capture(resources.agentId);
+    await manager.promote(resources.agentId, first.revision, first.digest);
+    rmSync(join(clone, 'SPEC.md'));
+    const second = await manager.capture(resources.agentId);
+    expect(second.repositories[0]?.changed_paths).toEqual([]);
+    expect(second.repositories[0]?.promotion_changed_paths).toEqual(['SPEC.md']);
+    expect((await manager.getPromotionPatch(resources.agentId, 'app')).patch).toContain('-added');
+    await manager.promote(resources.agentId, second.revision, second.digest);
+    expect(existsSync(join(parent, 'SPEC.md'))).toBe(false);
+  });
+
+  it('recovers legacy promotion metadata without applying pending changes or executing Docker commands', async () => {
+    const root = mkdtempSync(join(testTemporaryDirectory(), 'iso-legacy-recover-'));
+    temporaryRoots.push(root);
+    const parent = setupTestRepo(root, 'parent');
+    const state = join(root, 'state');
+    const config = windowsIsolatedBindConfig();
+    const calls: string[][] = [];
+    const manager = new ContainerAgentManager(config, state, createWindowsRuntime(config, calls));
+    const resources = await manager.prepare('agt_legacy_recover', worker(), [
+      { name: 'app', parentPath: parent, containerPath: 'C:/repos/app', access: 'read-write' },
+    ]);
+    const clone = join(state, 'container-agents', resources.agentId, 'workspaces', 'app');
+    writeFileSync(join(clone, 'SPEC.md'), 'first\n');
+    const first = await manager.capture(resources.agentId);
+    const revision = resources.repositories.get('app')!;
+    // Simulate the old manager: promotion succeeds but writes no checkpoint.
+    await repoSnapshot.promoteRepositoryChanges(revision.snapshot, revision.changes!);
+    writeFileSync(join(clone, 'SPEC.md'), 'second\n');
+    const second = await manager.capture(resources.agentId);
+    const callCount = calls.length;
+    const input = {
+      agentId: resources.agentId,
+      image: resources.image,
+      repositories: [...resources.repositories.values()].map((item) => item.runRepository),
+      changeSet: first,
+      pendingChangeSet: second,
+    };
+    const recovered = await manager.recoverPromotionCheckpoint(input);
+    expect(calls).toHaveLength(callCount);
+    expect(readFileSync(join(parent, 'SPEC.md'), 'utf8').replace(/\r\n/g, '\n')).toBe('first\n');
+    expect(recovered.repositories[0]?.promotion_base_revision).toBe(1);
+    expect(recovered.repositories[0]?.promotion_changed_paths).toEqual(['SPEC.md']);
+    writeFileSync(join(parent, 'SPEC.md'), 'external extra edit\n');
+    await expect(manager.recoverPromotionCheckpoint(input)).rejects.toThrow(
+      'PROMOTION_APPLIED_CONTENT_MISMATCH:SPEC.md',
+    );
   });
 
   it('capture fails closed immediately if stopContainer fails, before host inspection', async () => {

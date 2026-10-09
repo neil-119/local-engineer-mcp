@@ -280,12 +280,12 @@ export function createServer(engine: LocalEngineer): McpServer {
   server.tool(
     'local_engineer_get_diff',
     toolDescription(
-      'Get a bounded patch for one repository. since_last_check returns only changes after the last completely delivered diff for this parent connection; full returns the complete current patch. Truncated responses never advance the delivery cursor. Review remains mandatory before promotion.',
+      'Get a bounded patch for one repository. since_last_check returns changes after the last completely delivered diff; full returns the original-baseline patch; promotion returns only pending host changes since the last successful promotion, including reverts. Truncated and promotion responses never advance the delivery cursor. Review remains mandatory before promotion.',
     ),
     {
       agent_id: z.string(),
       repository: z.string(),
-      mode: z.enum(['since_last_check', 'full']).default('since_last_check'),
+      mode: z.enum(['since_last_check', 'full', 'promotion']).default('since_last_check'),
       max_characters: z.number().int().positive().max(100000).optional(),
     },
     async (input) => {
@@ -355,8 +355,35 @@ export function createServer(engine: LocalEngineer): McpServer {
 async function main(): Promise<void> {
   const config = loadConfig();
   const store = new RunStore(config.server.state_dir, config.server.max_server_log_bytes);
-  const engine = new LocalEngineer(config, store);
+  const engine =
+    process.argv[2] === 'recover-promotion'
+      ? new LocalEngineer(config, store, undefined, undefined, undefined, 0, false)
+      : new LocalEngineer(config, store);
   const [command, ...arguments_] = process.argv.slice(2);
+  if (command === 'recover-promotion') {
+    const option = (name: string) => {
+      const index = arguments_.indexOf(name);
+      return index >= 0 ? arguments_[index + 1] : undefined;
+    };
+    const agent = option('--agent');
+    const run = option('--run');
+    const promoted = option('--promoted-run');
+    if (!agent || !run || !promoted) throw new Error('PROMOTION_RECOVERY_ARGUMENTS_REQUIRED');
+    try {
+      const recovered = await engine.recoverPromotion(agent, run, promoted, arguments_.includes('--confirm-preflight'));
+      console.log(
+        JSON.stringify({
+          agent_id: recovered.agent_id,
+          run_id: recovered.run_id,
+          status: recovered.status,
+          pending_changes_promoted: false,
+        }),
+      );
+    } finally {
+      await engine.close();
+    }
+    return;
+  }
   if (command === 'doctor') {
     const containerProbe = await new ContainerRuntime(
       config.container.command,

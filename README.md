@@ -889,7 +889,7 @@ Restart Codex completely after changing MCP registration.
 | `local_engineer_cancel`              | Cancel a queued or active run.                                                                 |
 | `local_engineer_reply`               | Continue the same private session from `ready_for_review`.                                     |
 | `local_engineer_get_changes`         | Read changed paths, counts, and the exact revision/digest.                                     |
-| `local_engineer_get_diff`            | Read the patch since the last complete check, or request the full current patch.               |
+| `local_engineer_get_diff`            | Read changes since the last complete check, the original-baseline full patch, or `promotion` for the pending host delta. |
 | `local_engineer_get_file`            | Read one bounded text file from the private revision.                                          |
 | `local_engineer_keep_changes`        | Promote one exact reviewed revision after conflict checks.                                     |
 | `local_engineer_delete_agent`        | Remove disposable resources and unpromoted artifacts, returning explicit cleanup confirmation. |
@@ -1165,7 +1165,17 @@ When multiple Local Engineer processes share the same state directory:
 - **Transactional reconciliation and cleanup**: During startup or periodic maintenance, `reconcileStaleRuns()` checks for leases that have expired (`leaseExpiresAt <= now`). A worker-backed run is atomically fenced and moved to `recovery_required`; it continues consuming concurrency capacity while the adopting process awaits adapter and container-agent cleanup. Only successful cleanup moves it to `failed` or `cancelled` and releases capacity. Cleanup failure remains `recovery_required` with `requires_user_action: true`. An expired queued run has no worker resources and is cancelled directly.
 - **Live-owner preservation**: A live server instance never reclaims or alters active runs belonging to another live instance whose lease is valid, nor can one instance claim or start runs queued by another owner in `tryStart`.
 - **Fenced event ingestion**: Raw worker events, completed assistant messages, token accounting, and activity updates are fence-validated while a SQLite immediate transaction excludes reconciliation. SQLite writes are transactional; raw-event and metadata file writes are serialized with that check but cannot be rolled back with the database.
-- **Exclusive agent operations**: Reply, promotion, and deletion atomically claim the latest agent run, assign the current owner, and increment its `fenceToken` before retained-container recovery, host promotion, or resource deletion. A competing process fails before performing the external side effect. An ambiguous claimed-operation failure or lease expiry becomes `recovery_required`; further reply, promotion, and deletion claims fail closed until an operator resolves the ambiguous operation. Expiry alone does not prove the old external operation stopped.
+- **Exclusive agent operations**: Reply, promotion, and deletion atomically claim the latest agent run, assign the current owner, and increment its `fenceToken` before retained-container recovery, host promotion, or resource deletion. A competing process fails before performing the external side effect. A proven typed preflight rejection releases the still-owned promotion claim without losing review access. Other claimed-operation failures or lease expiry become `recovery_required`; further ordinary claims fail closed until an operator resolves the ambiguous operation. Expiry alone does not prove the old external operation stopped.
+
+Repeated promotions of the same retained agent use a durable last-promoted checkpoint and apply only pending changes. Original-baseline full patches remain available for review; use `local_engineer_get_diff` with `mode: "promotion"` to inspect what a follow-up promotion would apply. Pending reverts remain visible even when the full original-baseline patch is empty.
+
+For a **completed legacy preflight rejection only**, an operator who has verified that the failed operation stopped before host writes can recover review access without promoting anything:
+
+```powershell
+node .\dist\index.js recover-promotion --agent <agent-id> --run <failed-run-id> --promoted-run <last-successfully-promoted-run-id> --confirm-preflight
+```
+
+Use the same `LOCAL_ENGINEER_CONFIG` as the server. Recovery verifies retained patch digests, the last promoted content and index/HEAD, and a dry run of the pending patch. It rejects external edits and ambiguous/partial operations, performs no Docker operations or background maintenance, and preserves pending changes. After updating/rebuilding server code, restart the MCP connection before using promotion or the new diff mode. No worker image rebuild is required for these host-side changes.
 - **Fencing tokens**: Reconciliation and agent-operation claims increment `fenceToken`. If a delayed or paused owner attempts to mutate a reclaimed or claimed run, the update is rejected. Recovery state requires an explicit current token, and ordinary terminal-state mutation is forbidden.
 - **Legacy record safety**: Pre-lease historical records lacking lease metadata are handled conservatively and preserved (never declared dead on startup).
 

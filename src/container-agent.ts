@@ -28,6 +28,13 @@ import type {
   Worker,
 } from './domain.js';
 import type { ContainerAppServerWorker } from './codex.js';
+import {
+  checkpointPromotion,
+  loadPromotionLedger,
+  preparePromotion,
+  PromotionPreflightError,
+  savePromotionLedger,
+} from './promotion-checkpoint.js';
 import { relayedModelBaseUrl, writeContainerCodexConfigs } from './container-codex-config.js';
 import { containerLayout, joinContainerPath, nodeMkdirCommand, nodeRemoveCommand } from './container-platform.js';
 import { agentNetworkSubnetCandidates, ContainerRuntime } from './container-runtime.js';
@@ -72,6 +79,7 @@ interface RepositoryRevision {
   workingClonePath?: string;
   dependencyMounts?: WindowsDependencyMount[];
   dependencyManifestStale?: boolean;
+  reviewIncluded?: boolean;
 }
 
 /** Complete resource descriptor for an active or recoverable container agent. */
@@ -1194,6 +1202,7 @@ export class ContainerAgentManager {
         workingClonePath: repoMount?.workingClonePath,
         dependencyMounts: repoMount?.dependencyMounts,
         dependencyManifestStale,
+        reviewIncluded: summary !== undefined,
       });
     }
 
@@ -2375,7 +2384,7 @@ export class ContainerAgentManager {
             if (!/^[0-9a-f]{40,64}$/.test(reviewCommit)) throw new Error('CONTAINER_REVIEW_COMMIT_INVALID');
             revision.reviewCommits.set(nextRevision, reviewCommit);
 
-            if (changes.changedPaths.length)
+            if (changes.changedPaths.length || deltaChanges.changedPaths.length)
               summaries.push({
                 repository: revision.runRepository.name,
                 changed_paths: changes.changedPaths,
@@ -2569,7 +2578,7 @@ export class ContainerAgentManager {
         ).stdout.trim();
         if (!/^[0-9a-f]{40,64}$/.test(reviewCommit)) throw new Error('CONTAINER_REVIEW_COMMIT_INVALID');
         revision.reviewCommits.set(nextRevision, reviewCommit);
-        if (changes.changedPaths.length)
+        if (changes.changedPaths.length || deltaChanges.changedPaths.length)
           summaries.push({
             repository: revision.runRepository.name,
             changed_paths: changes.changedPaths,
@@ -2589,6 +2598,48 @@ export class ContainerAgentManager {
       }
     }
 
+    const promotionLedger = loadPromotionLedger(agentState);
+    if (promotionLedger?.phase === 'applying') throw new Error('PROMOTION_CHECKPOINT_RECOVERY_REQUIRED');
+    if (promotionLedger) {
+      for (const revision of resources.repositories.values()) {
+        if (!revision.changes) continue;
+        const pending = await preparePromotion(
+          revision.snapshot,
+          revision.changes,
+          promotionLedger.repositories[revision.runRepository.name],
+        );
+        let summary = summaries.find((item) => item.repository === revision.runRepository.name);
+        if (!summary && pending.changes.changedPaths.length) {
+          summary = {
+            repository: revision.runRepository.name,
+            changed_paths: revision.changes.changedPaths,
+            additions: revision.changes.additions,
+            deletions: revision.changes.deletions,
+            patch_digest: revision.changes.patchDigest,
+            delta_changed_paths: [],
+            delta_additions: 0,
+            delta_deletions: 0,
+            delta_patch_digest: `sha256:${createHash('sha256').update('').digest('hex')}`,
+            dependency_manifest_stale: Boolean(revision.dependencyManifestStale),
+          };
+          summaries.push(summary);
+        }
+        if (summary) {
+          summary.promotion_base_revision = promotionLedger.revision;
+          summary.promotion_changed_paths = pending.changes.changedPaths;
+          summary.promotion_patch_digest = pending.changes.patchDigest;
+        }
+      }
+    }
+    // Keep review digest order identical to the repository resource order, including pending reverts.
+    summaries.sort(
+      (a, b) =>
+        [...resources.repositories.keys()].indexOf(a.repository) -
+        [...resources.repositories.keys()].indexOf(b.repository),
+    );
+    for (const revision of resources.repositories.values()) {
+      revision.reviewIncluded = summaries.some((summary) => summary.repository === revision.runRepository.name);
+    }
     resources.revision = nextRevision;
     const digest = `sha256:${createHash('sha256')
       .update(JSON.stringify(summaries.map((summary) => [summary.repository, summary.patch_digest])))
@@ -2635,6 +2686,15 @@ export class ContainerAgentManager {
     const revision = this.require(agentId).repositories.get(repository);
     if (!revision?.patchPath || !existsSync(revision.patchPath)) throw new Error('CONTAINER_PATCH_NOT_FOUND');
     return readFileSync(revision.patchPath, 'utf8');
+  }
+
+  async getPromotionPatch(agentId: string, repository: string): Promise<{ patch: string; fromRevision: number }> {
+    const revision = this.require(agentId).repositories.get(repository);
+    if (!revision?.changes) throw new Error('CONTAINER_PATCH_NOT_FOUND');
+    const ledger = loadPromotionLedger(join(this.stateDir, 'container-agents', agentId));
+    if (ledger?.phase === 'applying') throw new Error('PROMOTION_CHECKPOINT_RECOVERY_REQUIRED');
+    const pending = await preparePromotion(revision.snapshot, revision.changes, ledger?.repositories[repository]);
+    return { patch: pending.changes.patch, fromRevision: ledger?.revision ?? 0 };
   }
 
   async getPatchBetween(
@@ -2788,33 +2848,69 @@ export class ContainerAgentManager {
     options?: { allowStaleDependencies?: boolean },
   ): Promise<void> {
     const resources = this.require(agentId);
-    if (resources.revision !== expectedRevision) throw new Error('CHANGE_SET_REVISION_MISMATCH');
+    if (resources.revision !== expectedRevision) throw new PromotionPreflightError('CHANGE_SET_REVISION_MISMATCH');
     const summaries = [...resources.repositories.values()]
-      .filter((revision) => revision.changes?.changedPaths.length)
+      .filter((revision) => revision.reviewIncluded ?? revision.changes?.changedPaths.length)
       .map((revision) => [revision.runRepository.name, revision.changes!.patchDigest]);
     const digest = `sha256:${createHash('sha256').update(JSON.stringify(summaries)).digest('hex')}`;
-    if (digest !== expectedDigest) throw new Error('CHANGE_SET_DIGEST_MISMATCH');
-    const changed = [...resources.repositories.values()].filter((revision) => revision.changes?.changedPaths.length);
+    if (digest !== expectedDigest) throw new PromotionPreflightError('CHANGE_SET_DIGEST_MISMATCH');
 
-    for (const revision of changed) {
-      if (revision.dependencyManifestStale && !options?.allowStaleDependencies) {
-        throw new Error(
-          `PROMOTION_DEPENDENCY_MANIFEST_STALE: Repository '${revision.runRepository.name}' modified dependency manifests while dependencies were mounted read-only. Host dependencies must be updated after promotion. Set allow_stale_dependencies to proceed.`,
-        );
-      }
-    }
-    const locks = this.acquirePromotionLocks(changed);
+    const agentState = join(this.stateDir, 'container-agents', agentId);
+    const locks = this.acquirePromotionLocks([...resources.repositories.values()]);
     try {
-      for (const revision of changed) {
-        assertNoManagedDependencyPaths(revision.changes!.changedPaths, this.config.platform);
-        await checkRepositoryPromotion(revision.snapshot, revision.changes!);
+      const ledger = loadPromotionLedger(agentState);
+      if (ledger?.phase === 'applying') throw new Error('PROMOTION_CHECKPOINT_RECOVERY_REQUIRED');
+      const prepared = [];
+      try {
+        if (
+          ledger &&
+          (ledger.revision >= expectedRevision ||
+            Object.keys(ledger.repositories).some((name) => !resources.repositories.has(name)))
+        ) {
+          throw new Error('PROMOTION_CHECKPOINT_INVALID');
+        }
+        for (const revision of resources.repositories.values()) {
+          if (!revision.changes) continue;
+          if (
+            revision.changes.patchDigest !==
+            `sha256:${createHash('sha256').update(revision.changes.patch).digest('hex')}`
+          ) {
+            throw new Error('CHANGE_SET_DIGEST_MISMATCH');
+          }
+          const promotion = await preparePromotion(
+            revision.snapshot,
+            revision.changes,
+            ledger?.repositories[revision.runRepository.name],
+          );
+          if (
+            promotion.changes.changedPaths.length &&
+            revision.dependencyManifestStale &&
+            !options?.allowStaleDependencies
+          ) {
+            throw new Error(
+              `PROMOTION_DEPENDENCY_MANIFEST_STALE: Repository '${revision.runRepository.name}' has stale dependency validation. Host dependencies must be updated after promotion. Set allow_stale_dependencies to proceed.`,
+            );
+          }
+          assertNoManagedDependencyPaths(promotion.changes.changedPaths, this.config.platform);
+          await checkRepositoryPromotion(promotion.snapshot, promotion.changes);
+          prepared.push({ ...promotion, name: revision.runRepository.name });
+        }
+      } catch (cause) {
+        throw new PromotionPreflightError(cause instanceof Error ? cause.message : 'PROMOTION_PREFLIGHT_FAILED');
       }
-      const applied: RepositoryRevision[] = [];
+      savePromotionLedger(agentState, {
+        schema_version: 1,
+        phase: 'applying',
+        revision: expectedRevision,
+        digest: expectedDigest,
+        repositories: ledger?.repositories ?? {},
+      });
+      const applied: typeof prepared = [];
       const reversePatchFn = this.#promotionHooks?.reversePatch ?? reversePatch;
       try {
-        for (const revision of changed) {
+        for (const revision of prepared) {
           if (this.#promotionHooks?.onBeforePromote) {
-            await this.#promotionHooks.onBeforePromote(revision.runRepository.name, applied.length);
+            await this.#promotionHooks.onBeforePromote(revision.name, applied.length);
           }
           await promoteRepositoryChanges(revision.snapshot, revision.changes!);
           applied.push(revision);
@@ -2826,7 +2922,7 @@ export class ContainerAgentManager {
             await reversePatchFn(revision.snapshot.parentPath, revision.changes!.patch);
           } catch (rollbackError) {
             rollbackFailures.push({
-              repository: revision.runRepository.name,
+              repository: revision.name,
               error: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
             });
           }
@@ -2841,6 +2937,144 @@ export class ContainerAgentManager {
         }
         throw cause;
       }
+      const checkpoints = { ...ledger?.repositories };
+      for (const promotion of prepared) {
+        checkpoints[promotion.name] = await checkpointPromotion(promotion.snapshot, promotion.changes, promotion.tree);
+      }
+      savePromotionLedger(agentState, {
+        schema_version: 1,
+        phase: 'complete',
+        revision: expectedRevision,
+        digest: expectedDigest,
+        repositories: checkpoints,
+      });
+    } finally {
+      for (const lock of locks.reverse()) {
+        closeSync(lock.file);
+        if (existsSync(lock.path)) unlinkSync(lock.path);
+      }
+    }
+  }
+
+  /** Bootstrap a legacy successful promotion checkpoint. No container recovery, captures or host writes. */
+  async recoverPromotionCheckpoint(
+    input: RecoveryInput & { changeSet: ContainerChangeSet; pendingChangeSet: ContainerChangeSet },
+  ): Promise<ContainerChangeSet> {
+    if (
+      !/^agt_[A-Za-z0-9_-]{1,100}$/.test(input.agentId) ||
+      input.repositories.some((repository) => !/^[A-Za-z0-9_-]{1,100}$/.test(repository.name)) ||
+      !Number.isSafeInteger(input.changeSet.revision) ||
+      input.changeSet.revision < 1 ||
+      !Number.isSafeInteger(input.pendingChangeSet.revision) ||
+      input.pendingChangeSet.revision <= input.changeSet.revision
+    ) {
+      throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+    }
+    const state = join(this.stateDir, 'container-agents', input.agentId);
+    const saved = JSON.parse(readFileSync(join(state, 'snapshots.json'), 'utf8')) as Array<{
+      runRepository: RunRepository;
+      snapshot: RepositorySnapshot;
+    }>;
+    const revisions: RepositoryRevision[] = input.repositories.map((repository) => {
+      const entry = saved.find((item) => item.runRepository.name === repository.name);
+      if (
+        !entry ||
+        resolve(entry.snapshot.parentPath) !== resolve(repository.parentPath) ||
+        resolve(entry.snapshot.snapshotPath) !== resolve(state, 'snapshots', repository.name) ||
+        entry.snapshot.parentHead !== repository.parentHead ||
+        entry.snapshot.baselineCommit !== repository.baselineCommit
+      ) {
+        throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+      }
+      return { runRepository: repository, snapshot: entry.snapshot, reviewCommits: new Map() };
+    });
+    const locks = this.acquirePromotionLocks(revisions);
+    try {
+      const existing = loadPromotionLedger(state);
+      if (
+        existing &&
+        (existing.phase !== 'complete' ||
+          existing.revision !== input.changeSet.revision ||
+          existing.digest !== input.changeSet.digest)
+      )
+        throw new Error('PROMOTION_CHECKPOINT_RECOVERY_REQUIRED');
+      const checkpoints: Record<string, Awaited<ReturnType<typeof checkpointPromotion>>> = {};
+      const summaries: Array<[string, string]> = [];
+      for (const revision of revisions) {
+        const summary = input.changeSet.repositories.find((item) => item.repository === revision.runRepository.name);
+        if (!summary) continue;
+        const patch = readFileSync(
+          join(state, 'patches', `revision-${input.changeSet.revision}`, `${summary.repository}.full.patch`),
+          'utf8',
+        );
+        const digest = `sha256:${createHash('sha256').update(patch).digest('hex')}`;
+        if (digest !== summary.patch_digest) throw new Error('CHANGE_SET_DIGEST_MISMATCH');
+        summaries.push([summary.repository, digest]);
+        const full = {
+          patch,
+          patchDigest: digest,
+          changedPaths: summary.changed_paths,
+          additions: summary.additions,
+          deletions: summary.deletions,
+        };
+        const promotion = await preparePromotion(revision.snapshot, full);
+        checkpoints[summary.repository] = await checkpointPromotion(
+          promotion.snapshot,
+          promotion.changes,
+          promotion.tree,
+        );
+      }
+      if (`sha256:${createHash('sha256').update(JSON.stringify(summaries)).digest('hex')}` !== input.changeSet.digest) {
+        throw new Error('CHANGE_SET_DIGEST_MISMATCH');
+      }
+      const pendingSummaries: RepositoryChangeSummary[] = [];
+      const pendingDigests: Array<[string, string]> = [];
+      for (const summary of input.pendingChangeSet.repositories) {
+        const revision = revisions.find((item) => item.runRepository.name === summary.repository);
+        if (!revision || pendingSummaries.some((item) => item.repository === summary.repository)) {
+          throw new Error('CONTAINER_AGENT_RETAINED_STATE_INVALID');
+        }
+        const patch = readFileSync(
+          join(state, 'patches', `revision-${input.pendingChangeSet.revision}`, `${summary.repository}.full.patch`),
+          'utf8',
+        );
+        const digest = `sha256:${createHash('sha256').update(patch).digest('hex')}`;
+        if (digest !== summary.patch_digest) throw new Error('CHANGE_SET_DIGEST_MISMATCH');
+        pendingDigests.push([summary.repository, digest]);
+        const pending = await preparePromotion(
+          revision.snapshot,
+          {
+            patch,
+            patchDigest: digest,
+            changedPaths: summary.changed_paths,
+            additions: summary.additions,
+            deletions: summary.deletions,
+          },
+          checkpoints[summary.repository],
+        );
+        assertNoManagedDependencyPaths(pending.changes.changedPaths, this.config.platform);
+        await checkRepositoryPromotion(pending.snapshot, pending.changes);
+        pendingSummaries.push({
+          ...summary,
+          promotion_base_revision: input.changeSet.revision,
+          promotion_changed_paths: pending.changes.changedPaths,
+          promotion_patch_digest: pending.changes.patchDigest,
+        });
+      }
+      if (
+        `sha256:${createHash('sha256').update(JSON.stringify(pendingDigests)).digest('hex')}` !==
+        input.pendingChangeSet.digest
+      ) {
+        throw new Error('CHANGE_SET_DIGEST_MISMATCH');
+      }
+      savePromotionLedger(state, {
+        schema_version: 1,
+        phase: 'complete',
+        revision: input.changeSet.revision,
+        digest: input.changeSet.digest,
+        repositories: checkpoints,
+      });
+      return { ...input.pendingChangeSet, repositories: pendingSummaries };
     } finally {
       for (const lock of locks.reverse()) {
         closeSync(lock.file);

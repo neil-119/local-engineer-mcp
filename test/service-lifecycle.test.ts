@@ -12,8 +12,184 @@ import {
   isMissingRecoveredThread,
 } from '../src/service.js';
 import { type Clock, RunStore } from '../src/store.js';
+import { PromotionPreflightError } from '../src/promotion-checkpoint.js';
 
 describe('agent lifecycle history', () => {
+  it('keeps a typed preflight rejection reviewable but blocks untyped or ambiguous failures', async () => {
+    for (const typed of [true, false]) {
+      const state = mkdtempSync(join(testTemporaryDirectory(), 'promotion-preflight-'));
+      const store = new RunStore(state);
+      const reviewed = {
+        ...run('run_preflight', 'ready_for_review', 0),
+        changeSet: { revision: 1, previous_revision: 0, digest: 'digest', repositories: [] },
+      };
+      store.add(reviewed);
+      const engine = new LocalEngineer(config(state), store, 'owner_new', undefined, 30_000, 0, false);
+      const manager = (engine as unknown as { containerManager: Record<string, unknown> }).containerManager;
+      manager.promote = async () => {
+        throw typed
+          ? new PromotionPreflightError('PROMOTION_PARENT_PATH_CHANGED:SPEC.md')
+          : new Error('PROMOTION_PARENT_PATH_CHANGED:SPEC.md');
+      };
+      await expect(engine.keepChanges(reviewed.agentId, 1, 'digest')).rejects.toThrow('PROMOTION_PARENT_PATH_CHANGED');
+      expect(store.get(reviewed.runId)?.status).toBe(typed ? 'ready_for_review' : 'recovery_required');
+      expect(store.get(reviewed.runId)?.operationClaim).toBeUndefined();
+      await engine.close();
+    }
+  });
+
+  it('requires operator confirmation and exact prior promotion evidence before recovery, without promoting', async () => {
+    const state = mkdtempSync(join(testTemporaryDirectory(), 'promotion-recovery-'));
+    const store = new RunStore(state);
+    const earlier = {
+      ...run('run_previous_promoted', 'promoted', 0),
+      changeSet: { revision: 1, previous_revision: 0, digest: 'digest1', repositories: [] },
+    };
+    const failed = {
+      ...run('run_failed_promote', 'recovery_required', 1),
+      leaseExpiresAt: '2000-01-01T00:00:00.000Z',
+      recovery: { kind: 'settled_operation' as const, operation: 'promote' as const },
+      diagnostics: {
+        last_phase: 'recovery_required',
+        last_activity_at: new Date().toISOString(),
+        recovery_error_excerpt: 'PROMOTION_PARENT_PATH_CHANGED:SPEC.md',
+      },
+      changeSet: { revision: 2, previous_revision: 1, digest: 'digest2', repositories: [] },
+    };
+    store.add(earlier);
+    store.add(failed);
+    const engine = new LocalEngineer(config(state), store, 'owner_operator', undefined, 30_000, 0, false);
+    const manager = (engine as unknown as { containerManager: Record<string, unknown> }).containerManager;
+    const bootstrap = vi.fn(async () => {
+      expect(Date.parse(store.get(failed.runId)!.leaseExpiresAt!)).toBeGreaterThan(Date.now());
+      return failed.changeSet;
+    });
+    const promote = vi.fn();
+    manager.recoverPromotionCheckpoint = bootstrap;
+    manager.promote = promote;
+    await expect(engine.recoverPromotion(failed.agentId, failed.runId, earlier.runId, false)).rejects.toThrow(
+      'PROMOTION_RECOVERY_CONFIRMATION_REQUIRED',
+    );
+    await expect(engine.recoverPromotion(failed.agentId, failed.runId, 'missing', true)).rejects.toThrow(
+      'PROMOTION_PREFLIGHT_RECOVERY_REJECTED',
+    );
+    expect(bootstrap).not.toHaveBeenCalled();
+    expect((await engine.recoverPromotion(failed.agentId, failed.runId, earlier.runId, true)).status).toBe(
+      'ready_for_review',
+    );
+    expect(bootstrap).toHaveBeenCalledOnce();
+    expect(promote).not.toHaveBeenCalled();
+    expect(store.get(failed.runId)?.recovery).toBeUndefined();
+    expect(store.get(earlier.runId)?.status).toBe('promoted');
+    await engine.close();
+  });
+
+  it('does not unlock expired or partial promotion failures through preflight recovery', async () => {
+    for (const error of [undefined, 'PROMOTION_ROLLBACK_INCOMPLETE', 'GIT_COMMAND_FAILED']) {
+      const state = mkdtempSync(join(testTemporaryDirectory(), 'ambiguous-promote-'));
+      const store = new RunStore(state);
+      const record = {
+        ...run('run_ambiguous', 'recovery_required', 0),
+        recovery: { kind: 'settled_operation' as const, operation: 'promote' as const },
+        diagnostics: {
+          last_phase: 'recovery_required',
+          last_activity_at: new Date().toISOString(),
+          recovery_error_excerpt: error,
+        },
+      };
+      store.add(record);
+      expect(() => store.claimPromotionPreflightRecovery(record.agentId, record.runId, 'owner_operator')).toThrow(
+        'PROMOTION_PREFLIGHT_RECOVERY_REJECTED',
+      );
+      expect(store.get(record.runId)?.status).toBe('recovery_required');
+      store.close();
+    }
+  });
+
+  it('returns pending promotion diffs without advancing the ordinary review cursor', async () => {
+    const state = mkdtempSync(join(testTemporaryDirectory(), 'promotion-diff-'));
+    const store = new RunStore(state);
+    const reviewed = {
+      ...run('run_pending_diff', 'ready_for_review', 0),
+      changeSet: { revision: 3, previous_revision: 2, digest: 'digest', repositories: [] },
+    };
+    store.add(reviewed);
+    const engine = new LocalEngineer(config(state), store, 'owner_review', undefined, 30_000, 0, false);
+    const manager = (engine as unknown as { containerManager: Record<string, unknown> }).containerManager;
+    manager.getPromotionPatch = async () => ({ patch: 'pending patch', fromRevision: 1 });
+    const ordinary = vi.fn(async () => 'full patch');
+    manager.getPatchBetween = ordinary;
+    expect(await engine.getDiff(reviewed.agentId, 'app', 'promotion')).toMatchObject({
+      from_revision: 1,
+      to_revision: 3,
+      patch: 'pending patch',
+      check_cursor_advanced: false,
+    });
+    await engine.getDiff(reviewed.agentId, 'app', 'since_last_check');
+    expect(ordinary).toHaveBeenCalledWith(reviewed.agentId, 'app', 0, 3);
+    await engine.close();
+  });
+
+  it('keeps recovery blocked when retained checkpoint validation fails', async () => {
+    const state = mkdtempSync(join(testTemporaryDirectory(), 'promotion-bad-recovery-'));
+    const store = new RunStore(state);
+    const previous = {
+      ...run('run_previous', 'promoted', 0),
+      changeSet: { revision: 1, previous_revision: 0, digest: 'old', repositories: [] },
+    };
+    const failed = {
+      ...run('run_recover_failed', 'recovery_required', 1),
+      recovery: { kind: 'settled_operation' as const, operation: 'promote' as const },
+      diagnostics: {
+        last_phase: 'recovery_required',
+        last_activity_at: new Date().toISOString(),
+        recovery_error_excerpt: 'PROMOTION_PARENT_PATH_CHANGED:SPEC.md',
+      },
+      changeSet: { revision: 2, previous_revision: 1, digest: 'new', repositories: [] },
+    };
+    store.add(previous);
+    store.add(failed);
+    const engine = new LocalEngineer(config(state), store, 'owner_operator', undefined, 30_000, 0, false);
+    const manager = (engine as unknown as { containerManager: Record<string, unknown> }).containerManager;
+    manager.recoverPromotionCheckpoint = async () => {
+      throw new Error('PROMOTION_APPLIED_CONTENT_MISMATCH:SPEC.md');
+    };
+    await expect(engine.recoverPromotion(failed.agentId, failed.runId, previous.runId, true)).rejects.toThrow(
+      'PROMOTION_APPLIED_CONTENT_MISMATCH',
+    );
+    expect(store.get(failed.runId)).toMatchObject({ status: 'recovery_required', recovery: { operation: 'promote' } });
+    expect(store.get(failed.runId)?.operationClaim).toBeUndefined();
+    await engine.close();
+  });
+
+  it('never clears a promotion claim after a competing fence advances', () => {
+    const state = mkdtempSync(join(testTemporaryDirectory(), 'promotion-fenced-'));
+    const store = new RunStore(state);
+    const record = run('run_fenced_promote', 'ready_for_review', 0);
+    store.add(record);
+    const claimed = store.claimAgentOperation(
+      record.agentId,
+      record.runId,
+      ['ready_for_review'],
+      'owner_promote',
+      'promote',
+    );
+    const fence = { ownerId: 'owner_promote', expectedFenceToken: claimed.fenceToken! };
+    store.update(
+      record.runId,
+      {
+        fenceToken: claimed.fenceToken! + 1,
+        status: 'recovery_required',
+        recovery: { kind: 'settled_operation', operation: 'promote' },
+      },
+      'test.competing_fence',
+      fence,
+    );
+    expect(() => store.releasePromotionPreflightClaim(record.runId, fence)).toThrow('AGENT_OPERATION_CLAIM_REJECTED');
+    expect(store.get(record.runId)?.status).toBe('recovery_required');
+    store.close();
+  });
+
   it('allows an exact opaque agent handle to recover review metadata after an MCP process changes', () => {
     const stateDirectory = mkdtempSync(join(testTemporaryDirectory(), 'service-capability-'));
     const store = new RunStore(stateDirectory);

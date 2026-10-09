@@ -1,11 +1,11 @@
 /**
  * Repository Snapshotting & Safe Review Promotion
  *
- * Implements isolated snapshotting of host repositories and atomic promotion of reviewed changes:
+ * Implements isolated snapshotting of host repositories and conflict-checked promotion of reviewed changes:
  * - Creates an isolated, ephemeral snapshot of the parent repository checkout.
  * - If the host repository has uncommitted changes, folds them into an ephemeral commit
  *   so the container agent begins with the user's exact working state without modifying host Git history.
- * - Tracks exact index hashes and file mtimes to protect the parent repo from race conditions
+ * - Tracks exact index hashes and file byte/mode fingerprints to detect
  *   and overlapping host modifications during review promotion.
  */
 
@@ -430,7 +430,7 @@ export async function extractPatchPaths(
  * Verifies that the host repository's HEAD, index, and affected working tree files
  * have not diverged since the snapshot was taken, and tests that the patch applies cleanly.
  */
-export async function checkRepositoryPromotion(
+export async function validateRepositoryChanges(
   snapshot: RepositorySnapshot,
   changes: RepositoryChanges,
 ): Promise<void> {
@@ -519,14 +519,20 @@ export async function checkRepositoryPromotion(
   ) {
     throw new Error('PROMOTION_PATCH_INCONSISTENT_METADATA');
   }
+}
 
+export async function checkRepositoryPromotion(
+  snapshot: RepositorySnapshot,
+  changes: RepositoryChanges,
+): Promise<void> {
+  await validateRepositoryChanges(snapshot, changes);
   // 4. Verify parent HEAD
   const currentHead = (await git(snapshot.parentPath, ['rev-parse', '--verify', 'HEAD'])).trim();
   if (currentHead !== snapshot.parentHead) throw new Error('PROMOTION_PARENT_HEAD_CHANGED');
 
   // 5. Verify index and worktree fingerprints for all affected paths
   const currentIndex = parseIndex(await git(snapshot.parentPath, ['ls-files', '--stage', '-z']));
-  const allAffected = new Set([...changes.changedPaths, ...patchPaths]);
+  const allAffected = new Set(changes.changedPaths);
   for (const path of allAffected) {
     assertCanonicalPathSafe(snapshot.parentPath, path);
     const parentFile = safeRepositoryPath(snapshot.parentPath, path);
@@ -635,7 +641,7 @@ function copyRoots(paths: string[]): string[] {
   return roots;
 }
 
-function parseIndex(value: string): Record<string, string> {
+export function parseIndex(value: string): Record<string, string> {
   const entries: Record<string, string> = {};
   for (const record of value.split('\0').filter(Boolean)) {
     const separator = record.indexOf('\t');

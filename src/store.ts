@@ -1197,6 +1197,119 @@ export class RunStore extends EventEmitter {
       throw cause;
     }
   }
+  /** Operator-only recovery of a completed, known preflight rejection, never an expired/ambiguous operation. */
+  claimPromotionPreflightRecovery(agentId: string, runId: string, ownerId: string): Run {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const current = this.readRun(runId);
+      const latest = this.getByAgent(agentId).at(-1);
+      if (
+        latest?.runId !== runId ||
+        current.agentId !== agentId ||
+        current.status !== 'recovery_required' ||
+        current.operationClaim ||
+        current.recovery?.kind !== 'settled_operation' ||
+        current.recovery.operation !== 'promote' ||
+        !/^PROMOTION_PARENT_PATH_CHANGED:[^\r\n]+$/.test(current.diagnostics?.recovery_error_excerpt ?? '')
+      ) {
+        throw new Error('PROMOTION_PREFLIGHT_RECOVERY_REJECTED');
+      }
+      const next: Run = {
+        ...current,
+        ownerId,
+        fenceToken: (current.fenceToken ?? 1) + 1,
+        leaseHeartbeatAt: this.clock.now().toISOString(),
+        leaseExpiresAt: new Date(this.clock.now().getTime() + 30_000).toISOString(),
+        operationClaim: { operation: 'promote', claimedAt: this.clock.now().toISOString() },
+      };
+      this.db.prepare('UPDATE runs SET json=? WHERE run_id=?').run(JSON.stringify(next), runId);
+      this.persist(next, 'run.promotion_recovery_claimed');
+      this.db.exec('COMMIT');
+      return next;
+    } catch (cause) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        /* already committed */
+      }
+      throw cause;
+    }
+  }
+
+  finishPromotionPreflightRecovery(
+    runId: string,
+    fence: Required<Pick<MutationFence, 'ownerId' | 'expectedFenceToken'>>,
+    success: boolean,
+    changeSet?: Run['changeSet'],
+  ): Run {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const current = this.readRun(runId);
+      this.assertOperationClaim(current, fence, 'promote');
+      if (current.status !== 'recovery_required') throw new Error('PROMOTION_PREFLIGHT_RECOVERY_REJECTED');
+      const next: Run = {
+        ...current,
+        operationClaim: undefined,
+        leaseExpiresAt: undefined,
+        ...(success
+          ? {
+              status: 'ready_for_review' as const,
+              recovery: undefined,
+              errorCode: undefined,
+              requiresUserAction: false,
+              ...(changeSet ? { changeSet } : {}),
+              diagnostics: {
+                ...current.diagnostics,
+                last_phase: 'ready_for_review',
+                last_activity_at: this.clock.now().toISOString(),
+                exit_reason: undefined,
+                recovery_error_excerpt: undefined,
+              },
+            }
+          : {}),
+      };
+      this.db.prepare('UPDATE runs SET json=? WHERE run_id=?').run(JSON.stringify(next), runId);
+      this.persist(next, success ? 'run.promotion_recovered' : 'run.promotion_recovery_rejected');
+      this.db.exec('COMMIT');
+      this.emit(`run:${runId}`, next);
+      this.emit('change', next);
+      return next;
+    } catch (cause) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        /* already committed */
+      }
+      throw cause;
+    }
+  }
+
+  /** Called only after the manager's typed, pre-write failure; a stale fence must never unlock recovery. */
+  releasePromotionPreflightClaim(
+    runId: string,
+    fence: Required<Pick<MutationFence, 'ownerId' | 'expectedFenceToken'>>,
+  ): Run {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const current = this.readRun(runId);
+      this.assertOperationClaim(current, fence, 'promote');
+      const next: Run = { ...current, operationClaim: undefined, leaseExpiresAt: undefined };
+      this.db.prepare('UPDATE runs SET json=? WHERE run_id=?').run(JSON.stringify(next), runId);
+      this.persist(next, 'run.promotion_preflight_rejected');
+      this.db.exec('COMMIT');
+      this.emit(`run:${runId}`, next);
+      this.emit('change', next);
+      return next;
+    } catch (cause) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        /* already committed */
+      }
+      throw cause;
+    }
+  }
+
   markOperationRecovery(
     runId: string,
     operation: AgentOperation,

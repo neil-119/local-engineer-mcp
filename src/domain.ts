@@ -117,6 +117,10 @@ export interface RunRepository {
   baselineKind?: 'clean_head' | 'ephemeral_dirty_snapshot';
 }
 export interface RepositoryChangeSummary {
+  /** Pending host delta after an earlier successful promotion; full review remains relative to the original baseline. */
+  promotion_base_revision?: number;
+  promotion_changed_paths?: string[];
+  promotion_patch_digest?: string;
   repository: string;
   changed_paths: string[];
   additions: number;

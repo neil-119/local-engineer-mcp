@@ -18,6 +18,7 @@ import { buildPrompt } from './prompt.js';
 import { canonicalWorkspace, defaultWorker } from './config.js';
 import { CodexAppServer, type ContainerAppServerWorker } from './codex.js';
 import { ContainerAgentManager } from './container-agent.js';
+import { PromotionPreflightError } from './promotion-checkpoint.js';
 import type { RepositoryAccess, RunRepository } from './domain.js';
 import { ImageProfileManager, type ImagePlan } from './image-profile.js';
 import { resolveRepositoryContainerPath } from './container-platform.js';
@@ -107,11 +108,12 @@ export class LocalEngineer {
     private readonly clock: Clock = systemClock,
     private readonly leaseDurationMs = 30_000,
     private readonly heartbeatIntervalMs = 5_000,
+    startupMaintenance = true,
   ) {
     this.containerManager = new ContainerAgentManager(config.container, config.server.state_dir);
     this.imageProfileManager = new ImageProfileManager(config, config.server.state_dir);
     this.startHeartbeat();
-    void this.runMaintenance().catch(() => undefined);
+    if (startupMaintenance) void this.runMaintenance().catch(() => undefined);
   }
 
   private startHeartbeat(): void {
@@ -744,18 +746,18 @@ export class LocalEngineer {
 
   /**
    * Retrieves a focused unified git diff for a repository revision:
-   * Supports `since_last_check` incremental pagination or `full` diffs.
+   * Supports delivery-cursor diffs, original-baseline full diffs, or pending promotion diffs.
    */
   async getDiff(
     agentId: string,
     repository: string,
-    mode: 'since_last_check' | 'full' = 'since_last_check',
+    mode: 'since_last_check' | 'full' | 'promotion' = 'since_last_check',
     maximumCharacters = 20000,
   ): Promise<{
     schema_version: 1;
     agent_id: string;
     repository: string;
-    mode: 'since_last_check' | 'full';
+    mode: 'since_last_check' | 'full' | 'promotion';
     from_revision: number;
     to_revision: number;
     patch: string;
@@ -767,13 +769,17 @@ export class LocalEngineer {
     await this.restoreContainerAgent(run);
     const checkpointKey = `${agentId}\0${repository}`;
     const toRevision = run.changeSet.revision;
-    const fromRevision = mode === 'full' ? 0 : (this.diffCheckpoints.get(checkpointKey) ?? 0);
-    const patch =
-      fromRevision === toRevision
+    const pending =
+      mode === 'promotion' ? await this.containerManager.getPromotionPatch(agentId, repository) : undefined;
+    const fromRevision =
+      pending?.fromRevision ?? (mode === 'full' ? 0 : (this.diffCheckpoints.get(checkpointKey) ?? 0));
+    const patch = pending
+      ? pending.patch
+      : fromRevision === toRevision
         ? ''
         : await this.containerManager.getPatchBetween(agentId, repository, fromRevision, toRevision);
     const truncated = patch.length > maximumCharacters;
-    if (!truncated) this.diffCheckpoints.set(checkpointKey, toRevision);
+    if (!truncated && mode !== 'promotion') this.diffCheckpoints.set(checkpointKey, toRevision);
     const response = {
       schema_version: 1 as const,
       agent_id: agentId,
@@ -783,7 +789,7 @@ export class LocalEngineer {
       to_revision: toRevision,
       patch: patch.slice(0, maximumCharacters),
       truncated,
-      check_cursor_advanced: !truncated,
+      check_cursor_advanced: !truncated && mode !== 'promotion',
     };
     this.recordParentDelivery(run.runId, 'diff', response);
     return response;
@@ -808,10 +814,51 @@ export class LocalEngineer {
   }
 
   /**
-   * Promotes the reviewed container change set into the host repository:
-   * Validates matching revision and patch digest, confirms pristine working tree,
-   * and atomically applies the changes.
+   * Restores review access after an explicitly attested legacy preflight rejection, without host promotion.
    */
+  async recoverPromotion(
+    agentId: string,
+    runId: string,
+    promotedRunId: string,
+    confirmedPreflight: boolean,
+  ): Promise<SafeRun> {
+    if (!confirmedPreflight) throw new Error('PROMOTION_RECOVERY_CONFIRMATION_REQUIRED');
+    const run = this.requireAgentCapability(agentId);
+    const previous = this.store.get(promotedRunId);
+    if (
+      run.runId !== runId ||
+      !run.changeSet ||
+      !previous ||
+      previous.agentId !== agentId ||
+      previous.status !== 'promoted' ||
+      !previous.changeSet ||
+      previous.continuationIndex >= run.continuationIndex ||
+      previous.changeSet.revision >= run.changeSet.revision ||
+      JSON.stringify(previous.repositories) !== JSON.stringify(run.repositories) ||
+      this.store
+        .getByAgent(agentId)
+        .some((item) => item.status === 'promoted' && item.continuationIndex > previous.continuationIndex)
+    ) {
+      throw new Error('PROMOTION_PREFLIGHT_RECOVERY_REJECTED');
+    }
+    const claimed = this.store.claimPromotionPreflightRecovery(agentId, runId, this.ownerId);
+    const fence = { ownerId: this.ownerId, expectedFenceToken: claimed.fenceToken! };
+    try {
+      const changeSet = await this.containerManager.recoverPromotionCheckpoint({
+        agentId,
+        image: this.config.container.image,
+        repositories: previous.repositories!,
+        changeSet: previous.changeSet,
+        pendingChangeSet: run.changeSet,
+      });
+      return safe(this.store.finishPromotionPreflightRecovery(runId, fence, true, changeSet));
+    } catch (cause) {
+      this.store.finishPromotionPreflightRecovery(runId, fence, false);
+      throw cause;
+    }
+  }
+
+  /** Promote an exact reviewed revision with conflict checks and a durable incremental checkpoint. */
   async keepChanges(
     agentId: string,
     revision: number,
@@ -844,7 +891,14 @@ export class LocalEngineer {
         ),
       );
     } catch (cause) {
-      this.markClaimRecovery(claimed, 'promote', cause);
+      if (cause instanceof PromotionPreflightError) {
+        this.store.releasePromotionPreflightClaim(claimed.runId, {
+          ownerId: this.ownerId,
+          expectedFenceToken: claimed.fenceToken!,
+        });
+      } else {
+        this.markClaimRecovery(claimed, 'promote', cause);
+      }
       throw cause;
     }
   }
